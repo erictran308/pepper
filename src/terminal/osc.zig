@@ -178,6 +178,10 @@ pub const Command = union(Key) {
     /// terminal supports the protocol. See `ProgramStatus`.
     program_status: ProgramStatus,
 
+    /// pepper: put a video stream over a box of cells, or take it away
+    /// (OSC 777;pepper)
+    pepper_place: PepperPlace,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
     pub const HierarchicalContext = parsers.hierarchical_context.Command;
 
@@ -222,8 +226,25 @@ pub const Command = union(Key) {
             "kitty_desktop_notification",
             "unknown",
             "program_status",
+            "pepper_place",
         },
     );
+
+    pub const PepperPlace = struct {
+        /// The longest token accepted.
+        pub const token_max = 64;
+
+        /// Ties the box to the stream whose Mach messages carry the same
+        /// token (macos/Sources/Features/Pepper/PepperServer.swift).
+        token: [:0]const u8,
+
+        /// The box, in cells from the top left of the screen. All zero
+        /// takes the stream's box away.
+        col: u16 = 0,
+        row: u16 = 0,
+        cols: u16 = 0,
+        rows: u16 = 0,
+    };
 
     /// An OSC sequence whose number this parser does not implement. For
     /// the sequence `ESC ] 7400;status=busy BEL`, `content` is
@@ -556,6 +577,7 @@ pub const Parser = struct {
             .hierarchical_context,
             .unknown,
             .program_status,
+            .pepper_place,
             => {},
         }
 

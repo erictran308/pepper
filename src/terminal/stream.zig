@@ -138,6 +138,7 @@ pub const Action = union(Key) {
     xt_checksum_extension: XtChecksumExtension,
     program_status: ProgramStatus,
     soft_reset,
+    pepper_place: PepperPlace,
 
     pub const Key = lib.Enum(
         lib.target,
@@ -246,6 +247,7 @@ pub const Action = union(Key) {
             "xt_checksum_extension",
             "program_status",
             "soft_reset",
+            "pepper_place",
         },
     );
 
@@ -445,6 +447,32 @@ pub const Action = union(Key) {
             return .{
                 .title = .init(self.title),
                 .body = .init(self.body),
+            };
+        }
+    };
+
+    pub const PepperPlace = struct {
+        token: []const u8,
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+
+        pub const C = extern struct {
+            token: lib.String,
+            col: u16,
+            row: u16,
+            cols: u16,
+            rows: u16,
+        };
+
+        pub fn cval(self: PepperPlace) PepperPlace.C {
+            return .{
+                .token = .init(self.token),
+                .col = self.col,
+                .row = self.row,
+                .cols = self.cols,
+                .rows = self.rows,
             };
         }
     };
@@ -2917,6 +2945,16 @@ pub fn Stream(comptime H: type) type {
                     self.handler.vt(.show_desktop_notification, .{
                         .title = v.title,
                         .body = v.body,
+                    });
+                },
+
+                .pepper_place => |v| {
+                    self.handler.vt(.pepper_place, .{
+                        .token = v.token,
+                        .col = v.col,
+                        .row = v.row,
+                        .cols = v.cols,
+                        .rows = v.rows,
                     });
                 },
 

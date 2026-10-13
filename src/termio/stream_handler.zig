@@ -344,6 +344,7 @@ pub const StreamHandler = struct {
             .window_title => try self.windowTitle(value.title),
             .report_pwd => try self.reportPwd(value.url),
             .show_desktop_notification => try self.showDesktopNotification(value.title, value.body),
+            .pepper_place => self.pepperPlace(value),
             .progress_report => self.progressReport(value),
             .start_hyperlink => try self.startHyperlink(value.uri, value.id),
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
@@ -1838,6 +1839,23 @@ pub const StreamHandler = struct {
         self.surfaceMessageWriter(.{
             .desktop_notification = .init(title, body),
         });
+    }
+
+    fn pepperPlace(self: *StreamHandler, value: terminal.StreamAction.PepperPlace) void {
+        var message = apprt.surface.Message{ .pepper_place = .{
+            .token = undefined,
+            .col = value.col,
+            .row = value.row,
+            .cols = value.cols,
+            .rows = value.rows,
+        } };
+
+        // The parser already refuses longer tokens.
+        const token_len = @min(value.token.len, message.pepper_place.token.len);
+        @memcpy(message.pepper_place.token[0..token_len], value.token[0..token_len]);
+        message.pepper_place.token[token_len] = 0;
+
+        self.surfaceMessageWriter(message);
     }
 
     /// Send a report to the pty.

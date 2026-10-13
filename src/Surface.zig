@@ -1186,6 +1186,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .pepper_place => |v| self.pepperPlace(
+            std.mem.sliceTo(&v.token, 0),
+            v.col,
+            v.row,
+            v.cols,
+            v.rows,
+        ),
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
@@ -2208,6 +2216,39 @@ fn resolvePathForOpening(
     }
 
     return null;
+}
+
+/// pepper: tells the apprt where to show the video stream with this token,
+/// turning the box of cells into pixels from the surface's top left
+/// (padding included). An empty box takes the stream away.
+fn pepperPlace(
+    self: *Surface,
+    token: [:0]const u8,
+    col: u16,
+    row: u16,
+    cols: u16,
+    rows: u16,
+) void {
+    const cell = self.size.cell;
+    const padding = self.size.padding;
+    const px = struct {
+        fn f(v: u32) u16 {
+            return @intCast(@min(v, std.math.maxInt(u16)));
+        }
+    }.f;
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .pepper_place,
+        .{
+            .token = token,
+            .x = px(padding.left + @as(u32, col) * cell.width),
+            .y = px(padding.top + @as(u32, row) * cell.height),
+            .width = px(@as(u32, cols) * cell.width),
+            .height = px(@as(u32, rows) * cell.height),
+        },
+    ) catch |err| {
+        log.warn("apprt failed to place pepper stream err={}", .{err});
+    };
 }
 
 /// Returns the x/y coordinate of where the IME (Input Method Editor)

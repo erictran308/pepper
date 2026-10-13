@@ -134,6 +134,16 @@ pub const Message = union(enum) {
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
 
+    /// pepper: put a video stream over a box of cells, or take it away
+    /// (OSC 777;pepper).
+    pepper_place: struct {
+        token: [terminal.osc.Command.PepperPlace.token_max:0]u8,
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+    },
+
     /// The terminal encountered a bell character.
     ring_bell,
 
