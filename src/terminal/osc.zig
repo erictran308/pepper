@@ -160,6 +160,10 @@ pub const Command = union(Key) {
     /// https://uapi-group.org/specifications/specs/osc_context/
     context_signal: parsers.context_signal.Command,
 
+    /// pepper: put a video stream over a box of cells, or take it away
+    /// (OSC 777;pepper)
+    pepper_place: PepperPlace,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const KittyClipboardProtocol = parsers.kitty_clipboard_protocol.OSC;
@@ -193,8 +197,25 @@ pub const Command = union(Key) {
             "kitty_text_sizing",
             "kitty_clipboard_protocol",
             "context_signal",
+            "pepper_place",
         },
     );
+
+    pub const PepperPlace = struct {
+        /// The longest token accepted.
+        pub const token_max = 64;
+
+        /// Ties the box to the stream whose Mach messages carry the same
+        /// token (macos/Sources/Features/Pepper/PepperServer.swift).
+        token: [:0]const u8,
+
+        /// The box, in cells from the top left of the screen. All zero
+        /// takes the stream's box away.
+        col: u16 = 0,
+        row: u16 = 0,
+        cols: u16 = 0,
+        rows: u16 = 0,
+    };
 
     pub const ProgressReport = struct {
         pub const State = enum(c_int) {
@@ -425,6 +446,7 @@ pub const Parser = struct {
             .kitty_text_sizing,
             .kitty_clipboard_protocol,
             .context_signal,
+            .pepper_place,
             => {},
         }
 

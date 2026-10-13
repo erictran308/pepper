@@ -666,6 +666,8 @@ extension Ghostty {
                 return false
             case GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD:
                 return copyTitleToClipboard(app, target: target)
+            case GHOSTTY_ACTION_PEPPER_PLACE:
+                pepperPlace(app, target: target, v: action.action.pepper_place)
             default:
                 Ghostty.logger.warning("unknown action action=\(action.tag.rawValue)")
                 return false
@@ -1955,6 +1957,24 @@ extension Ghostty {
             default:
                 assertionFailure()
             }
+        }
+
+        private static func pepperPlace(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s,
+            v: ghostty_action_pepper_place_s) {
+            guard target.tag == GHOSTTY_TARGET_SURFACE,
+                  let surface = target.target.surface,
+                  let surfaceView = self.surfaceView(from: surface),
+                  let token = v.token else { return }
+            PepperServer.shared.place(
+                token: String(cString: token),
+                pixels: CGRect(
+                    x: CGFloat(v.x),
+                    y: CGFloat(v.y),
+                    width: CGFloat(v.width),
+                    height: CGFloat(v.height)),
+                in: surfaceView)
         }
 
         private static func progressReport(

@@ -343,6 +343,10 @@ pub const Action = union(Key) {
     /// otherwise the terminal-set title.
     copy_title_to_clipboard,
 
+    /// pepper: show the video stream with this token over a box of the
+    /// surface, or take it away (OSC 777;pepper).
+    pepper_place: PepperPlace,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -410,6 +414,7 @@ pub const Action = union(Key) {
         search_selected,
         readonly,
         copy_title_to_clipboard,
+        pepper_place,
 
         test "ghostty.h Action.Key" {
             try lib.checkGhosttyHEnum(Key, "GHOSTTY_ACTION_");
@@ -736,6 +741,37 @@ pub const Pwd = struct {
         writer: *std.Io.Writer,
     ) !void {
         try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.pwd });
+    }
+};
+
+/// pepper: where to show a video stream.
+pub const PepperPlace = struct {
+    token: [:0]const u8,
+
+    /// The box in pixels from the surface's top left. An empty box takes
+    /// the stream away.
+    x: u16,
+    y: u16,
+    width: u16,
+    height: u16,
+
+    // Sync with: ghostty_action_pepper_place_s
+    pub const C = extern struct {
+        token: [*:0]const u8,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+    };
+
+    pub fn cval(self: PepperPlace) C {
+        return .{
+            .token = self.token.ptr,
+            .x = self.x,
+            .y = self.y,
+            .width = self.width,
+            .height = self.height,
+        };
     }
 };
 
