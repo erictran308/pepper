@@ -112,7 +112,7 @@
 	<array>
 		<dict>
 			<key>UTTypeIdentifier</key>
-			<string>com.mitchellh.ghosttySurfaceId</string>
+			<string>io.github.erictran308.pepper.surfaceId</string>
 			<key>UTTypeDescription</key>
 			<string>Ghostty Surface Identifier</string>
 			<key>UTTypeConformsTo</key>
