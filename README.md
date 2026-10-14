@@ -30,13 +30,14 @@ Everything Pepper adds to Ghostty 1.3.1 is in this table, and in [a handful of c
 
 | Where | What Pepper adds | Size |
 | --- | --- | --- |
-| Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box. | 290 lines, tests included |
-| The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 468 lines, plus 22 that hook it in |
+| Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box. | 332 lines, tests included |
+| The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 663 lines, plus 22 that hook it in |
+| Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says where new releases are. | About 2,100 lines fewer |
 | The player (Rust) | [`pepper-play`](pepper-play/), a program of its own inside the app. Pepper never starts it: you do, or a program you run does. | Separate program |
 | The name and icon | "Pepper" in menus, About and alerts, its own app id and icon, so it can't be confused with Ghostty or replace it. | Text and images |
-| The build | Builds with Zig 0.15.2 on Apple's newest SDKs, plus one fix from Ghostty's own later code. | Build files only |
+| The build | Builds with Zig 0.15.2 on Apple's newest SDKs, plus one fix from Ghostty's own later code. Signs Pepper and its player with macOS's hardened runtime, and checks what their signatures allow. | Build files only |
 
-Nothing else changes. Pepper adds no new way to run a command. Ghostty's updater is off, so Ghostty's releases can't install over Pepper, and Pepper doesn't update itself.
+Nothing else changes. Pepper adds no new way to run a command, and it doesn't update itself.
 
 Pepper follows Ghostty: each new Ghostty release, the same changes move onto it.
 
@@ -57,7 +58,7 @@ pepper-play video.mp4
 pepper-play 'https://www.youtube.com/watch?v=…'
 ```
 
-The video fills the tab, with mpv's status line at the bottom. mpv's keys work: space pauses, the arrows seek, `q` quits and gives the screen back as it was. It shows in macOS's Now Playing, and the media keys work.
+The video fills the tab, with mpv's status line at the bottom. mpv's keys work: space pauses, the arrows seek, `f` covers the status line too, and `q` quits and gives the screen back as it was. ⌘↩ makes Pepper's window full screen, and the video grows with it. It shows in macOS's Now Playing, and the media keys work.
 
 [tuitube](https://github.com/erictran308/tuitube), a YouTube client for the terminal, plays its videos inside Pepper too: on the video's page, and in a small box while you browse.
 
@@ -68,11 +69,22 @@ Any program can do the same. [`pepper-play/README.md`](pepper-play/README.md) ex
 A terminal sees everything you type and runs your commands, so what Pepper adds is kept small, and none of it can run anything:
 
 - **The escape sequence only places a box.** It holds a token and four numbers: where the box goes, in cells. No file names, no commands. Anything else is refused.
-- **Pepper shows pictures, nothing more.** Its message port takes only frames already on the graphics chip, and the number of the one to show. Every message is checked for its size and kind, and the rest are dropped. There are limits on how many streams and boxes there can be.
-- **A video shows only where it was placed, by the same random token.** A program must be able to write to that tab and know the token. Frames sent with any other token show nowhere.
+- **Pepper shows pictures, nothing more.** Its message port takes only frames already on the graphics chip, and the number of the one to show. Every message is checked for its size and kind, and the rest are dropped. A stream answers only to the program that started it. There are limits on how many streams and boxes there can be, and a tab's output can use up only its own boxes.
+- **A video shows only where it was placed, by the same random token.** A program must be able to write to that tab and know the token. Frames sent with any other token show nowhere, and a box never shows outside its tab.
 - **The player runs on its own.** `pepper-play` is a separate program, started by you or by a program you run, with the same rights as any other. Pepper only tells your shell where it is.
+- **Nothing a video says reaches your terminal raw.** A video's tags, a playlist or a web page could hold escape sequences. pepper-play shows only mpv's status line, and mpv's errors with any control characters escaped.
+- **Signed to keep code out.** Pepper and pepper-play run with macOS's hardened runtime: no debugger can attach, and `DYLD_` variables can't put code in them. Pepper loads no libraries but its own and the system's.
 
 The most a program can do with what Pepper adds: show a picture in a box of a tab it can already write to. It can't read the screen, type into a tab, or start anything.
+
+In October 2026 everything Pepper adds, and tuitube's use of it, went through a strict security review. It found no way for terminal output or another program to run a command. It found seven weaknesses, all fixed before the first release:
+
+1. pepper-play printed mpv's messages as they came, so a video's tags could send escape sequences to the terminal.
+2. The build kept a debugging permission Xcode adds, so a debugger could attach to Pepper.
+3. pepper-play ran without the hardened runtime.
+4. Ghostty's updater, unused, kept macOS's library check off.
+5. Output in one tab could use up the video boxes of every tab.
+6. and 7. Two ways a local program could upset Pepper's bookkeeping of the Mach ports it holds.
 
 Found a security problem in what Pepper adds? Please report it privately through [this repository's security advisories](https://github.com/erictran308/pepper/security/advisories/new), not in a public issue. Problems in Ghostty itself belong to [Ghostty](https://github.com/ghostty-org/ghostty/security).
 
