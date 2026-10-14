@@ -18,6 +18,12 @@
   <a href="pepper-play/README.md">For developers</a>
 </p>
 
+<p align="center">
+  <img src="images/pepper-demo.gif" alt="In a Pepper tab, pepper-play big-buck-bunny.mp4 plays the video inside the terminal with mpv's status line under it; f makes it fill the tab, and when it ends the shell is back" width="800">
+  <br>
+  <sub><code>pepper-play</code> in a Pepper tab; <code>f</code> fills the tab. Big Buck Bunny © Blender Foundation, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</sub>
+</p>
+
 Pepper is [Ghostty](https://ghostty.org) 1.3.1, the terminal, with one thing added: a program can play a video in a box of cells inside a tab. The video goes straight from the graphics chip to the screen, with no copies. In a Pepper tab, a 1080p video costs about 45% less CPU and under a third of the memory of mpv playing it in its own window, and the terminal itself adds nothing.
 
 It's named after Pepper's ghost, the stage trick that lays a picture over the live scene.
