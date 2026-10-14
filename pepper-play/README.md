@@ -10,15 +10,20 @@ It needs mpv's library: `brew install mpv`.
 pepper-play video.mp4
 pepper-play 'https://www.youtube.com/watch?v=…'     # through yt-dlp, as in mpv
 pepper-play --start=1:30 --volume=50 video.mp4    # any of mpv's options
+pepper-play -- "$name"                            # all after -- is a file or URL
 ```
 
-The video takes the terminal (the alternate screen, as a full-screen program does) but for its last row, where mpv's status line is, and follows the window as it resizes. mpv's keys work: `q` quits, space pauses, the arrows seek. When it ends, the terminal is as it was.
+Put `--` before a name you didn't write yourself: one that starts with `--` would otherwise be taken as one of mpv's options, and some of those run commands.
+
+The video takes the terminal (the alternate screen, as a full-screen program does) but for its last row, where mpv's status line is, and follows the window as it resizes. mpv's keys work: `q` quits, space pauses, the arrows seek, and `f` makes the video fill the whole tab, over the status line (again to bring it back). For the whole screen, make Pepper's window full screen too (⌘↩). When it ends, the terminal is as it was.
+
+mpv prints only its status line: its other messages hold the video's tags, file names and URLs, and so could hold escape sequences. If something couldn't play, its errors are shown once the screen is back, with any control characters escaped (`\u{1b}`).
 
 Pepper puts `pepper-play` on every shell's `PATH`. A shell that sets its own `PATH` from scratch can run `"$PEPPER_PLAY"`.
 
 ## From an app
 
-An app shows video in a box of its own, laid out among its text, and controls playback over mpv's JSON IPC. pepper-play acts as an app's player when it gets a token (`PEPPER_TOKEN`) or an IPC option (`--input-ipc-client`, `--input-ipc-server`): then it leaves the screen and the keys alone.
+An app shows video in a box of its own, laid out among its text, and controls playback over mpv's JSON IPC. pepper-play acts as an app's player when it gets a token (`PEPPER_TOKEN`) or an IPC option (`--input-ipc-client`, `--input-ipc-server`): then it leaves the screen and the keys alone, and writes mpv's warnings to its stderr, with any control characters escaped.
 
 ### Is this Pepper?
 
@@ -47,7 +52,7 @@ ESC ] 777 ; pepper ; remove ; TOKEN ESC \
 
 There are two ways to do it:
 
-1. **The app writes them.** It makes the token, gives it to pepper-play in `PEPPER_TOKEN` (or over the IPC, `script-message-to main pepper-token TOKEN`), and writes the sequences with the rest of its output. This suits a full-screen app, which redraws often and knows when the box moves.
+1. **The app writes them.** It makes the token, gives it to pepper-play over the IPC (`script-message-to main pepper-token TOKEN`, best: a program's environment can be read by the user's other programs, `ps -E`) or in `PEPPER_TOKEN`, and writes the sequences with the rest of its output. This suits a full-screen app, which redraws often and knows when the box moves.
 2. **pepper-play writes them**, to `/dev/tty`, when the app asks over the IPC:
 
    ```text
@@ -72,8 +77,8 @@ Files and URLs on the command line play at once, and pepper-play quits after the
 
 | Variable | What it does |
 | --- | --- |
-| `PEPPER_TOKEN` | The token the app places the box with. pepper-play takes it out of its environment at once, so nothing it starts (yt-dlp) gets it. |
-| `PEPPER_LIBMPV` | Where libmpv is, if not in Homebrew's or MacPorts' `lib` (`/opt/homebrew`, `/usr/local`, `/opt/local`). |
+| `PEPPER_TOKEN` | The token the app places the box with. pepper-play takes it out of its environment at once, so nothing it starts (yt-dlp) gets it. Giving it over the IPC is better still. |
+| `PEPPER_LIBMPV` | libmpv's absolute path, if it isn't in Homebrew's or MacPorts' `lib` (`/opt/homebrew`, `/opt/local`, `/usr/local`). The library, and its folder, must belong to you or root and not be writable by others, and it mustn't be a download (quarantined). |
 | `PEPPER_PLAY_DEBUG` | Set: mpv's messages from verbose up on stderr, not only its warnings. |
 
 ### Examples
@@ -91,7 +96,7 @@ if not play or "TMUX" in os.environ:
 
 ours, theirs = socket.socketpair()
 player = subprocess.Popen(
-    [play, f"--input-ipc-client=fd://{theirs.fileno()}", sys.argv[1]],
+    [play, f"--input-ipc-client=fd://{theirs.fileno()}", "--", sys.argv[1]],
     pass_fds=[theirs.fileno()],
 )
 theirs.close()
@@ -120,7 +125,11 @@ fn main() -> std::io::Result<()> {
     let mut out = std::io::stdout();
     write!(out, "\x1b]777;pepper;place;{token};0;0;60;20\x1b\\")?;
     out.flush()?;
-    let status = Command::new(play).env("PEPPER_TOKEN", &token).arg(file).status()?;
+    let status = Command::new(play)
+        .env("PEPPER_TOKEN", &token)
+        .arg("--")
+        .arg(file)
+        .status()?;
     write!(out, "\x1b]777;pepper;remove;{token}\x1b\\")?;
     out.flush()?;
     std::process::exit(status.code().unwrap_or(1));

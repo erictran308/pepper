@@ -85,14 +85,24 @@ impl Tty {
 }
 
 /// The box run from a shell: the window but its last row, mpv's status
-/// line.
-pub fn screen_box(cols: u16, rows: u16) -> Cells {
+/// line; or, filling it, the whole window.
+pub fn screen_box(cols: u16, rows: u16, fill: bool) -> Cells {
     Cells {
         col: 0,
         row: 0,
         cols,
-        rows: rows.saturating_sub(1).max(1),
+        rows: if fill {
+            rows
+        } else {
+            rows.saturating_sub(1).max(1)
+        },
     }
+}
+
+/// Where the box was last placed: the window's size, and whether it fills it.
+struct Placed {
+    size: (u16, u16),
+    fill: bool,
 }
 
 /// Run from a shell: the video takes the screen (the alternate one, as a
@@ -101,6 +111,7 @@ pub fn screen_box(cols: u16, rows: u16) -> Cells {
 pub struct Screen {
     tty: Arc<Tty>,
     token: String,
+    placed: Arc<Mutex<Placed>>,
     stop: Arc<AtomicBool>,
     watch: Option<std::thread::JoinHandle<()>>,
 }
@@ -113,21 +124,26 @@ impl Screen {
         let (cols, rows) = tty.size().unwrap_or((80, 24));
         tty.write(&format!(
             "\x1b[?1049h\x1b[?25l\x1b[{rows};1H{}",
-            place(&token, screen_box(cols, rows))
+            place(&token, screen_box(cols, rows, false))
         ));
+        let placed = Arc::new(Mutex::new(Placed {
+            size: (cols, rows),
+            fill: false,
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let watch = std::thread::spawn({
-            let (tty, token, stop) = (tty.clone(), token.clone(), stop.clone());
+            let (tty, token) = (tty.clone(), token.clone());
+            let (placed, stop) = (placed.clone(), stop.clone());
             move || {
-                let mut last = (cols, rows);
                 while !stop.load(Ordering::Acquire) {
                     std::thread::sleep(LOOK_EVERY);
-                    if let Some(now) = tty.size()
-                        && now != last
-                        && !stop.load(Ordering::Acquire)
-                    {
-                        last = now;
-                        tty.write(&place(&token, screen_box(now.0, now.1)));
+                    let Some(now) = tty.size() else {
+                        continue;
+                    };
+                    let mut placed = placed.lock().unwrap_or_else(|e| e.into_inner());
+                    if now != placed.size && !stop.load(Ordering::Acquire) {
+                        placed.size = now;
+                        tty.write(&place(&token, screen_box(now.0, now.1, placed.fill)));
                     }
                 }
             }
@@ -135,8 +151,21 @@ impl Screen {
         Screen {
             tty,
             token,
+            placed,
             stop,
             watch: Some(watch),
+        }
+    }
+
+    /// Makes the video fill the whole window, over mpv's status line, or
+    /// leave it the last row again: mpv's fullscreen (`f`).
+    pub fn set_fill(&self, fill: bool) {
+        let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+        if placed.fill != fill {
+            placed.fill = fill;
+            let (cols, rows) = placed.size;
+            self.tty
+                .write(&place(&self.token, screen_box(cols, rows, fill)));
         }
     }
 
@@ -170,7 +199,7 @@ mod tests {
     #[test]
     fn the_screen_but_the_status_line() {
         assert_eq!(
-            screen_box(120, 40),
+            screen_box(120, 40, false),
             Cells {
                 col: 0,
                 row: 0,
@@ -178,6 +207,7 @@ mod tests {
                 rows: 39
             }
         );
-        assert_eq!(screen_box(10, 1).rows, 1);
+        assert_eq!(screen_box(10, 1, false).rows, 1);
+        assert_eq!(screen_box(120, 40, true).rows, 40);
     }
 }

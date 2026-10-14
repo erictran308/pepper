@@ -6,11 +6,13 @@
 //! media keys and the rest of Now Playing's controls (`input-media-keys`).
 
 use std::ffi::{CStr, CString, c_char, c_int};
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crate::mpv;
-use crate::objc::{Id, Sel, class, sel, send, with_pool};
+use crate::objc::{
+    Id, Sel, class, objc_autorelease, objc_release, objc_retain, sel, send, with_pool,
+};
 
 #[link(name = "MediaPlayer", kind = "framework")]
 unsafe extern "C" {
@@ -92,11 +94,20 @@ static DESCRIPTOR: Descriptor = Descriptor(BlockDescriptor {
     signature: c"@24@?0{CGSize=dd}8".as_ptr(),
 });
 
-/// The cover's NSImage, which the block hands out.
-static COVER: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// The cover's NSImage (its address), which the block hands out: one
+/// reference of ours, released once another takes its place.
+static COVER: Mutex<usize> = Mutex::new(0);
 
 unsafe extern "C" fn cover_image(_block: *const Block, _size: CGSize) -> Id {
-    COVER.load(Ordering::Acquire)
+    let cover = COVER.lock().unwrap_or_else(|e| e.into_inner());
+    let image = *cover as Id;
+    if image.is_null() {
+        return image;
+    }
+    // SAFETY: a live image, held by COVER while the lock is; handed out
+    // retained and autoreleased, as a block returns an object, so it
+    // outlives a new cover taking its place.
+    unsafe { objc_autorelease(objc_retain(image)) }
 }
 
 struct Global(Block);
@@ -120,7 +131,11 @@ pub struct NowPlaying {
     position: f64,
     paused: bool,
     speed: f64,
-    /// The cover's path, and Now Playing's artwork made of it.
+    /// Whether the app's cover is shown: only for an app, which chose the
+    /// file, not for one mpv found next to a video played from a shell.
+    covers: bool,
+    /// The cover's path, and Now Playing's artwork made of it (one
+    /// reference of ours).
     cover: Option<String>,
     artwork: Id,
     /// Where Now Playing was last told the video is, and when.
@@ -132,8 +147,8 @@ unsafe impl Send for NowPlaying {}
 
 impl NowPlaying {
     /// Follows mpv's properties for Now Playing, unless the app turned
-    /// Now Playing off.
-    pub fn start(handle: *mut mpv::Handle) -> NowPlaying {
+    /// Now Playing off; with the app's cover if `covers`.
+    pub fn start(handle: *mut mpv::Handle, covers: bool) -> NowPlaying {
         let on = get_string(handle, c"input-media-keys").as_deref() != Some("no");
         if on {
             for (i, (name, format)) in FOLLOWED.iter().enumerate() {
@@ -149,6 +164,7 @@ impl NowPlaying {
             position: 0.0,
             paused: false,
             speed: 1.0,
+            covers,
             cover: None,
             artwork: std::ptr::null_mut(),
             told: None,
@@ -197,6 +213,9 @@ impl NowPlaying {
                 }
             }
             b"track-list/count" => {
+                if !self.covers {
+                    return;
+                }
                 // Once found, the cover stays, whatever the list does after.
                 let cover = find_cover(handle);
                 if cover.is_none() || cover == self.cover {
@@ -229,10 +248,14 @@ impl NowPlaying {
 
     fn set_cover(&mut self, cover: Option<String>) {
         self.cover = cover;
-        let image = self.cover.as_deref().and_then(|path| {
-            let path = CString::new(path).ok()?;
-            // SAFETY: AppKit calls through their own signatures; the image
-            // is kept (retained) for as long as this program runs.
+        let Some(path) = self.cover.as_deref().and_then(|p| CString::new(p).ok()) else {
+            return;
+        };
+        with_pool(|| {
+            // SAFETY: AppKit and MediaPlayer calls through their own
+            // signatures. The image and the artwork are made here with one
+            // reference each, which COVER and self.artwork hold; the ones
+            // they held before are released once nothing hands them out.
             unsafe {
                 let path: Id = send!(unsafe extern "C" fn(Id, Sel, *const c_char) -> Id)(
                     class(c"NSString"),
@@ -246,27 +269,35 @@ impl NowPlaying {
                     sel(c"initWithContentsOfFile:"),
                     path,
                 );
-                (!image.is_null()).then_some(image)
+                if image.is_null() {
+                    return;
+                }
+                let old = std::mem::replace(
+                    &mut *COVER.lock().unwrap_or_else(|e| e.into_inner()),
+                    image as usize,
+                );
+                if old != 0 {
+                    objc_release(old as Id);
+                }
+                let size: CGSize =
+                    send!(unsafe extern "C" fn(Id, Sel) -> CGSize)(image, sel(c"size"));
+                let artwork: Id = send!(unsafe extern "C" fn(Id, Sel) -> Id)(
+                    class(c"MPMediaItemArtwork"),
+                    sel(c"alloc"),
+                );
+                let artwork = send!(unsafe extern "C" fn(Id, Sel, CGSize, *const Block) -> Id)(
+                    artwork,
+                    sel(c"initWithBoundsSize:requestHandler:"),
+                    size,
+                    &raw const COVER_BLOCK.0,
+                );
+                // The info Now Playing has holds the old artwork itself.
+                let old = std::mem::replace(&mut self.artwork, artwork);
+                if !old.is_null() {
+                    objc_release(old);
+                }
             }
         });
-        let Some(image) = image else {
-            return;
-        };
-        COVER.store(image, Ordering::Release);
-        // SAFETY: as above; the block is global and hands out the image.
-        self.artwork = unsafe {
-            let size: CGSize = send!(unsafe extern "C" fn(Id, Sel) -> CGSize)(image, sel(c"size"));
-            let artwork: Id = send!(unsafe extern "C" fn(Id, Sel) -> Id)(
-                class(c"MPMediaItemArtwork"),
-                sel(c"alloc"),
-            );
-            send!(unsafe extern "C" fn(Id, Sel, CGSize, *const Block) -> Id)(
-                artwork,
-                sel(c"initWithBoundsSize:requestHandler:"),
-                size,
-                &raw const COVER_BLOCK.0,
-            )
-        };
     }
 
     fn publish(&mut self) {
