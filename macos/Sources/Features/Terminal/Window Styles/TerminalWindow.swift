@@ -22,7 +22,6 @@ class TerminalWindow: NSWindow {
     private let resetZoomAccessory = NSTitlebarAccessoryViewController()
 
     /// Update notification UI in titlebar
-    private let updateAccessory = NSTitlebarAccessoryViewController()
 
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
@@ -142,17 +141,6 @@ class TerminalWindow: NSWindow {
                 }))
             addTitlebarAccessoryViewController(resetZoomAccessory)
             resetZoomAccessory.view.translatesAutoresizingMaskIntoConstraints = false
-
-            // Create update notification accessory
-            if supportsUpdateAccessory {
-                updateAccessory.layoutAttribute = .right
-                updateAccessory.view = NonDraggableHostingView(rootView: UpdateAccessoryView(
-                    viewModel: viewModel,
-                    model: appDelegate.updateViewModel
-                ))
-                addTitlebarAccessoryViewController(updateAccessory)
-                updateAccessory.view.translatesAutoresizingMaskIntoConstraints = false
-            }
         }
 
         // Setup the accessory view for tabs that shows our keyboard shortcuts,
@@ -657,19 +645,6 @@ extension TerminalWindow {
                 // We always need space at the end of the titlebar
                 .padding(.trailing, 10)
             }
-        }
-    }
-
-    /// A pill-shaped button that displays update status and provides access to update actions.
-    struct UpdateAccessoryView: View {
-        @ObservedObject var viewModel: ViewModel
-        @ObservedObject var model: UpdateViewModel
-
-        var body: some View {
-            // We use the same top/trailing padding so that it hugs the same.
-            UpdatePill(model: model)
-                .padding(.top, viewModel.accessoryTopPadding)
-                .padding(.trailing, viewModel.accessoryTopPadding)
         }
     }
 

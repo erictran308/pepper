@@ -111,35 +111,12 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                     TerminalCommandPaletteView(
                         surfaceView: surfaceView,
                         isPresented: $viewModel.commandPaletteIsShowing,
-                        ghosttyConfig: ghostty.config,
-                        updateViewModel: (NSApp.delegate as? AppDelegate)?.updateViewModel) { action in
+                        ghosttyConfig: ghostty.config) { action in
                         self.delegate?.performAction(action, on: surfaceView)
                     }
                 }
-
-                // Show update information above all else.
-                if viewModel.updateOverlayIsVisible {
-                    UpdateOverlay()
-                }
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
-        }
-    }
-}
-
-private struct UpdateOverlay: View {
-    var body: some View {
-        if let appDelegate = NSApp.delegate as? AppDelegate {
-            VStack {
-                Spacer()
-
-                HStack {
-                    Spacer()
-                    UpdatePill(model: appDelegate.updateViewModel)
-                        .padding(.bottom, 9)
-                        .padding(.trailing, 9)
-                }
-            }
         }
     }
 }

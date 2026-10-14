@@ -14,7 +14,6 @@
 		819324642F24FF2100A9ED8F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A5B30538299BEAAB0047F10C /* Assets.xcassets */; };
 		8F3A9B4C2FA6B88000A18D13 /* Ghostty.sdef in Resources */ = {isa = PBXBuildFile; fileRef = 8F3A9B4B2FA6B88000A18D13 /* Ghostty.sdef */; };
 		9351BE8E3D22937F003B3499 /* nvim in Resources */ = {isa = PBXBuildFile; fileRef = 9351BE8E2D22937F003B3499 /* nvim */; };
-		A51BFC272B30F1B800E92F16 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A51BFC262B30F1B800E92F16 /* Sparkle */; };
 		A53D0C8E2B53B0EA00305CE6 /* GhosttyKit.xcframework in Frameworks */ = {isa = PBXBuildFile; fileRef = A5D495A1299BEC7E00DD1313 /* GhosttyKit.xcframework */; };
 		A53D0C952B53B4D800305CE6 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A5B30538299BEAAB0047F10C /* Assets.xcassets */; };
 		A546F1142D7B68D7003B11A0 /* locale in Resources */ = {isa = PBXBuildFile; fileRef = A546F1132D7B68D7003B11A0 /* locale */; };
@@ -198,14 +197,6 @@
 				"Features/Terminal/Window Styles/TitlebarTabsTahoeTerminalWindow.swift",
 				"Features/Terminal/Window Styles/TitlebarTabsVenturaTerminalWindow.swift",
 				"Features/Terminal/Window Styles/TransparentTitlebarTerminalWindow.swift",
-				Features/Update/UpdateBadge.swift,
-				Features/Update/UpdateController.swift,
-				Features/Update/UpdateDelegate.swift,
-				Features/Update/UpdateDriver.swift,
-				Features/Update/UpdatePill.swift,
-				Features/Update/UpdatePopoverView.swift,
-				Features/Update/UpdateSimulator.swift,
-				Features/Update/UpdateViewModel.swift,
 				"Ghostty/FullscreenMode+Extension.swift",
 				Ghostty/Ghostty.Error.swift,
 				Ghostty/Ghostty.Event.swift,
@@ -298,7 +289,6 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A51BFC272B30F1B800E92F16 /* Sparkle in Frameworks */,
 				A56B880B2A840447007A0E29 /* Carbon.framework in Frameworks */,
 				A571AB1D2A206FCF00248498 /* GhosttyKit.xcframework in Frameworks */,
 			);
@@ -459,9 +449,6 @@
 				81F82BC72E82815D001EDFA7 /* Sources */,
 			);
 			name = Ghostty;
-			packageProductDependencies = (
-				A51BFC262B30F1B800E92F16 /* Sparkle */,
-			);
 			productName = Ghostty;
 			productReference = A5B30531299BEAAA0047F10C /* Pepper.app */;
 			productType = "com.apple.product-type.application";
@@ -525,9 +512,6 @@
 				Base,
 			);
 			mainGroup = A5B30528299BEAAA0047F10C;
-			packageReferences = (
-				A51BFC252B30F1B700E92F16 /* XCRemoteSwiftPackageReference "Sparkle" */,
-			);
 			productRefGroup = A5B30532299BEAAA0047F10C /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -1422,24 +1406,6 @@
 		};
 /* End XCConfigurationList section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-		A51BFC252B30F1B700E92F16 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/sparkle-project/Sparkle";
-			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 2.5.1;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		A51BFC262B30F1B800E92F16 /* Sparkle */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = A51BFC252B30F1B700E92F16 /* XCRemoteSwiftPackageReference "Sparkle" */;
-			productName = Sparkle;
-		};
-/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A5B30529299BEAAA0047F10C /* Project object */;
 }
