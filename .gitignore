@@ -26,3 +26,7 @@ glad.zip
 
 vgcore.*
 
+# pepper: the notes' test runs
+__pycache__/
+*.pyc
+*.mpvlog
