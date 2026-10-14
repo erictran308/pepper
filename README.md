@@ -86,7 +86,7 @@ In October 2026 everything Pepper adds, and tuitube's use of it, went through a 
 5. Output in one tab could use up the video boxes of every tab.
 6. and 7. Two ways a local program could upset Pepper's bookkeeping of the Mach ports it holds.
 
-Found a security problem in what Pepper adds? Please report it privately through [this repository's security advisories](https://github.com/erictran308/pepper/security/advisories/new), not in a public issue. Problems in Ghostty itself belong to [Ghostty](https://github.com/ghostty-org/ghostty/security).
+Found a security problem in what Pepper adds? Please report it privately through [this repository's security advisories](https://github.com/erictran308/pepper/security/advisories/new), not in a public issue ([what's Pepper's](SECURITY.md)). Problems in Ghostty itself belong to [Ghostty](https://github.com/ghostty-org/ghostty/security).
 
 ## Build it yourself
 
