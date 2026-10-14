@@ -70,6 +70,9 @@ fn parsePepper(parser: *Parser, data: []u8) ?*Command {
         var it = std.mem.splitScalar(u8, rest[token_end + 1 ..], ';');
         for (&cells) |*v| {
             const s = it.next() orelse return invalidPepper(parser, "missing cells");
+            // Digits only: parseInt alone also takes "+5", "-0" and "1_0".
+            if (s.len == 0 or s.len > 5) return invalidPepper(parser, "bad cell");
+            for (s) |c| if (!std.ascii.isDigit(c)) return invalidPepper(parser, "bad cell");
             v.* = std.fmt.parseInt(u16, s, 10) catch return invalidPepper(parser, "bad cell");
         }
         if (it.next() != null) return invalidPepper(parser, "too many fields");
@@ -116,6 +119,20 @@ test "OSC: OSC 777 pepper place" {
     try testing.expectEqual(17, cmd.pepper_place.rows);
 }
 
+test "OSC: OSC 777 pepper place, a 64-byte token" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+
+    const token = "t" ** 64;
+    const input = "777;pepper;place;" ++ token ++ ";0;0;1;1";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .pepper_place);
+    try testing.expectEqualStrings(token, cmd.pepper_place.token);
+}
+
 test "OSC: OSC 777 pepper remove" {
     const testing = std.testing;
 
@@ -142,6 +159,12 @@ test "OSC: OSC 777 pepper invalid" {
         "777;pepper;place;tok;1;2;3;4;5",
         "777;pepper;place;tok;1;2;0;4",
         "777;pepper;place;tok;1;2;3;70000",
+        "777;pepper;place;tok;+1;2;3;4",
+        "777;pepper;place;tok;-0;2;3;4",
+        "777;pepper;place;tok;1_0;2;3;4",
+        "777;pepper;place;tok;1;2; 3;4",
+        "777;pepper;place;tok;1;;3;4",
+        "777;pepper;place;tok;000001;2;3;4",
         "777;pepper;place;to;k;1;2;3;4",
         "777;pepper;place;to k;1;2;3;4",
         "777;pepper;place;;1;2;3;4",

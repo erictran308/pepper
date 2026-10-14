@@ -2094,10 +2094,12 @@ fn pepperPlace(
         .pepper_place,
         .{
             .token = token,
-            .x = px(padding.left + @as(u32, col) * cell.width),
-            .y = px(padding.top + @as(u32, row) * cell.height),
-            .width = px(@as(u32, cols) * cell.width),
-            .height = px(@as(u32, rows) * cell.height),
+            // Saturating: a large enough cell or padding (the user's config)
+            // mustn't overflow.
+            .x = px(padding.left +| @as(u32, col) *| cell.width),
+            .y = px(padding.top +| @as(u32, row) *| cell.height),
+            .width = px(@as(u32, cols) *| cell.width),
+            .height = px(@as(u32, rows) *| cell.height),
         },
     ) catch |err| {
         log.warn("apprt failed to place pepper stream err={}", .{err});
