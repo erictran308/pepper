@@ -12,8 +12,8 @@
 # its path to Zig. xcodebuild keeps using the real SDK.
 #
 # Then it builds pepper-play (pepper-play/, Rust) and puts it in the app as
-# Contents/Helpers/Pepper.app, signed ad hoc, and signs the app again
-# around it.
+# Contents/Helpers/Pepper.app, signs both ad hoc with the hardened runtime and
+# entitlements of their own, and checks what the signatures say.
 #
 # Usage: ./pepper-build.sh [zig build options]   (default: -Doptimize=ReleaseFast)
 set -eu
@@ -81,13 +81,15 @@ chmod +x "$cache/bin/xcrun"
 [ "$#" -gt 0 ] || set -- -Doptimize=ReleaseFast
 # The build copies the app over the one already in zig-out, keeping files
 # the new build no longer has; so the old one goes first.
+app=yes
 case " $* " in
-*emit-macos-app=false*) ;;
+*emit-macos-app=false*) app=no ;;
 *) rm -rf zig-out/Pepper.app ;;
 esac
 PEPPER_SDK="$view" PATH="$cache/bin:$PATH" zig build "$@"
 
 # Built without the app (-Demit-macos-app=false): nothing to put it in.
+[ "$app" = yes ] || exit 0
 app=zig-out/Pepper.app
 [ -d "$app" ] || exit 0
 
@@ -110,9 +112,39 @@ fi
 # pepper-play follows to run from its bundle.
 ln -sf ../Helpers/Pepper.app/Contents/MacOS/pepper-play "$app/Contents/MacOS/pepper-play"
 
-# The helper first, then the app, keeping what Xcode gave it (entitlements,
-# hardened runtime).
-codesign --force --sign - "$helper"
-codesign --force --sign - --preserve-metadata=entitlements,requirements,flags,runtime "$app"
+# Both with the hardened runtime, which ignores DYLD_* variables and keeps
+# debuggers out. The helper turns off library validation to load Homebrew's
+# libmpv, signed by someone else (mpv.rs checks the file), and allows
+# executable memory for mpv's Lua scripts: LuaJIT maps its code without
+# MAP_JIT, so allow-jit isn't enough. The app gets its own entitlements, not
+# the ones Xcode signs a local build with, which add get-task-allow (a
+# debugger may attach).
+codesign --force --sign - --options runtime \
+    --entitlements pepper-play/pepper-play.entitlements "$helper"
+codesign --force --sign - --options runtime \
+    --entitlements macos/GhosttyReleaseLocal.entitlements "$app"
 codesign --verify --deep --strict "$app"
+
+# codesign --verify checks the seal, not what the signatures allow: these
+# must hold for every build that may be released.
+fail() {
+    echo "pepper-build: $*" >&2
+    exit 1
+}
+for code in "$app" "$helper"; do
+    case "$(codesign -d --verbose=2 "$code" 2>&1)" in
+    *"flags=0x10002(adhoc,runtime)"*) ;;
+    *) fail "$code isn't signed with the hardened runtime" ;;
+    esac
+    case "$(codesign -d --entitlements - --xml "$code" 2>/dev/null)" in
+    *get-task-allow* | *allow-dyld-environment-variables*)
+        fail "$code may be debugged or have code put in it" ;;
+    esac
+done
+case "$(codesign -d --entitlements - --xml "$app" 2>/dev/null)" in
+*disable-library-validation* | *allow-unsigned-executable-memory* | *allow-jit*)
+    fail "$app loads libraries not its own, or makes code" ;;
+esac
+[ ! -e "$app/Contents/Frameworks" ] || fail "$app has frameworks (Sparkle is taken out)"
+
 echo "pepper-build: $app, with pepper-play $version" >&2
