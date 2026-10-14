@@ -3,7 +3,8 @@ import SwiftUI
 struct AboutView: View {
     @Environment(\.openURL) var openURL
 
-    private let githubURL = URL(string: "https://github.com/ghostty-org/ghostty")
+    private let githubURL = URL(string: "https://github.com/erictran308/pepper")
+    private let ghosttyURL = URL(string: "https://ghostty.org")
     private let docsURL = URL(string: "https://ghostty.org/docs")
 
     /// Read the commit from the bundle.
@@ -78,10 +79,10 @@ struct AboutView: View {
 
             VStack(alignment: .center, spacing: 32) {
                 VStack(alignment: .center, spacing: 8) {
-                    Text("Ghostty")
+                    Text("Pepper")
                         .bold()
                         .font(.title)
-                    Text("Fast, native, feature-rich terminal \nemulator pushing modern features.")
+                    Text("A terminal that plays video inside it, \nstraight from the graphics chip.")
                         .multilineTextAlignment(.center)
                         .fixedSize(horizontal: false, vertical: true)
                         .font(.caption)
@@ -113,7 +114,7 @@ struct AboutView: View {
 
                 HStack(spacing: 8) {
                     if let url = docsURL {
-                        Button("Docs") {
+                        Button("Ghostty Docs") {
                             openURL(url)
                         }
                     }
@@ -122,6 +123,16 @@ struct AboutView: View {
                             openURL(url)
                         }
                     }
+                }
+
+                // Pepper is Ghostty with video added, under Ghostty's MIT
+                // licence.
+                if let url = ghosttyURL {
+                    Button("Based on Ghostty (MIT)") {
+                        openURL(url)
+                    }
+                    .buttonStyle(.link)
+                    .font(.caption)
                 }
 
                 if let copy = self.copyright {

@@ -79,10 +79,16 @@ EOF
 chmod +x "$cache/bin/xcrun"
 
 [ "$#" -gt 0 ] || set -- -Doptimize=ReleaseFast
+# The build copies the app over the one already in zig-out, keeping files
+# the new build no longer has; so the old one goes first.
+case " $* " in
+*emit-macos-app=false*) ;;
+*) rm -rf zig-out/Pepper.app ;;
+esac
 PEPPER_SDK="$view" PATH="$cache/bin:$PATH" zig build "$@"
 
 # Built without the app (-Demit-macos-app=false): nothing to put it in.
-app=zig-out/Ghostty.app
+app=zig-out/Pepper.app
 [ -d "$app" ] || exit 0
 
 echo "pepper-build: building pepper-play" >&2
