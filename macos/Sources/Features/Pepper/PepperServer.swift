@@ -525,7 +525,9 @@ final class PepperServer {
         header.pointee.msgh_remote_port = mach_port_t(MACH_PORT_NULL)
         dropStream(token)
         streams[token] = Stream(surfaces: surfaces, client: client, owner: sender, slot: nil)
-        show(token)
+        // Not shown yet: the box keeps the last frame of the stream this
+        // replaces (its client attaches again at a new size) until the first
+        // `present`, rather than going blank between them.
         report(token)
         Self.logger.info("attached \(surfaces.count) surfaces")
     }
