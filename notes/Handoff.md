@@ -74,9 +74,11 @@ The audit (the security-audit skill, standard profile, scoped to `git diff v1.3.
    - Push the `pepper` branch only after the user confirms at that moment. The README's compare link (`ghostty-org/ghostty/compare/v1.3.1...erictran308:pepper:pepper`) works once it's pushed.
    - Publish a GitHub Release.
    - Maybe make `pepper` the default branch, so the README shows.
-6. **tuitube:** a note under the "Pepper" setting (settings tab, `ui::settings_lines`) on where to get Pepper and pepper-play. Then its release (0.10.0) by the steps in its CLAUDE.md, also only when the user says. Pepper's README already says tuitube plays inside Pepper: release them together.
+6. **tuitube: done (2026-10-14).** 0.10.0 released (GitHub release with six builds, crates.io). The settings note, a Windows-only dead-code fix (`TOKEN_BYTES`), and `f` (full screen) went in first. Was: a note under the "Pepper" setting (settings tab, `ui::settings_lines`) on where to get Pepper and pepper-play. Then its release (0.10.0) by the steps in its CLAUDE.md, also only when the user says. Pepper's README already says tuitube plays inside Pepper: release them together.
 
 ## Open issues
+
+- When the box changes size (`f`, a resize), the picture blanks for ~50 ms: pepper-play makes new surfaces at the new size, and Pepper's `attach` clears the layer until the first frame comes. Fix: in `attach`, keep the old contents when a stream with the same token and owner is replaced, until its first `present`. The README's GIF (`images/pepper-demo.gif`, recorded from the release build with Big Buck Bunny, CC BY) has those frames dropped.
 
 - Enter on a card: a resumed video takes ~4 s to show (seeking the stream).
 - The notch app (Vorssaint) shows a paused browser tab whenever tuitube isn't playing; that's the app, not us.
