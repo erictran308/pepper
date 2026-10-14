@@ -50,13 +50,18 @@ Committed: `38e79c9d8`. Checked by the user: the Dock shows the icon and "Pepper
    - **Alerts and messages:** `AppDelegate.swift` (Quit, Close, "Allow … to execute"), `main.swift`, `ErrorView`, `SettingsView`, `TerminalView` debug notices, `IntentPermission`, `GhosttyIntentError`, AppleScript errors.
    - **Icon:** a new default icon. `ASSETCATALOG_COMPILER_APPICON_NAME = Ghostty`; find that asset, and also `Assets.xcassets/AppIconImage.imageset` used by About. Ghostty's alternate icons can stay as opt-in.
    - **Leave alone:** internal names, settings keys, the `.sdef`.
-3. **README** for the public fork (top of README.md): what Pepper is, download, "Open Anyway" in Privacy & Security (ad-hoc signed), building, credit.
-4. **Release:** the user chose **ad-hoc signing**, a **public repo** (the fork `erictran308/pepper` is already public; only `main` is there), and a **full rename**. Steps:
-   - Build and zip with `ditto -c -k --keepParent`.
-   - Push the `pepper` branch only after the user confirms at that moment.
+3. **README** (drafted 2026-10-14, replaces Ghostty's README.md; Ghostty's is linked upstream). The user asked for it to be bold that Pepper leaves Ghostty's terminal alone and only adds the video, so people aren't afraid to install it, and careful about security, since it's a terminal (above all, command execution). It says exactly what changes: one escape sequence in the core (290 lines with tests, `git diff v1.3.1..pepper -- src include ':!src/build'`), one new Swift file (`PepperServer.swift`, 468 lines, plus 22 that hook it in), pepper-play as a separate program, the name and icon, the build. Keep those numbers true whenever the patch changes. Never claim the core is untouched: it isn't.
+4. **Security audit, strict** (the user, 2026-10-14), before the release: everything Pepper adds (the OSC parser and its path to the app, `PepperServer.swift`'s Mach messages, pepper-play, tuitube's use of it), above all anything near command execution, and the earlier hardening notes (forged dead-name notices; boxes not clipped to their split). Then:
+   - The README's Security section says how it was audited and what was found and fixed (the user wants that told plainly, and only after the audit is real).
+   - A `SECURITY.md` of Pepper's own (Ghostty's sends reports to Ghostty).
+   - Turn on private vulnerability reporting on `erictran308/pepper` (the README links to it).
+5. **Release:** the user chose **ad-hoc signing**, a **public repo** (the fork `erictran308/pepper` is already public; only `main` is there), and a **full rename**. Steps:
+   - Build and zip with `ditto -c -k --keepParent` (`Pepper.zip`, the name the README gives).
+   - Check on a quarantined copy that "Open Anyway" is enough, pepper-play included (it runs from a shell, so Gatekeeper may ask about it separately); if not, say so in the README (`xattr -dr com.apple.quarantine /Applications/Pepper.app`).
+   - Push the `pepper` branch only after the user confirms at that moment. The README's compare link (`ghostty-org/ghostty/compare/v1.3.1...erictran308:pepper:pepper`) works once it's pushed.
    - Publish a GitHub Release.
-   - Maybe make `pepper` the default branch.
-5. **tuitube:** a note under the "pepper" setting (settings tab, `ui::settings_lines`) on where to get Pepper and pepper-play. Then its release (0.10.0) by the steps in its CLAUDE.md, also only when the user says.
+   - Maybe make `pepper` the default branch, so the README shows.
+6. **tuitube:** a note under the "Pepper" setting (settings tab, `ui::settings_lines`) on where to get Pepper and pepper-play. Then its release (0.10.0) by the steps in its CLAUDE.md, also only when the user says. Pepper's README already says tuitube plays inside Pepper: release them together.
 
 ## Open issues
 
