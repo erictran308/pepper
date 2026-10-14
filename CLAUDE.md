@@ -2,7 +2,9 @@
 
 Pepper: a personal fork of [Ghostty](https://github.com/ghostty-org/ghostty) (MIT) that shows video inside the terminal straight from the graphics chip, with no copies, for tuitube (`../tuitube`, a terminal YouTube client in Rust). Named after Pepper's ghost, the stage trick that lays a picture over the live scene. For this Mac only for now (macOS, Apple M5 Pro); the aim is the least the machine can spend, about what mpv's own window costs.
 
-The research behind it, with measurements, the routes weighed and sources: `notes/Inline video.md`. The test scripts and clients it used: `notes/inline-video/`. **Where the work stands and what's next: `notes/Handoff.md`. Read it first.**
+The research behind it, with measurements, the routes weighed and sources: `notes/Inline video.md`. The test scripts and clients it used: `notes/inline-video/` (`pepper_play.c`, a raw client of the Mach port and the escape sequence; `bench_pepper.py`, against mpv's window; `nowplaying_dump.m` and `nowplaying_name.m`, what Now Playing holds and what it calls the player).
+
+**Where it stands (2026-10-14):** released, [Pepper 1.3.1-pepper.1](https://github.com/erictran308/pepper/releases/tag/v1.3.1-pepper.1) (`pepper` is the default branch) and tuitube 0.10.0, which plays inside it. A strict security audit of everything Pepper adds came before the release; its report is outside the repo (`~/security-audit-skill/pepper/run-1/`), and the README's Security section says what it found and fixed. Next: each new Ghostty release (see Releasing).
 
 Ghostty's own guide for agents holds here too (its build, test and format commands, where things are):
 
@@ -44,13 +46,22 @@ The app is called Pepper, with bundle id `io.github.erictran308.pepper` (Ghostty
 
 The name is "Pepper", capitalized, wherever it's shown or written in prose, as "Ghostty" is. Paths, bundle ids, env names (`PEPPER_PORT`), the `pepper-play` command, the `pepper` branch, the `777;pepper;` keyword and the `pepper:` tags in code comments stay lowercase.
 
-## Steps
+## Releasing
 
-1. Install Xcode (the user) and its components; Zig 0.15.2; gettext.
-2. Build `v1.3.1` unchanged and run it, so the build is known to work before any patch.
-3. Spike: Pepper shows one IOSurface, made by a small test program, in a box of a tab (answers the Mach port question).
-4. The helper in tuitube: libmpv → IOSurface ring → Pepper.
-5. tuitube: a setting, the video hidden under popups, resizes.
-6. Measure against mpv's window with `notes/inline-video/bench.py` (adapted).
+Each Ghostty release, Pepper's changes move onto it, and then:
 
-Rough time: ½–1 day for the spike, 2–3 days each for the helper and tuitube's side.
+1. Keep the README's numbers true: the core's lines (`git diff vX.Y.Z..pepper -- src include ':!src/build'`), `PepperServer.swift`'s, the 22 that hook it in.
+2. Set `pepper_version` (Ghostty's version, then Pepper's count: `1.3.1-pepper.1`) and `pepper_build` in `pepper-build.sh`, and commit.
+3. Build from nothing: `rm -rf ~/.cache/pepper macos/build zig-out && ./pepper-build.sh` (Xcode's output keeps stale files; the SDK view is reused on a marker alone). The build fails if a signature allows more than it should.
+4. `ditto -c -k --keepParent zig-out/Pepper.app zig-out/Pepper.zip`, and its `shasum -a 256` for the release notes: an ad hoc build has no publisher identity.
+5. Check it as a download: copy the zip to `~/Downloads`, mark it (`xattr -w com.apple.quarantine "0083;$(printf %x $(date +%s));Safari;" ~/Downloads/Pepper.zip`), unzip in Finder, drag to Applications, Open Anyway, then `pepper-play` in a tab (the user does this). For 1.3.1-pepper.1 Open Anyway was enough, pepper-play included.
+6. Only when the user says so, at that moment: push `pepper` and the tag `v<version>` on the built commit, and `gh release create` with `Pepper.zip` and the SHA-256 in the notes.
+
+## Gotchas on this Mac
+
+- **Shell:** zsh has a `log` builtin, so use `/usr/bin/log`. `ls` is aliased to eza, so use `command ls`.
+- **The user's Pepper:** its pid is `pgrep -f '^/Applications/Pepper.app/Contents/MacOS/ghostty$'`, its port `io.github.erictran308.pepper.<pid>`. Never test against it, its port or its tabs. A test instance of a build: `open -n zig-out/Pepper.app --args --command=… --window-save-state=never --quit-after-last-window-closed=true` (other config keys work the same way); macOS's focus rules keep it in the background, and Ghostty opens its first window only once it's active, so activate it by pid (`NSRunningApplication(processIdentifier:)?.activate()`).
+- **Installing a build:** the user quits Pepper, then `rm -rf /Applications/Pepper.app && ditto zig-out/Pepper.app /Applications/Pepper.app && open /Applications/Pepper.app`. Replace it whole: `ditto` into an existing app keeps files the new build no longer has, which breaks its signature, and on this case-insensitive disk keeps an old folder name.
+- **Now Playing's name for the player is cached:** `mediaremoted` keeps the name it first saw for a bundle id (the bundle's folder, as LaunchServices had it). After renaming the helper's folder: `sudo killall mediaremoted`. LaunchServices keeps every copy it saw, test copies too: `lsregister -u PATH` (`/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister`), check with `lsregister -dump | rg erictran308`.
+- **`git commit -- paths`** takes those paths from the working tree: a removal staged with `git rm --cached` comes back if the file is still on disk. Commit such a removal without paths.
+- **The README's GIF** (`images/pepper-demo.gif`): a test instance running a scripted demo (`pepper-play` on Big Buck Bunny, CC BY, credited under it), recorded with `screencapture -v -R<window bounds>`, made into a GIF with ffmpeg (10 fps, 960 px, a palette).
