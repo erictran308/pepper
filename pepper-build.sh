@@ -20,6 +20,11 @@ set -eu
 cd "$(dirname "$0")"
 path_before=$PATH
 
+# Pepper's version: Ghostty's, then Pepper's own count on it. The build
+# number counts Pepper's releases.
+pepper_version=1.3.1-pepper.1
+pepper_build=1
+
 zig_want=0.15.2
 zig_have=$(zig version 2>/dev/null || true)
 if [ "$zig_have" != "$zig_want" ]; then
@@ -108,6 +113,10 @@ if [ -n "$icon" ] && [ -f "$app/Contents/Resources/$icon.icns" ]; then
     cp "$app/Contents/Resources/$icon.icns" "$helper/Contents/Resources/pepper.icns"
 fi
 
+# What About and Finder say (the Xcode project has a placeholder).
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $pepper_version" \
+    -c "Set :CFBundleVersion $pepper_build" "$app/Contents/Info.plist"
+
 # On every shell's PATH: Pepper adds Contents/MacOS to it. A link, which
 # pepper-play follows to run from its bundle.
 ln -sf ../Helpers/Pepper.app/Contents/MacOS/pepper-play "$app/Contents/MacOS/pepper-play"
@@ -147,4 +156,4 @@ case "$(codesign -d --entitlements - --xml "$app" 2>/dev/null)" in
 esac
 [ ! -e "$app/Contents/Frameworks" ] || fail "$app has frameworks (Sparkle is taken out)"
 
-echo "pepper-build: $app, with pepper-play $version" >&2
+echo "pepper-build: $app $pepper_version, with pepper-play $version" >&2
