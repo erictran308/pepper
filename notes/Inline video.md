@@ -106,6 +106,32 @@ The 1080p30 H.264 test file with sound, release build, played into a 139×31-cel
 
 445 frames in 15 s, 1 drawn into a surface still on screen (all 3 others were showing). The picture is upright with `FLIP_Y` 0. mpv's own window was 16% at 4806 px wide, mpv's kitty output in a large box 98% + 15% in Ghostty. Not yet measured: WindowServer, and a like-for-like run with `bench.py`.
 
+## Measured against mpv's window (2026-10-14)
+
+`inline-video/bench_pepper.py`, in a pepper tab: the 1080p30 test file, 15 s per run, `--hwdec=auto-safe`, no sound (`--ao=null`). It measures the player's own CPU (wait4, so the samplers' `ps` and `ioreg` don't count), pepper's and WindowServer's, the graphics chip's use (ioreg's Device Utilization %, sampled) and the largest memory.
+
+| Run | Player | pepper | WindowServer | GPU | Player MB | pepper MB | fps |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Idle | – | 4.7% | 55.8% | 43% | – | 77 | – |
+| pepper, 540×391 px | 8.0% | 4.5% | 56.1% | 46% | 104 | 77 | 30 |
+| pepper, 1764×759 px | 7.8% | 4.7% | 55.4% | 43% | 103 | 77 | 30 |
+| mpv's window, 540×391 px | 13.6% | 0.3% | 45.4% | 39% | 376 | 83 | – |
+| mpv's window, 1764×759 px | 14.3% | 0.4% | 45.8% | 41% | 367 | 84 | – |
+
+- Inside pepper the player (tuitube-video) costs about 45% less CPU than mpv with its own window, and 3.5× less memory. pepper and WindowServer stay at their idle (nothing added), and the box's size barely matters.
+- In the window runs pepper and WindowServer fall below their idle because mpv's window covers the terminal: pepper stops drawing, and WindowServer stops blurring the see-through window over the wallpaper. Their idle is what the terminal costs while it's on screen, which watching in tuitube pays either way.
+- WindowServer and the GPU are busy at idle on this Mac (56%, 43%), so differences of a few points there are noise.
+
+## Now Playing through libmpv (2026-10-14)
+
+tuitube's mpv shows in Now Playing because the mpv program does it itself (`osdep/mac/remote_command_center.swift`). Inside libmpv it doesn't, for three reasons, found one by one:
+
+1. libmpv turns `input-media-keys` off, and that option is what starts it. tuitube-video turns it, and `input-default-bindings` (so PLAYPAUSE cycles pause), back on.
+2. It works on the main queue, which a libmpv program blocked in `mpv_wait_event` never serves. tuitube-video is an NSApplication (accessory: no Dock icon) whose main thread takes its events; mpv starts and runs on another thread, as in the mpv program (`AppHub.initMpv` waits on the main queue, so `mpv_initialize` on the main thread deadlocks).
+3. mpv sends its Now Playing the title, length and position only when NSApp is mpv's own `Application` class (`AppHub.isApplication` gates its `EventHelper`): otherwise Now Playing gets "playing" and mpv's icon, which notch apps show as "Nothing playing". As that class (`_TtC5swift11Application` in libmpv), mpv also takes the video output for its own window (cocoa-cb) and fails beside the render API. So tuitube-video publishes Now Playing itself (MPNowPlayingInfoCenter, from mpv's properties, the cover through a hand-made block with its type signature, without which MediaRemote never asks for the picture), and leaves the media keys to mpv.
+
+macOS's own view was the way to check each step. mediaremoted's log (`/usr/bin/log stream --level debug --predicate 'process BEGINSWITH "mediaremote"'`) shows which app is Now Playing (`ActiveNowPlayingClient changed`), but hides the info. MediaRemote reads only from entitled programs, and Apple's `/usr/bin/perl` is one: a tiny dylib loaded through it with `DynaLoader` prints `MRMediaRemoteGetNowPlayingInfo`.
+
 ## Sources
 
 - mpv: [vo.rst v0.41.0](https://github.com/mpv-player/mpv/blob/v0.41.0/DOCS/man/vo.rst), [vo_kitty.c](https://github.com/mpv-player/mpv/blob/master/video/out/vo_kitty.c), commit `e5a74aaaa` (shm name), [issue #16299](https://github.com/mpv-player/mpv/issues/16299)
