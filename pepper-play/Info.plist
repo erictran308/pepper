@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  pepper-play as a helper app, Pepper.app/Contents/Helpers/Pepper.app, made by
+  pepper-build.sh. macOS knows the program by the bundle it runs from, and Now
+  Playing and notch apps name it by the bundle's folder, so what it plays shows
+  as "Pepper". No Dock icon, no menu bar (LSUIElement). pepper-build.sh sets the
+  version from Cargo.toml.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>io.github.erictran308.pepper.play</string>
+	<key>CFBundleName</key>
+	<string>Pepper</string>
+	<key>CFBundleDisplayName</key>
+	<string>Pepper</string>
+	<key>CFBundleExecutable</key>
+	<string>pepper-play</string>
+	<key>CFBundleIconFile</key>
+	<string>pepper</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
