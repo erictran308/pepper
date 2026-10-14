@@ -4,13 +4,13 @@ Where the work stands, for the next session. Read this, then CLAUDE.md and `note
 
 ## Done and committed
 
-- **Pepper** (branch `pepper`, not pushed): Zig 0.15.2 build on macOS 27 (`pepper-build.sh`), own name and bundle id, Mach-port IOSurface server (`macos/Sources/Features/Pepper/PepperServer.swift`), `OSC 777;pepper;place|remove;TOKEN;…` with a token, cells→pixels in Zig. Measured: the player costs ~45% less CPU and 3.5× less memory than mpv's own window; Pepper and WindowServer add nothing. Last commit `f9256db21`.
+- **Pepper** (branch `pepper`, not pushed): Zig 0.15.2 build on macOS 27 (`pepper-build.sh`), own name and bundle id, Mach-port IOSurface server (`macos/Sources/Features/Pepper/PepperServer.swift`), `OSC 777;pepper;place|remove;TOKEN;…` with a token, cells→pixels in Zig. Measured: the player costs ~45% less CPU and 3.5× less memory than mpv's own window; Pepper and WindowServer add nothing. Last commit `21457a8c6`.
 - **tuitube** (`main`, not pushed): watch page (Enter), picture-in-picture (`P`), inline playback through `tuitube-video` (`video/` crate: libmpv → IOSurfaces → Pepper), Now Playing published by the helper itself (`video/src/nowplaying.rs`), helper runs as an accessory NSApplication with mpv on a second thread (`video/src/runloop.rs`), helper bundled as `tuitube.app` (`src/bundle.rs`), one automatic retry when YouTube refuses the stream addresses (HTTP 403), `TT_VIDEO_LOG`. Last commit `c651808`. 237 + 2 tests pass, clippy clean, live tests pass.
 - Security review of both: no findings ≥ 8/10 (two hardening notes: forged dead-name notices on the public port; boxes not clipped to their split).
 
 ## Step 1, pepper-play: done (2026-10-14)
 
-Committed: Pepper `65b845d07` (the player), `755925af9` (the name), `ac6f6e03e` (notes); tuitube `fee10f9`.
+Committed: Pepper `5ec842851` (the player), `3e4e9366e` (the name), `9e9e10203` (notes); tuitube `fee10f9`.
 
 - **Pepper:** `pepper-play/` (the helper, moved from tuitube; libmpv by `dlopen`; shell and app modes; `README.md` is the integration guide); `PepperServer.swift` sends the size message (`0x7070_0101`) and sets `PEPPER_PLAY`; `pepper-build.sh` builds it into `Contents/Helpers/Pepper.app`, links `Contents/MacOS/pepper-play` (on PATH; it re-runs itself by its real path so macOS sees its bundle), signs nested then outer.
 - **tuitube:** `video/` and the workspace gone; `bundle.rs` back to mpv only; `Tools::find_pepper_play` (`pepper_play` setting, `TT_PEPPER_PLAY`, `PEPPER_PLAY`); no more `pepper-size` or pixel sizes; `PEPPER_PLAY_DEBUG`; README and CLAUDE.md. 236 tests pass, clippy clean.
@@ -21,7 +21,7 @@ Committed: Pepper `65b845d07` (the player), `755925af9` (the name), `ac6f6e03e` 
 
 ## Step 2, the full rename: done (2026-10-14)
 
-Committed: `38e79c9d8`. Checked by the user: the Dock shows the icon and "Pepper".
+Committed: `4894615cd`. Checked by the user: the Dock shows the icon and "Pepper".
 
 - `PRODUCT_NAME = Pepper` (`PRODUCT_MODULE_NAME = Ghostty` for the xibs), so the build is `zig-out/Pepper.app` (`GhosttyXcodebuild.zig`, test hosts, `pepper-build.sh`, docs). The executable stays `ghostty`.
 - Shown text: the app menu (About, Hide, Quit, "Make Pepper the Default Terminal"), Help → "Ghostty Docs", "👻 Pepper" placeholders (6 xibs, 2 window styles), About ("Pepper", what it is, "Based on Ghostty (MIT)" linking ghostty.org, GitHub → erictran308/pepper, "Ghostty Docs"), alerts (quit, close, "Allow Pepper to execute"), `main.swift`, ErrorView, SettingsView, the debug-build notice, the update popover and command, Shortcuts (IntentPermission, GhosttyIntentError), AppleScript errors, every permission prompt ("A program running within Pepper…").
@@ -67,7 +67,7 @@ The audit (the security-audit skill, standard profile, scoped to `git diff v1.3.
    - The README's Security section says how it was audited and what was found and fixed (the user wants that told plainly, and only after the audit is real).
    - A `SECURITY.md` of Pepper's own (Ghostty's sends reports to Ghostty).
    - Turn on private vulnerability reporting on `erictran308/pepper` (the README links to it).
-5. **Release** (in progress 2026-10-14): `SECURITY.md` committed; issues and private vulnerability reporting turned on (`gh`); version `1.3.1-pepper.1` set by `pepper-build.sh` (`a3b3e446b`), built from nothing, `zig-out/Pepper.zip` SHA-256 `feba33a0f90a43eda1f35173ffe3964f87e2b2166369aa09ea4b9ac0dd1deda1`. **Checked by the user:** a quarantined copy of the zip, unzipped in Finder and dragged to Applications, opens after Open Anyway, and `pepper-play` then plays with no prompt of its own (no README change needed). The user chose **ad-hoc signing**, a **public repo** (the fork `erictran308/pepper` is already public; only `main` is there), and a **full rename**. Steps:
+5. **Release** (in progress 2026-10-14): `SECURITY.md` committed; issues and private vulnerability reporting turned on (`gh`); version `1.3.1-pepper.1` set by `pepper-build.sh` (`e0e30cfb3`), built from nothing, `zig-out/Pepper.zip` SHA-256 `feba33a0f90a43eda1f35173ffe3964f87e2b2166369aa09ea4b9ac0dd1deda1`. **Checked by the user:** a quarantined copy of the zip, unzipped in Finder and dragged to Applications, opens after Open Anyway, and `pepper-play` then plays with no prompt of its own (no README change needed). The user chose **ad-hoc signing**, a **public repo** (the fork `erictran308/pepper` is already public; only `main` is there), and a **full rename**. Steps:
    - Build from nothing: `rm -rf ~/.cache/pepper macos/build zig-out && ./pepper-build.sh` (Xcode's own output keeps stale files, and the SDK view is reused on a marker alone).
    - Zip with `ditto -c -k --keepParent` (`Pepper.zip`, the name the README gives), and publish its SHA-256 with the release (`shasum -a 256 Pepper.zip`): an ad hoc build has no publisher identity.
    - Check on a quarantined copy that "Open Anyway" is enough, pepper-play included (it runs from a shell, so Gatekeeper may ask about it separately); if not, say so in the README (`xattr -dr com.apple.quarantine /Applications/Pepper.app`).
