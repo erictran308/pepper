@@ -80,46 +80,46 @@ Precedent for 3: porthole (flotilla-org/porthole #80): IOSurfaces handed over on
 
 ## Spike (2026-10-13)
 
-pepper (`macos/Sources/Features/Pepper/PepperServer.swift`) shows 3 IOSurfaces of 640×360 BGRA, sent once over its Mach port by `inline-video/pepper_play.c`, in a 480×270-point layer over the front tab, switching surface on each "present" message.
+Pepper (`macos/Sources/Features/Pepper/PepperServer.swift`) shows 3 IOSurfaces of 640×360 BGRA, sent once over its Mach port by `inline-video/pepper_play.c`, in a 480×270-point layer over the front tab, switching surface on each "present" message.
 
-| | pepper CPU |
+| | Pepper CPU |
 | --- | --- |
 | Idle | 4.2% |
 | Showing 30 fps | 4.6% (+0.4%) |
 
 All 300 frames arrived on time. Only 1 was drawn into a surface the screen was still using, so a ring of 3 looks enough. Against that, Ghostty spent +11% just receiving mpv's kitty output in a small box.
 
-With the escape sequence and token (step 4), in a pepper tab, 20 s at 30 fps while resizing the window: 600 frames, 0 ms late. The box follows the cell grid as the window resizes. With `-k` (exit with no detach), pepper clears the frame by itself.
+With the escape sequence and token (step 4), in a Pepper tab, 20 s at 30 fps while resizing the window: 600 frames, 0 ms late. The box follows the cell grid as the window resizes. With `-k` (exit with no detach), Pepper clears the frame by itself.
 
-9 of the 600 frames (1.5%) went into a surface still in use (`IOSurfaceIsInUse`), more than the 1 in 300 earlier, possibly because of the resizing. Real video would tear there. So the helper should skip to the next free slot, or wait, rather than write blindly in turn. pepper accepts up to 4 surfaces.
+9 of the 600 frames (1.5%) went into a surface still in use (`IOSurfaceIsInUse`), more than the 1 in 300 earlier, possibly because of the resizing. Real video would tear there. So the helper should skip to the next free slot, or wait, rather than write blindly in turn. Pepper accepts up to 4 surfaces.
 
 ## Helper (2026-10-13)
 
-`tuitube-video` (tuitube's `video/` crate): libmpv's render API draws with OpenGL (a CGL context with no window) into 4 IOSurface-backed framebuffers. It always picks a surface the window server isn't showing (`IOSurfaceIsInUse`) and sends pepper "present slot k" after `glFinish`. It takes tuitube's mpv options and IPC on fd 3 unchanged, and gets the token and the box's pixel size as `script-message-to main pepper-token|pepper-size`. Driven by `inline-video/helper_try.py`.
+`tuitube-video` (tuitube's `video/` crate): libmpv's render API draws with OpenGL (a CGL context with no window) into 4 IOSurface-backed framebuffers. It always picks a surface the window server isn't showing (`IOSurfaceIsInUse`) and sends Pepper "present slot k" after `glFinish`. It takes tuitube's mpv options and IPC on fd 3 unchanged, and gets the token and the box's pixel size as `script-message-to main pepper-token|pepper-size`. Driven by `inline-video/helper_try.py`.
 
-The 1080p30 H.264 test file with sound, release build, played into a 139×31-cell box (2502×1426 px) in a pepper tab:
+The 1080p30 H.264 test file with sound, release build, played into a 139×31-cell box (2502×1426 px) in a Pepper tab:
 
 | | CPU |
 | --- | --- |
 | helper (decode with `videotoolbox`, scale, draw) | 7.4% |
-| pepper (its idle was 3–4%) | 3.2% |
+| Pepper (its idle was 3–4%) | 3.2% |
 
 445 frames in 15 s, 1 drawn into a surface still on screen (all 3 others were showing). The picture is upright with `FLIP_Y` 0. mpv's own window was 16% at 4806 px wide, mpv's kitty output in a large box 98% + 15% in Ghostty. Not yet measured: WindowServer, and a like-for-like run with `bench.py`.
 
 ## Measured against mpv's window (2026-10-14)
 
-`inline-video/bench_pepper.py`, in a pepper tab: the 1080p30 test file, 15 s per run, `--hwdec=auto-safe`, no sound (`--ao=null`). It measures the player's own CPU (wait4, so the samplers' `ps` and `ioreg` don't count), pepper's and WindowServer's, the graphics chip's use (ioreg's Device Utilization %, sampled) and the largest memory.
+`inline-video/bench_pepper.py`, in a Pepper tab: the 1080p30 test file, 15 s per run, `--hwdec=auto-safe`, no sound (`--ao=null`). It measures the player's own CPU (wait4, so the samplers' `ps` and `ioreg` don't count), Pepper's and WindowServer's, the graphics chip's use (ioreg's Device Utilization %, sampled) and the largest memory.
 
-| Run | Player | pepper | WindowServer | GPU | Player MB | pepper MB | fps |
+| Run | Player | Pepper | WindowServer | GPU | Player MB | Pepper MB | fps |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | Idle | – | 4.7% | 55.8% | 43% | – | 77 | – |
-| pepper, 540×391 px | 8.0% | 4.5% | 56.1% | 46% | 104 | 77 | 30 |
-| pepper, 1764×759 px | 7.8% | 4.7% | 55.4% | 43% | 103 | 77 | 30 |
+| Pepper, 540×391 px | 8.0% | 4.5% | 56.1% | 46% | 104 | 77 | 30 |
+| Pepper, 1764×759 px | 7.8% | 4.7% | 55.4% | 43% | 103 | 77 | 30 |
 | mpv's window, 540×391 px | 13.6% | 0.3% | 45.4% | 39% | 376 | 83 | – |
 | mpv's window, 1764×759 px | 14.3% | 0.4% | 45.8% | 41% | 367 | 84 | – |
 
-- Inside pepper the player (tuitube-video) costs about 45% less CPU than mpv with its own window, and 3.5× less memory. pepper and WindowServer stay at their idle (nothing added), and the box's size barely matters.
-- In the window runs pepper and WindowServer fall below their idle because mpv's window covers the terminal: pepper stops drawing, and WindowServer stops blurring the see-through window over the wallpaper. Their idle is what the terminal costs while it's on screen, which watching in tuitube pays either way.
+- Inside Pepper the player (tuitube-video) costs about 45% less CPU than mpv with its own window, and 3.5× less memory. Pepper and WindowServer stay at their idle (nothing added), and the box's size barely matters.
+- In the window runs Pepper and WindowServer fall below their idle because mpv's window covers the terminal: Pepper stops drawing, and WindowServer stops blurring the see-through window over the wallpaper. Their idle is what the terminal costs while it's on screen, which watching in tuitube pays either way.
 - WindowServer and the GPU are busy at idle on this Mac (56%, 43%), so differences of a few points there are noise.
 
 ## Now Playing through libmpv (2026-10-14)

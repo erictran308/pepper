@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Plays a file through tuitube-video into pepper, the way tuitube will.
+"""Plays a file through tuitube-video into Pepper, the way tuitube will.
 
-Run it in a pepper tab:
+Run it in a Pepper tab:
 
     python3 -I helper_try.py HELPER VIDEO [SECONDS]
 
@@ -142,7 +142,7 @@ def main():
 
 
 def measure(helper_pid, pepper_pid, samples=6):
-    """CPU of the helper and pepper, from 3 s in (top's first sample is skipped)."""
+    """CPU of the helper and Pepper, from 3 s in (top's first sample is skipped)."""
     time.sleep(3)
     out = subprocess.run(
         ["/usr/bin/top", "-l", str(samples + 1), "-s", "1", "-stats", "pid,cpu",

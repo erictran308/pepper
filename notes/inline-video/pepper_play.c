@@ -1,13 +1,13 @@
-// Test client for pepper: places a box with OSC 777;pepper, hands pepper 3
+// Test client for Pepper: places a box with OSC 777;pepper, hands Pepper 3
 // IOSurfaces over its Mach port with the same token, then draws a moving bar
 // into each in turn and presents it.
 //
 //   clang -O2 -o pepper_play pepper_play.c -framework IOSurface -framework CoreFoundation
 //   ./pepper_play [-k] [seconds=10] [fps=30]
 //
-// Run it in a pepper tab (it needs PEPPER_PORT, and the escape sequence must
-// reach pepper). -k exits without detaching or removing the box, as a
-// crashed helper would: pepper should clear the frame by itself.
+// Run it in a Pepper tab (it needs PEPPER_PORT, and the escape sequence must
+// reach Pepper). -k exits without detaching or removing the box, as a
+// crashed helper would: Pepper should clear the frame by itself.
 // Messages match macos/Sources/Features/Pepper/PepperServer.swift.
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
@@ -124,7 +124,7 @@ int main(int argc, char **argv) {
     double fps = argc > 2 ? atof(argv[2]) : 30;
     const char *name = getenv("PEPPER_PORT");
     if (!name) {
-        fprintf(stderr, "PEPPER_PORT is not set: run this in a pepper tab\n");
+        fprintf(stderr, "PEPPER_PORT is not set: run this in a Pepper tab\n");
         return 1;
     }
     kern_return_t kr = bootstrap_look_up(bootstrap_port, name, &server);
@@ -138,7 +138,7 @@ int main(int argc, char **argv) {
     arc4random_buf(random, sizeof random);
     for (int i = 0; i < 16; i++) snprintf(token + 2 * i, 3, "%02x", random[i]);
 
-    // Our port: pepper watches it to learn when we die.
+    // Our port: Pepper watches it to learn when we die.
     mach_port_t client;
     mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &client);
 

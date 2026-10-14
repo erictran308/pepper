@@ -1,11 +1,11 @@
-"""What playing a video costs: inside pepper through tuitube-video, or in
+"""What playing a video costs: inside Pepper through tuitube-video, or in
 mpv's own window, at the same sizes. Each run plays the same 1080p H.264 file
 for SECONDS with tuitube's --hwdec=auto-safe and no sound (--ao=null, as
-bench.py), and measures the CPU time of the player, pepper and WindowServer,
+bench.py), and measures the CPU time of the player, Pepper and WindowServer,
 the graphics chip's use (ioreg's Device Utilization %, sampled), and the
-largest memory of the player and pepper.
+largest memory of the player and Pepper.
 
-Run it in a pepper tab, as large as you use it, and don't touch anything:
+Run it in a Pepper tab, as large as you use it, and don't touch anything:
 
     python3 -I bench_pepper.py [HELPER] [VIDEO]
 
@@ -153,7 +153,7 @@ def inline(name, col, row, cols, rows, cw, ch, pids):
     ours.close()
     os.write(1, f"\x1b]777;pepper;remove;{token}\x1b\\".encode())
     shown = re.search(r"(\d+) frames drawn, (\d+) shown", stderr)
-    result.update(run=f"pepper {width}x{height}",
+    result.update(run=f"Pepper {width}x{height}",
                   fps=int(shown.group(2)) / result["wall"] if shown else None,
                   hwdec=hwdec.get("current") or "?")
     return result
@@ -182,7 +182,7 @@ def main():
     if len(sys.argv) > 2:
         globals()["VIDEO"] = sys.argv[2]
     if not os.environ.get("PEPPER_PORT"):
-        sys.exit("run this in a pepper tab (PEPPER_PORT is not set)")
+        sys.exit("run this in a Pepper tab (PEPPER_PORT is not set)")
     for path in (HELPER, VIDEO):
         if not os.path.exists(path):
             sys.exit(f"not found: {path}")
@@ -202,14 +202,14 @@ def main():
     results.append(idle)
 
     for i, (bc, br) in enumerate((small, large)):
-        say(f"{2 + i}/5 pepper, a {bc}x{br} cell box, {SECONDS} s")
+        say(f"{2 + i}/5 Pepper, a {bc}x{br} cell box, {SECONDS} s")
         results.append(inline(f"inline-{i}", 6, 3, bc, br, cw, ch, pids))
     for i, (bc, br) in enumerate((small, large)):
         w, h = round(bc * cw), round(br * ch)
         say(f"{4 + i}/5 mpv's own window, {w}x{h} px, {SECONDS} s (it opens over this)")
         results.append(window(f"window-{i}", w, h, pids))
 
-    lines = ["run                   player%  pepper%  windowserver%  gpu%  player MB  pepper MB  fps  hwdec"]
+    lines = ["run                   player%  Pepper%  windowserver%  gpu%  player MB  Pepper MB  fps  hwdec"]
     for r in results:
         fps = f"{r['fps']:.0f}" if r["fps"] is not None else "-"
         lines.append(f"{r['run']:<21} {r['player']:>7.1f}  {r['pepper']:>7.1f}  {r['windowserver']:>13.1f}"
