@@ -27,9 +27,6 @@ struct TerminalCommandPaletteView: View {
     /// The configuration so we can lookup keyboard shortcuts.
     @ObservedObject var ghosttyConfig: Ghostty.Config
 
-    /// The update view model for showing update commands.
-    var updateViewModel: UpdateViewModel?
-
     /// The callback when an action is submitted.
     var onAction: ((String) -> Void)
 
@@ -70,57 +67,14 @@ struct TerminalCommandPaletteView: View {
         }
     }
 
-    /// All commands available in the command palette, combining update and terminal options.
+    /// All commands available in the command palette.
     private var commandOptions: [CommandOption] {
         var options: [CommandOption] = []
-        // Updates always appear first
-        options.append(contentsOf: updateOptions)
 
         // Sort the rest. We replace ":" with a character that sorts before space
         // so that "Foo:" sorts before "Foo Bar:". Use sortKey as a tie-breaker
         // for stable ordering when titles are equal.
         options.append(contentsOf: sortedTerminalPaletteOptions(jumpOptions + terminalOptions))
-        return options
-    }
-
-    /// Commands for installing or canceling available updates.
-    private var updateOptions: [CommandOption] {
-        var options: [CommandOption] = []
-
-        guard let updateViewModel else {
-            return options
-        }
-
-        if updateViewModel.state.isInstallable {
-            // We override the update available one only because we want to properly
-            // convey it'll go all the way through.
-            let title: String
-            if case .updateAvailable = updateViewModel.state {
-                title = "Update Pepper and Restart"
-            } else {
-                title = updateViewModel.text
-            }
-
-            options.append(CommandOption(
-                title: title,
-                description: updateViewModel.description,
-                leadingIcon: updateViewModel.iconName ?? "shippingbox.fill",
-                badge: updateViewModel.badge,
-                emphasis: true
-            ) {
-                (NSApp.delegate as? AppDelegate)?.updateController.viewModel.state.confirm()
-            })
-        }
-
-        if updateViewModel.state.isCancellable {
-            options.append(CommandOption(
-                title: "Cancel or Skip Update",
-                description: "Dismiss the current update process"
-            ) {
-                updateViewModel.state.cancel()
-            })
-        }
-
         return options
     }
 
