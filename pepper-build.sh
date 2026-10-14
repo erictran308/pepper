@@ -1,5 +1,5 @@
 #!/bin/sh
-# Builds pepper with Zig 0.15.2 against Apple's 26.4+ SDKs.
+# Builds Pepper with Zig 0.15.2 against Apple's 26.4+ SDKs.
 #
 # Those SDKs' .tbd stubs list only arm64e-macos, and Zig 0.15.2 links only
 # against stubs naming arm64-macos, so every libc symbol comes out undefined.
@@ -11,8 +11,14 @@
 # math.h supplies the two macros, and puts an xcrun first on PATH that gives
 # its path to Zig. xcodebuild keeps using the real SDK.
 #
+# Then it builds pepper-play (pepper-play/, Rust) and puts it in the app as
+# Contents/Helpers/Pepper.app, signed ad hoc, and signs the app again
+# around it.
+#
 # Usage: ./pepper-build.sh [zig build options]   (default: -Doptimize=ReleaseFast)
 set -eu
+cd "$(dirname "$0")"
+path_before=$PATH
 
 zig_want=0.15.2
 zig_have=$(zig version 2>/dev/null || true)
@@ -72,7 +78,35 @@ exec /usr/bin/xcrun "$@"
 EOF
 chmod +x "$cache/bin/xcrun"
 
-export PEPPER_SDK="$view"
-export PATH="$cache/bin:$PATH"
 [ "$#" -gt 0 ] || set -- -Doptimize=ReleaseFast
-exec zig build "$@"
+PEPPER_SDK="$view" PATH="$cache/bin:$PATH" zig build "$@"
+
+# Built without the app (-Demit-macos-app=false): nothing to put it in.
+app=zig-out/Ghostty.app
+[ -d "$app" ] || exit 0
+
+echo "pepper-build: building pepper-play" >&2
+PATH="$path_before" cargo build --release --locked --manifest-path pepper-play/Cargo.toml
+helper="$app/Contents/Helpers/Pepper.app"
+rm -rf "$app/Contents/Helpers"
+mkdir -p "$helper/Contents/MacOS" "$helper/Contents/Resources"
+cp pepper-play/Info.plist "$helper/Contents/Info.plist"
+cp pepper-play/target/release/pepper-play "$helper/Contents/MacOS/pepper-play"
+version=$("$helper/Contents/MacOS/pepper-play" --version | cut -d' ' -f2)
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$helper/Contents/Info.plist"
+# The app's icon, for Now Playing.
+icon=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist" 2>/dev/null || true)
+if [ -n "$icon" ] && [ -f "$app/Contents/Resources/$icon.icns" ]; then
+    cp "$app/Contents/Resources/$icon.icns" "$helper/Contents/Resources/pepper.icns"
+fi
+
+# On every shell's PATH: Pepper adds Contents/MacOS to it. A link, which
+# pepper-play follows to run from its bundle.
+ln -sf ../Helpers/Pepper.app/Contents/MacOS/pepper-play "$app/Contents/MacOS/pepper-play"
+
+# The helper first, then the app, keeping what Xcode gave it (entitlements,
+# hardened runtime).
+codesign --force --sign - "$helper"
+codesign --force --sign - --preserve-metadata=entitlements,requirements,flags,runtime "$app"
+codesign --verify --deep --strict "$app"
+echo "pepper-build: $app, with pepper-play $version" >&2

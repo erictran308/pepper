@@ -22,6 +22,15 @@ import QuartzCore
 ///   dies, its streams go.
 /// - present: the token, then a `UInt32` slot; shows that surface.
 /// - detach: the token; ends the stream.
+///
+/// Pepper answers on the client's port, never waiting for it:
+/// - size: the token, then the box's width and height in pixels and whether
+///   it's placed, as `UInt32`s. Sent when a token's stream and placement
+///   both exist, and when the placement moves, resizes or goes, so the
+///   client draws its frames at the box's size.
+///
+/// Every shell gets the port's name as `PEPPER_PORT`, and pepper-play's path
+/// (the player in `Contents/Helpers`) as `PEPPER_PLAY`.
 final class PepperServer {
     static let shared = PepperServer()
 
@@ -31,8 +40,12 @@ final class PepperServer {
         case detach = 0x7070_0003
     }
 
+    /// The size message, to a client.
+    private static let sizeID: mach_msg_id_t = 0x7070_0101
+
     /// The kernel's notifications (mach/notify.h).
     private static let notifyPortDeleted: mach_msg_id_t = 0o101
+    private static let notifySendOnce: mach_msg_id_t = 0o107
     private static let notifyDeadName: mach_msg_id_t = 0o110
 
     /// MACH_PORT_TYPE_DEAD_NAME, a macro Swift doesn't import.
@@ -68,12 +81,22 @@ final class PepperServer {
         /// Our send right to the client's port; one user reference per stream.
         var client: mach_port_t
         var slot: Int?
+        /// What the client was last told of its box.
+        var reported: BoxSize?
     }
 
     /// Where a token's frames show.
     private struct Placement {
         weak var view: Ghostty.SurfaceView?
         let layer: CALayer
+        /// The box's size in pixels.
+        var pixels: CGSize = .zero
+    }
+
+    private struct BoxSize: Equatable {
+        var width: UInt32
+        var height: UInt32
+        var visible: Bool
     }
 
     private var port = mach_port_t(MACH_PORT_NULL)
@@ -101,6 +124,11 @@ final class PepperServer {
             return
         }
         setenv("PEPPER_PORT", name, 1)
+        let play = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/Helpers/Pepper.app/Contents/MacOS/pepper-play")
+        if FileManager.default.isExecutableFile(atPath: play.path) {
+            setenv("PEPPER_PLAY", play.path, 1)
+        }
 
         let source = DispatchSource.makeMachReceiveSource(port: port, queue: .main)
         source.setEventHandler { [weak self] in self?.drain() }
@@ -118,6 +146,7 @@ final class PepperServer {
         guard !pixels.isEmpty else {
             if let placement = placements.removeValue(forKey: token) {
                 remove(placement.layer)
+                report(token)
             }
             return
         }
@@ -139,7 +168,10 @@ final class PepperServer {
             placement = Placement(view: view, layer: layer)
             placements[token] = placement
         }
-        guard let layer = placement?.layer else { return }
+        guard var current = placement else { return }
+        current.pixels = pixels.size
+        placements[token] = current
+        let layer = current.layer
 
         let scale = host.contentsScale
         CATransaction.begin()
@@ -153,6 +185,7 @@ final class PepperServer {
         if layer.superlayer !== host { host.addSublayer(layer) }
         layer.contents = currentSurface(token)
         CATransaction.commit()
+        report(token)
     }
 
     private func remove(_ layer: CALayer) {
@@ -163,7 +196,10 @@ final class PepperServer {
     }
 
     private func pruneGoneViews() {
-        placements = placements.filter { $0.value.view != nil }
+        for (token, placement) in placements where placement.view == nil {
+            placements.removeValue(forKey: token)
+            report(token)
+        }
     }
 
     private func currentSurface(_ token: String) -> IOSurface? {
@@ -225,6 +261,10 @@ final class PepperServer {
             return
         case Self.notifyPortDeleted:
             // A stream ended first and its client's name went with it.
+            return
+        case Self.notifySendOnce:
+            // A client attached again: its earlier dead-name request, given
+            // back by mach_port_request_notification, was let go.
             return
         default:
             break
@@ -330,6 +370,7 @@ final class PepperServer {
         dropStream(token)
         streams[token] = Stream(surfaces: surfaces, client: client, slot: nil)
         show(token)
+        report(token)
         Self.logger.info("attached \(surfaces.count) surfaces")
     }
 
@@ -343,6 +384,71 @@ final class PepperServer {
     private func dropStream(_ token: String) {
         guard let stream = streams.removeValue(forKey: token) else { return }
         mach_port_deallocate(mach_task_self_, stream.client)
+    }
+
+    // MARK: Answering
+
+    /// Tells the token's client its box's size, if that changed since it was
+    /// last told: the placement's, or the last one, not visible, once the
+    /// placement is gone.
+    private func report(_ token: String) {
+        guard var stream = streams[token] else { return }
+        let size: BoxSize
+        if let placement = placements[token], placement.view != nil {
+            size = BoxSize(
+                width: UInt32(placement.pixels.width),
+                height: UInt32(placement.pixels.height),
+                visible: true
+            )
+        } else if let last = stream.reported {
+            size = BoxSize(width: last.width, height: last.height, visible: false)
+        } else {
+            return
+        }
+        guard size != stream.reported, send(size, token: token, to: stream.client) else { return }
+        stream.reported = size
+        streams[token] = stream
+    }
+
+    /// Sends the size message without waiting: a client whose queue is full,
+    /// or that's gone, misses it.
+    private func send(_ size: BoxSize, token: String, to client: mach_port_t) -> Bool {
+        let headerSize = MemoryLayout<mach_msg_header_t>.size
+        let byteCount = headerSize + Self.tokenSize + 3 * MemoryLayout<UInt32>.size
+        let kr = withUnsafeTemporaryAllocation(byteCount: byteCount, alignment: 8) { buffer in
+            guard let raw = buffer.baseAddress else { return KERN_FAILURE }
+            raw.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
+            var header = mach_msg_header_t()
+            header.msgh_bits = mach_msg_bits_t(MACH_MSG_TYPE_COPY_SEND)
+            header.msgh_size = mach_msg_size_t(byteCount)
+            header.msgh_remote_port = client
+            header.msgh_id = Self.sizeID
+            raw.storeBytes(of: header, as: mach_msg_header_t.self)
+            let bytes = Array(token.utf8.prefix(Self.tokenSize))
+            bytes.withUnsafeBytes { token in
+                if let base = token.baseAddress {
+                    (raw + headerSize).copyMemory(from: base, byteCount: token.count)
+                }
+            }
+            var offset = headerSize + Self.tokenSize
+            for value in [size.width, size.height, size.visible ? 1 : 0] {
+                raw.storeBytes(of: value, toByteOffset: offset, as: UInt32.self)
+                offset += MemoryLayout<UInt32>.size
+            }
+            return mach_msg(
+                raw.assumingMemoryBound(to: mach_msg_header_t.self),
+                MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                mach_msg_size_t(byteCount),
+                0,
+                mach_port_t(MACH_PORT_NULL),
+                0,
+                mach_port_t(MACH_PORT_NULL)
+            )
+        }
+        if kr != KERN_SUCCESS {
+            Self.logger.warning("size to client failed: \(kr)")
+        }
+        return kr == KERN_SUCCESS
     }
 
     private func clientDied(_ name: mach_port_t) {
