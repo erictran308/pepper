@@ -60,17 +60,20 @@ mod macos {
     use std::ffi::{CStr, CString, c_char, c_int, c_void};
     use std::process::ExitCode;
     use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
+    use std::time::{Duration, Instant};
 
     use crate::nowplaying::NowPlaying;
     use crate::terminal::{self, Cells, Screen, Tty};
     use crate::{gl, mpv, pepper, runloop};
 
     const USAGE: &str = "\
-usage: pepper-play [mpv options] FILE|URL ...
+usage: pepper-play [mpv options] [--] FILE|URL ...
 
 Plays video inside Pepper's terminal, through libmpv (brew install mpv).
 URLs go through yt-dlp, as in mpv. mpv's keys work: q quits, space pauses,
-arrows seek.
+arrows seek, f fills the whole tab (Cmd-Enter: Pepper's window, full screen).
+All after -- is a file or URL, even one that starts with --: put it before
+names you didn't write yourself.
 
 By an app: set PEPPER_TOKEN, or give --input-ipc-client=fd://N or
 --input-ipc-server=PATH, and place the box yourself. See
@@ -80,8 +83,15 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     /// The surfaces' size until Pepper says the box's.
     const DEFAULT_SIZE: (u32, u32) = (640, 360);
     const MAX_SIDE: u32 = 8192;
+    /// The most pixels a surface has (a 6K screen's worth): a bigger box
+    /// gets frames this size, scaled up.
+    const MAX_PIXELS: u64 = 6144 * 3456;
     /// The most of mpv's errors kept, run from a shell, to show at the end.
     const MAX_ERRORS: usize = 20;
+    /// The most of one of mpv's messages printed, in bytes.
+    const MAX_LINE: usize = 1024;
+    /// How long after Pepper didn't take the surfaces they're offered again.
+    const ATTACH_AGAIN: Duration = Duration::from_secs(1);
 
     /// mpv's options that start its IPC: set once frames can be drawn.
     const IPC_OPTIONS: [&str; 2] = ["input-ipc-client", "input-ipc-server"];
@@ -176,10 +186,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         /// and, if something couldn't play, says why. After mpv has let go
         /// of the terminal.
         fn end(self, failed: bool) {
+            let token = self.shared.lock().token.clone();
             if let Some(screen) = self.screen {
                 screen.leave();
             } else if self.placed
-                && let (Some(tty), Some(token)) = (&self.tty, &self.shared.lock().token)
+                && let (Some(tty), Some(token)) = (&self.tty, &token)
             {
                 tty.write(&terminal::remove(token));
             }
@@ -345,6 +356,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             // mpv's status line, and its keys from the terminal.
             set_option(mpv, "terminal", "yes")?;
             set_option(mpv, "input-terminal", "yes")?;
+            // But none of mpv's messages: they hold the video's tags, file
+            // names and URLs, which mpv prints with any escape sequences in
+            // them. Its errors are shown, made safe, once the screen is back.
+            set_option(mpv, "msg-level", "all=no,statusline=status")?;
         }
         let mut ipc = Vec::new();
         for (name, value) in &setup.args.options {
@@ -352,6 +367,9 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 name if IPC_OPTIONS.contains(&name) => ipc.push((name.to_owned(), value.clone())),
                 // There's no window here to force.
                 "force-window" => {}
+                // Only to keep from mistakes: the options are the user's or
+                // the app's, who could still change the output with
+                // --vo-add, --profile or --include.
                 "vo" => return Err("--vo is this program's own".into()),
                 _ => set_option(mpv, name, value)?,
             }
@@ -524,7 +542,22 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     fn events(mpv: Mpv, session: &mut Session) {
         /// How often Now Playing is told it all again, with no event.
         const REFRESH: f64 = 5.0;
-        let mut now_playing = NowPlaying::start(mpv.0);
+        /// The reply id of mpv's `fullscreen`, apart from Now Playing's.
+        const FULLSCREEN: u64 = 1000;
+        let mut now_playing = NowPlaying::start(mpv.0, session.mode == Mode::App);
+        if session.screen.is_some() {
+            // From a shell, mpv's fullscreen (`f`) fills the whole window,
+            // over its status line: there's no window of mpv's to fill.
+            // SAFETY: a live handle and a C string.
+            unsafe {
+                mpv::mpv_observe_property(
+                    mpv.0,
+                    FULLSCREEN,
+                    c"fullscreen".as_ptr(),
+                    mpv::FORMAT_FLAG,
+                )
+            };
+        }
         loop {
             // SAFETY: mpv is a live handle; the event stays valid until the
             // next mpv_wait_event.
@@ -535,7 +568,17 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 mpv::EVENT_PROPERTY_CHANGE => {
                     // SAFETY: a property event's data is an mpv_event_property.
                     let property = unsafe { &*event.data.cast::<mpv::EventProperty>() };
-                    now_playing.on_property(mpv.0, property);
+                    if event.reply_userdata == FULLSCREEN {
+                        // SAFETY: a flag property's data is an int.
+                        let on = property.format == mpv::FORMAT_FLAG
+                            && !property.data.is_null()
+                            && unsafe { *property.data.cast::<c_int>() } != 0;
+                        if let Some(screen) = &session.screen {
+                            screen.set_fill(on);
+                        }
+                    } else {
+                        now_playing.on_property(mpv.0, property);
+                    }
                 }
                 mpv::EVENT_END_FILE => {
                     // SAFETY: an end-file event's data is an mpv_event_end_file.
@@ -549,7 +592,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                         let message = &*event.data.cast::<mpv::LogMessage>();
                         (CStr::from_ptr(message.prefix), CStr::from_ptr(message.text))
                     };
-                    let (prefix, text) = (prefix.to_string_lossy(), text.to_string_lossy());
+                    let (prefix, text) = (
+                        printable(&prefix.to_string_lossy()),
+                        printable(&text.to_string_lossy()),
+                    );
                     match session.mode {
                         Mode::App => eprint!("mpv [{prefix}] {text}"),
                         Mode::Shell if session.errors.len() < MAX_ERRORS => {
@@ -567,6 +613,30 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 _ => {}
             }
         }
+    }
+
+    /// mpv's text made safe to print to a terminal: it can hold a playlist
+    /// entry's name, a URL or yt-dlp's output, so its control characters (C0,
+    /// DEL, C1), which would start escape sequences, are shown escaped
+    /// (`\u{1b}`). Cut at MAX_LINE bytes; a newline at the end stays.
+    fn printable(text: &str) -> String {
+        let (body, newline) = match text.strip_suffix('\n') {
+            Some(body) => (body, "\n"),
+            None => (text, ""),
+        };
+        let mut out = String::new();
+        for c in body.chars() {
+            if out.len() >= MAX_LINE {
+                out.push('…');
+                break;
+            }
+            if c.is_control() {
+                out.extend(c.escape_default());
+            } else {
+                out.push(c);
+            }
+        }
+        out + newline
     }
 
     unsafe fn client_args(message: *const mpv::ClientMessage) -> Vec<String> {
@@ -662,9 +732,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 session.placed = true;
             }
             Message::Remove => {
-                if let (Some(tty), Some(token)) =
-                    (session.tty(), session.shared.lock().token.clone())
-                {
+                let token = session.shared.lock().token.clone();
+                if let (Some(tty), Some(token)) = (session.tty(), token) {
                     tty.write(&terminal::remove(&token));
                 }
                 session.placed = false;
@@ -681,10 +750,20 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     }
 
     /// A size Pepper reported, as surfaces can be made: none for a box
-    /// that's gone (the last size stays) or has no pixels.
+    /// that's gone (the last size stays) or has no pixels. At most MAX_SIDE
+    /// a side and MAX_PIXELS in all, the same shape.
     fn surface_size(size: pepper::BoxSize) -> Option<(u32, u32)> {
-        (size.visible && size.width > 0 && size.height > 0)
-            .then(|| (size.width.min(MAX_SIDE), size.height.min(MAX_SIDE)))
+        if !(size.visible && size.width > 0 && size.height > 0) {
+            return None;
+        }
+        let (w, h) = (size.width.min(MAX_SIDE), size.height.min(MAX_SIDE));
+        let pixels = w as u64 * h as u64;
+        if pixels <= MAX_PIXELS {
+            return Some((w, h));
+        }
+        let scale = (MAX_PIXELS as f64 / pixels as f64).sqrt();
+        let shrink = |side: u32| ((side as f64 * scale) as u32).max(1);
+        Some((shrink(w), shrink(h)))
     }
 
     /// Takes Pepper's reports of the box's size, for as long as the program
@@ -777,6 +856,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         }
         let mut ring: Vec<gl::Target> = Vec::new();
         let mut attached: Option<String> = None;
+        // The token Pepper last didn't take the surfaces for, and when: they
+        // go again once that's ATTACH_AGAIN ago, or new surfaces or a new
+        // token come, not with every frame.
+        let mut refused: Option<(String, Instant)> = None;
         let mut last = 0;
         let mut stats = Stats::default();
         // New surfaces, or surfaces Pepper hasn't seen: draw the frame again
@@ -800,6 +883,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             if ring.first().map(|t| (t.surface.width, t.surface.height)) != Some(size) {
                 ring.clear();
                 attached = None;
+                refused = None;
                 redraw = true;
                 match (0..pepper::MAX_SURFACES)
                     .map(|_| gl::Target::new(&context, size.0, size.1))
@@ -812,20 +896,28 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
 
             if let Some(client) = &client
                 && ring.len() == pepper::MAX_SURFACES
-                && token.is_some()
-                && token != attached
+                && let Some(token) = &token
+                && Some(token) != attached.as_ref()
+                && !refused
+                    .as_ref()
+                    .is_some_and(|(t, when)| t == token && when.elapsed() < ATTACH_AGAIN)
             {
                 if let Some(old) = attached.take() {
                     client.detach(&old);
                 }
-                let token = token.unwrap();
                 let surfaces = std::array::from_fn(|i| &ring[i].surface);
-                match client.attach(&token, surfaces) {
+                match client.attach(token, surfaces) {
                     Ok(()) => {
-                        attached = Some(token);
+                        attached = Some(token.clone());
+                        refused = None;
                         redraw = true;
                     }
-                    Err(err) => eprintln!("pepper-play: {err}"),
+                    Err(err) => {
+                        if refused.as_ref().is_none_or(|(t, _)| t != token) {
+                            eprintln!("pepper-play: {err}");
+                        }
+                        refused = Some((token.clone(), Instant::now()));
+                    }
                 }
             }
 
@@ -982,6 +1074,31 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             assert_eq!(size(1920, 1080, false), None);
             assert_eq!(size(0, 1080, true), None);
             assert_eq!(size(20000, 1080, true), Some((MAX_SIDE, 1080)));
+            assert_eq!(size(6016, 3384, true), Some((6016, 3384)));
+            let (w, h) = size(8192, 8192, true).unwrap();
+            assert!(w as u64 * h as u64 <= MAX_PIXELS && w == h && w > 4000);
+        }
+
+        #[test]
+        fn mpv_text_is_printed_inert() {
+            assert_eq!(
+                printable("Cannot open file '/a\x1b]2;X\x07.mp4'\n"),
+                "Cannot open file '/a\\u{1b}]2;X\\u{7}.mp4'\n"
+            );
+            assert_eq!(
+                printable("a\u{9b}31m\r\tb\x7f"),
+                "a\\u{9b}31m\\r\\tb\\u{7f}"
+            );
+            assert_eq!(printable("Failed to open é ✓.\n"), "Failed to open é ✓.\n");
+            let long = printable(&format!("{}\n", "x".repeat(5000)));
+            assert_eq!(long, format!("{}…\n", "x".repeat(MAX_LINE)));
+            let printed = printable("\x1b[2J\x1bP\u{90}\u{85}\n");
+            assert!(
+                printed
+                    .trim_end_matches('\n')
+                    .chars()
+                    .all(|c| !c.is_control())
+            );
         }
 
         #[test]

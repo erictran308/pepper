@@ -13,6 +13,9 @@ unsafe extern "C" {
     pub fn objc_msgSend();
     pub fn objc_autoreleasePoolPush() -> *mut c_void;
     pub fn objc_autoreleasePoolPop(pool: *mut c_void);
+    pub fn objc_retain(object: Id) -> Id;
+    pub fn objc_release(object: Id);
+    pub fn objc_autorelease(object: Id) -> Id;
 }
 
 /// `objc_msgSend` as a function of the given type: it must be called

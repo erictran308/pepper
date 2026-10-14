@@ -4,7 +4,9 @@
 //! libmpv is loaded at run time ([`load`]), not linked: Pepper ships this
 //! program, and the user's mpv (Homebrew's, MacPorts') brings the library.
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::ffi::{CStr, CString, c_char, c_int, c_ulong, c_void};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 use std::sync::OnceLock;
 
 #[repr(C)]
@@ -99,13 +101,17 @@ pub const RENDER_UPDATE_FRAME: u64 = 1;
 
 pub type UpdateCallback = unsafe extern "C" fn(ctx: *mut c_void);
 
-/// Where libmpv is looked for, after `PEPPER_LIBMPV`: Homebrew on Apple
-/// chips, Homebrew on Intel, MacPorts.
+/// Where libmpv is looked for, unless `PEPPER_LIBMPV` says: Homebrew on
+/// Apple chips, MacPorts, Homebrew on Intel.
 const PLACES: [&str; 3] = [
     "/opt/homebrew/lib/libmpv.2.dylib",
-    "/usr/local/lib/libmpv.2.dylib",
     "/opt/local/lib/libmpv.2.dylib",
+    "/usr/local/lib/libmpv.2.dylib",
 ];
+
+/// The client API's major version this program is written for (client.h's
+/// MPV_CLIENT_API_VERSION >> 16).
+const API_MAJOR: c_ulong = 2;
 
 const RTLD_NOW: c_int = 0x2;
 const RTLD_LOCAL: c_int = 0x4;
@@ -114,6 +120,15 @@ unsafe extern "C" {
     fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
     fn dlerror() -> *const c_char;
+    fn getuid() -> u32;
+    fn getxattr(
+        path: *const c_char,
+        name: *const c_char,
+        value: *mut c_void,
+        size: usize,
+        position: u32,
+        options: c_int,
+    ) -> isize;
 }
 
 /// Declares libmpv's functions: each becomes a pointer in [`Api`], found by
@@ -156,6 +171,7 @@ macro_rules! api {
 }
 
 api! {
+    fn mpv_client_api_version() -> c_ulong;
     fn mpv_create() -> *mut Handle;
     fn mpv_initialize(ctx: *mut Handle) -> c_int;
     fn mpv_set_option_string(ctx: *mut Handle, name: *const c_char, data: *const c_char) -> c_int;
@@ -184,51 +200,97 @@ fn api() -> &'static Api {
 }
 
 /// Loads libmpv: from `PEPPER_LIBMPV` if set, else the first of [`PLACES`]
-/// that opens. Call it once, before anything else here.
+/// there is. Call it once, before anything else here.
+///
+/// The library is code this program runs, so only a file that only the user
+/// or the system could have put there: an absolute path, the file and its
+/// folder owned by the user or root and not writable by others, and not
+/// downloaded (no quarantine).
 pub fn load() -> Result<(), String> {
     let from_env = std::env::var("PEPPER_LIBMPV")
         .ok()
         .filter(|p| !p.is_empty());
-    let places: Vec<String> = match &from_env {
-        Some(path) => vec![path.clone()],
-        None => PLACES.iter().map(|p| p.to_string()).collect(),
+    let place = match &from_env {
+        Some(path) => path.clone(),
+        None => PLACES
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .ok_or_else(|| {
+                format!(
+                    "libmpv not found (looked in {}): install mpv with `brew install mpv`, \
+                     or set PEPPER_LIBMPV to libmpv.2.dylib",
+                    PLACES.join(", ")
+                )
+            })?
+            .to_string(),
     };
-    let mut why = Vec::new();
-    for place in &places {
-        let Ok(path) = CString::new(place.as_str()) else {
-            continue;
+    let real = trusted(&place).map_err(|e| format!("won't load libmpv from {place}: {e}"))?;
+    let path = CString::new(real.as_os_str().as_encoded_bytes())
+        .map_err(|_| format!("{place} holds a NUL"))?;
+    // SAFETY: a C string path; the library stays open for the program's
+    // life.
+    let lib = unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
+    if lib.is_null() {
+        // SAFETY: dlerror's text is a C string, valid until the next dl call.
+        let error = unsafe { dlerror() };
+        let why = if error.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(error) }
+                .to_string_lossy()
+                .into_owned()
         };
-        // SAFETY: a C string path; the library stays open for the program's
-        // life.
-        let lib = unsafe { dlopen(path.as_ptr(), RTLD_NOW | RTLD_LOCAL) };
-        if lib.is_null() {
-            // SAFETY: dlerror's text is a C string, valid until the next dl call.
-            let error = unsafe { dlerror() };
-            if !error.is_null() && from_env.is_some() {
-                why.push(
-                    unsafe { CStr::from_ptr(error) }
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-            continue;
-        }
-        let api =
-            find(lib).map_err(|e| format!("{place} isn't a libmpv this program can use: {e}"))?;
-        let _ = API.set(api);
-        return Ok(());
+        return Err(format!("cannot load libmpv from {place}: {why}"));
     }
-    Err(match from_env {
-        Some(path) => format!(
-            "cannot load libmpv from PEPPER_LIBMPV ({path}): {}",
-            why.join("; ")
-        ),
-        None => format!(
-            "libmpv not found (looked in {}): install mpv with `brew install mpv`, \
-             or set PEPPER_LIBMPV to libmpv.2.dylib",
-            PLACES.join(", ")
-        ),
-    })
+    let api = find(lib).map_err(|e| format!("{place} isn't a libmpv this program can use: {e}"))?;
+    let _ = API.set(api);
+    // SAFETY: libmpv is loaded; a function with no arguments.
+    let version = unsafe { mpv_client_api_version() };
+    if version >> 16 != API_MAJOR {
+        return Err(format!(
+            "{place} has client API {}.{}; this program needs {API_MAJOR}.x",
+            version >> 16,
+            version & 0xffff
+        ));
+    }
+    Ok(())
+}
+
+/// The real path of a library to load, if only the user or the system
+/// could have put it there.
+fn trusted(place: &str) -> Result<std::path::PathBuf, String> {
+    if !place.starts_with('/') {
+        return Err("not an absolute path".into());
+    }
+    let real = std::fs::canonicalize(place).map_err(|e| e.to_string())?;
+    // SAFETY: getuid has no preconditions.
+    let me = unsafe { getuid() };
+    let folder = real.parent().ok_or("no folder")?;
+    for path in [real.as_path(), folder] {
+        let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if meta.uid() != me && meta.uid() != 0 {
+            return Err(format!("{} belongs to someone else", path.display()));
+        }
+        if meta.mode() & 0o002 != 0 {
+            return Err(format!("anyone can write to {}", path.display()));
+        }
+    }
+    let c_path = CString::new(real.as_os_str().as_encoded_bytes()).map_err(|_| "holds a NUL")?;
+    // SAFETY: C strings; with no buffer, getxattr only says the size.
+    let quarantined = unsafe {
+        getxattr(
+            c_path.as_ptr(),
+            c"com.apple.quarantine".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+        )
+    } >= 0;
+    if quarantined {
+        return Err(format!("{} was downloaded (quarantined)", real.display()));
+    }
+    Ok(real)
 }
 
 /// mpv's text for an error code.
