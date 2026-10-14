@@ -1842,20 +1842,13 @@ pub const StreamHandler = struct {
     }
 
     fn pepperPlace(self: *StreamHandler, value: terminal.StreamAction.PepperPlace) void {
-        var message = apprt.surface.Message{ .pepper_place = .{
-            .token = undefined,
+        self.surfaceMessageWriter(.{ .pepper_place = .{
+            .token = pepperToken(value.token),
             .col = value.col,
             .row = value.row,
             .cols = value.cols,
             .rows = value.rows,
-        } };
-
-        // The parser already refuses longer tokens.
-        const token_len = @min(value.token.len, message.pepper_place.token.len);
-        @memcpy(message.pepper_place.token[0..token_len], value.token[0..token_len]);
-        message.pepper_place.token[token_len] = 0;
-
-        self.surfaceMessageWriter(message);
+        } });
     }
 
     /// Send a report to the pty.
@@ -2040,4 +2033,28 @@ test "kitty clipboard write: oversized text replies EFBIG" {
     // Teardown leaves no transaction that could be committed and
     // forwarded to the macOS clipboard path.
     try testing.expect(mailbox.spsc.queue.pop(global.io()) == null);
+}
+
+/// pepper: a token as a surface message holds it: NUL padded, cut at the
+/// longest the parser takes (it refuses longer ones already).
+fn pepperToken(token: []const u8) [terminal.osc.Command.PepperPlace.token_max:0]u8 {
+    var out = [_:0]u8{0} ** terminal.osc.Command.PepperPlace.token_max;
+    const len = @min(token.len, out.len);
+    @memcpy(out[0..len], token[0..len]);
+    return out;
+}
+
+test "pepper token" {
+    const testing = std.testing;
+    const max = terminal.osc.Command.PepperPlace.token_max;
+
+    const short = pepperToken("ab_1");
+    try testing.expectEqualStrings("ab_1", std.mem.sliceTo(&short, 0));
+
+    const full = pepperToken("z" ** max);
+    try testing.expectEqualStrings("z" ** max, std.mem.sliceTo(&full, 0));
+    try testing.expectEqual(0, full[max]);
+
+    const long = pepperToken("y" ** (max + 8));
+    try testing.expectEqualStrings("y" ** max, std.mem.sliceTo(&long, 0));
 }
