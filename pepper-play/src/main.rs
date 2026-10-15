@@ -12,7 +12,7 @@
 //!   (`OSC 777;pepper;place;TOKEN;…`, or `script-message-to main
 //!   pepper-place COL ROW COLS ROWS`) and drives mpv over its JSON IPC.
 //!
-//! libmpv draws each frame with OpenGL into one of `pepper::MAX_SURFACES`
+//! libmpv draws each frame with OpenGL into one of a ring of `RING`
 //! IOSurfaces, and Pepper (its Mach port named in `PEPPER_PORT`) is told
 //! which one to show; nothing is copied. Pepper says the box's size in
 //! pixels, and the frames are drawn at it.
@@ -43,6 +43,8 @@ mod runloop;
 mod surface;
 #[cfg(target_os = "macos")]
 mod terminal;
+#[cfg(target_os = "macos")]
+mod vsync;
 
 #[cfg(target_os = "macos")]
 fn main() -> std::process::ExitCode {
@@ -64,6 +66,7 @@ mod macos {
 
     use crate::nowplaying::NowPlaying;
     use crate::terminal::{self, Cells, Screen, Tty};
+    use crate::vsync::Vsync;
     use crate::{gl, mpv, pepper, runloop};
 
     const USAGE: &str = "\
@@ -90,6 +93,15 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     const MAX_ERRORS: usize = 20;
     /// The most of one of mpv's messages printed, in bytes.
     const MAX_LINE: usize = 1024;
+    /// The surfaces frames are drawn into in turn, handed to Pepper once.
+    const RING: usize = pepper::MAX_SURFACES;
+    /// While the box's size keeps changing (a window drag), new surfaces
+    /// are made once it has stayed the same this long, or at least this
+    /// often; until then frames go into the old ones, which Pepper scales.
+    const SETTLE: Duration = Duration::from_millis(80);
+    const REMAKE_EVERY: Duration = Duration::from_millis(500);
+    /// Refreshes with nothing to show before the display link stops.
+    const LINK_IDLE: u32 = 30;
     /// How long after Pepper didn't take the surfaces they're offered again.
     const ATTACH_AGAIN: Duration = Duration::from_secs(1);
 
@@ -109,6 +121,9 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         /// Run by an app, which places the box and drives mpv.
         App,
     }
+
+    /// mpv's options, by name and value.
+    type Options = Vec<(String, String)>;
 
     /// The command line: mpv's options, then files and URLs.
     #[derive(Debug, Default, PartialEq)]
@@ -134,6 +149,16 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         /// The token or size changed.
         changed: bool,
         stop: bool,
+        /// A frame waits for the display's next refresh to be shown.
+        awaiting: bool,
+        /// The display refreshed while one waited.
+        refresh: bool,
+        /// Refreshes since one was waited for; at LINK_IDLE, `link_idle`
+        /// tells the render thread to stop the link.
+        idle_refreshes: u32,
+        link_idle: bool,
+        /// mpv blends frames (`interpolation`), so no frame repeats another.
+        interpolation: bool,
     }
 
     #[derive(Default)]
@@ -149,6 +174,23 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
 
         fn update(&self, f: impl FnOnce(&mut State)) {
             f(&mut self.lock());
+            self.wake.notify_one();
+        }
+
+        /// At each of the display's refreshes, while the link runs.
+        fn on_refresh(&self) {
+            let mut state = self.lock();
+            if state.awaiting {
+                state.refresh = true;
+                state.idle_refreshes = 0;
+            } else {
+                state.idle_refreshes = state.idle_refreshes.saturating_add(1);
+                if state.idle_refreshes != LINK_IDLE {
+                    return;
+                }
+                state.link_idle = true;
+            }
+            drop(state);
             self.wake.notify_one();
         }
     }
@@ -169,6 +211,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         errors: Vec<String>,
         /// A file or URL couldn't be played.
         failed: bool,
+        /// PEPPER_PLAY_DEBUG: mpv's hardware decoder, as last said
+        /// (`hwdec-current`), and the render thread's counts, said at the end.
+        hwdec: Option<String>,
+        stats: Option<Stats>,
     }
 
     impl Session {
@@ -200,6 +246,21 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 for error in &self.errors {
                     eprint!("{error}");
                 }
+            }
+            if let Some(stats) = &self.stats {
+                eprintln!(
+                    "pepper-play: {} frames drawn, {} shown, {} into a surface still on screen; \
+                     {} surfaces made in {} rings; {} repeats not drawn; \
+                     {:.3} s waiting on the graphics chip; hwdec {}",
+                    stats.drawn,
+                    stats.presented,
+                    stats.on_screen,
+                    stats.surfaces,
+                    stats.rings,
+                    stats.repeated,
+                    stats.gpu_wait.as_secs_f64(),
+                    self.hwdec.as_deref().unwrap_or("-"),
+                );
             }
         }
     }
@@ -321,9 +382,23 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             placed: false,
             errors: Vec::new(),
             failed: false,
+            hwdec: None,
+            stats: None,
         };
-        let result =
-            start(mpv, &setup, &mut session).and_then(|ipc| play(mpv, &setup, ipc, &mut session));
+        // The display's refresh, to show frames at and time video to; without
+        // it, each frame is shown as soon as it's drawn.
+        let vsync = Vsync::new(Box::new({
+            let shared = session.shared.clone();
+            move || shared.on_refresh()
+        }))
+        .inspect_err(|err| eprintln!("pepper-play: {err}"))
+        .ok();
+        let rate = vsync.as_ref().and_then(Vsync::rate);
+        if setup.debug {
+            eprintln!("pepper-play: the display refreshes {rate:?} times a second");
+        }
+        let result = start(mpv, &setup, rate, &mut session)
+            .and_then(|ipc| play(mpv, &setup, ipc, vsync, &mut session));
         // SAFETY: the render thread has freed its render context by now.
         // While mpv winds down, the main run loop still runs.
         unsafe { mpv::mpv_terminate_destroy(mpv.0) };
@@ -343,36 +418,12 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     fn start(
         mpv: Mpv,
         setup: &Setup,
+        rate: Option<f64>,
         session: &mut Session,
     ) -> Result<Vec<(String, String)>, String> {
-        set_option(mpv, "vo", "libmpv")?;
-        // Now Playing and the media keys, as the mpv program has them (libmpv
-        // turns them off); `--input-media-keys=no` turns them off.
-        set_option(mpv, "input-media-keys", "yes")?;
-        // And mpv's bindings for them (PLAYPAUSE cycles pause, …), which the
-        // mpv program has and libmpv doesn't.
-        set_option(mpv, "input-default-bindings", "yes")?;
-        if setup.mode == Mode::Shell {
-            // mpv's status line, and its keys from the terminal.
-            set_option(mpv, "terminal", "yes")?;
-            set_option(mpv, "input-terminal", "yes")?;
-            // But none of mpv's messages: they hold the video's tags, file
-            // names and URLs, which mpv prints with any escape sequences in
-            // them. Its errors are shown, made safe, once the screen is back.
-            set_option(mpv, "msg-level", "all=no,statusline=status")?;
-        }
-        let mut ipc = Vec::new();
-        for (name, value) in &setup.args.options {
-            match name.as_str() {
-                name if IPC_OPTIONS.contains(&name) => ipc.push((name.to_owned(), value.clone())),
-                // There's no window here to force.
-                "force-window" => {}
-                // Only to keep from mistakes: the options are the user's or
-                // the app's, who could still change the output with
-                // --vo-add, --profile or --include.
-                "vo" => return Err("--vo is this program's own".into()),
-                _ => set_option(mpv, name, value)?,
-            }
+        let (options, ipc) = mpv_options(setup.mode, &setup.args, rate)?;
+        for (name, value) in &options {
+            set_option(mpv, name, value)?;
         }
 
         if setup.mode == Mode::Shell {
@@ -401,11 +452,76 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         Ok(ipc)
     }
 
+    /// mpv's options in the order they're set, and apart, the IPC options,
+    /// to set once frames can be drawn. This program's own come first, so
+    /// that the user's or the app's, set after them, win.
+    fn mpv_options(
+        mode: Mode,
+        args: &Args,
+        rate: Option<f64>,
+    ) -> Result<(Options, Options), String> {
+        let mut own = vec![
+            ("vo", "libmpv"),
+            // Now Playing and the media keys, as the mpv program has them
+            // (libmpv turns them off); `--input-media-keys=no` turns them off.
+            ("input-media-keys", "yes"),
+            // And mpv's bindings for them (PLAYPAUSE cycles pause, …), which
+            // the mpv program has and libmpv doesn't.
+            ("input-default-bindings", "yes"),
+            // Decoding on the graphics chip (VideoToolbox) for what it can
+            // decode, the CPU for the rest. mpv hands VideoToolbox's frames to
+            // OpenGL with no copy (CGLTexImageIOSurface2D). libmpv's default
+            // is no, and it doesn't read the user's mpv.conf: `--hwdec=no`
+            // turns it off.
+            ("hwdec", "auto-safe"),
+        ];
+        if mode == Mode::Shell {
+            own.extend([
+                // mpv's status line, and its keys from the terminal.
+                ("terminal", "yes"),
+                ("input-terminal", "yes"),
+                // But none of mpv's messages: they hold the video's tags, file
+                // names and URLs, which mpv prints with any escape sequences
+                // in them. Its errors are shown, made safe, once the screen is
+                // back.
+                ("msg-level", "all=no,statusline=status"),
+            ]);
+        }
+        let mut options: Vec<(String, String)> = own
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect();
+        if let Some(rate) = rate {
+            // Frames are shown at the display's refreshes (vsync.rs), so mpv
+            // can time video to the display, as in its own window: it plays
+            // the sound a hair faster or slower to match, and a 24 fps film
+            // keeps an even cadence. libmpv can't ask the display's rate, so
+            // it's told. `--video-sync=audio` goes back to timing by sound.
+            options.push(("display-fps-override".into(), format!("{rate:.6}")));
+            options.push(("video-sync".into(), "display-resample".into()));
+        }
+        let mut ipc = Vec::new();
+        for (name, value) in &args.options {
+            match name.as_str() {
+                name if IPC_OPTIONS.contains(&name) => ipc.push((name.to_owned(), value.clone())),
+                // There's no window here to force.
+                "force-window" => {}
+                // Only to keep from mistakes: the options are the user's or
+                // the app's, who could still change the output with
+                // --vo-add, --profile or --include.
+                "vo" => return Err("--vo is this program's own".into()),
+                _ => options.push((name.clone(), value.clone())),
+            }
+        }
+        Ok((options, ipc))
+    }
+
     /// Draws and plays until mpv shuts down.
     fn play(
         mpv: Mpv,
         setup: &Setup,
         ipc: Vec<(String, String)>,
+        vsync: Option<Vsync>,
         session: &mut Session,
     ) -> Result<(), String> {
         let shared = session.shared.clone();
@@ -414,7 +530,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             let shared = shared.clone();
             let port = setup.port.clone();
             let debug = setup.debug;
-            move || render(mpv, shared, port, debug, ready_tx)
+            move || render(mpv, shared, port, debug, vsync, ready_tx)
         });
         let ready = ready_rx
             .recv()
@@ -445,11 +561,14 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 }
             });
         if started.is_ok() {
-            events(mpv, session);
+            events(mpv, setup.debug, session);
         }
 
         shared.update(|state| state.stop = true);
-        let _ = render.join();
+        let stats = render.join().ok();
+        if setup.debug {
+            session.stats = stats;
+        }
         started
     }
 
@@ -539,12 +658,37 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     }
 
     /// mpv's events, until it shuts down.
-    fn events(mpv: Mpv, session: &mut Session) {
+    fn events(mpv: Mpv, debug: bool, session: &mut Session) {
         /// How often Now Playing is told it all again, with no event.
         const REFRESH: f64 = 5.0;
-        /// The reply id of mpv's `fullscreen`, apart from Now Playing's.
+        /// The reply ids of mpv's `fullscreen` and `hwdec-current`, apart
+        /// from Now Playing's.
         const FULLSCREEN: u64 = 1000;
+        const HWDEC: u64 = 1001;
+        const INTERPOLATION: u64 = 1002;
         let mut now_playing = NowPlaying::start(mpv.0, session.mode == Mode::App);
+        // With interpolation, a frame shown at several refreshes is drawn
+        // anew at each; without, the render thread skips its repeats.
+        // SAFETY: a live handle and a C string.
+        unsafe {
+            mpv::mpv_observe_property(
+                mpv.0,
+                INTERPOLATION,
+                c"interpolation".as_ptr(),
+                mpv::FORMAT_FLAG,
+            )
+        };
+        if debug {
+            // SAFETY: a live handle and a C string.
+            unsafe {
+                mpv::mpv_observe_property(
+                    mpv.0,
+                    HWDEC,
+                    c"hwdec-current".as_ptr(),
+                    mpv::FORMAT_STRING,
+                )
+            };
+        }
         if session.screen.is_some() {
             // From a shell, mpv's fullscreen (`f`) fills the whole window,
             // over its status line: there's no window of mpv's to fill.
@@ -575,6 +719,23 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                             && unsafe { *property.data.cast::<c_int>() } != 0;
                         if let Some(screen) = &session.screen {
                             screen.set_fill(on);
+                        }
+                    } else if event.reply_userdata == INTERPOLATION {
+                        // SAFETY: a flag property's data is an int.
+                        let on = property.format == mpv::FORMAT_FLAG
+                            && !property.data.is_null()
+                            && unsafe { *property.data.cast::<c_int>() } != 0;
+                        session.shared.update(|state| state.interpolation = on);
+                    } else if event.reply_userdata == HWDEC {
+                        // SAFETY: a string property's data is a char *; the
+                        // last one with a file loaded stays.
+                        if property.format == mpv::FORMAT_STRING && !property.data.is_null() {
+                            let value =
+                                unsafe { CStr::from_ptr(*property.data.cast::<*const c_char>()) };
+                            let value = printable(&value.to_string_lossy());
+                            if !value.is_empty() {
+                                session.hwdec = Some(value);
+                            }
                         }
                     } else {
                         now_playing.on_property(mpv.0, property);
@@ -792,19 +953,26 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         shared: Arc<Shared>,
         port: Option<String>,
         debug: bool,
+        vsync: Option<Vsync>,
         ready: mpsc::Sender<Result<(), String>>,
-    ) {
+    ) -> Stats {
+        // Frames go out at the display's refreshes: this thread wakes for
+        // each, and is as prompt as a window's would be.
+        // SAFETY: sets this thread's own class.
+        unsafe { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0) };
+        let mut stats = Stats::default();
         let context = match gl::Context::new() {
             Ok(context) => context,
             Err(err) => {
                 let _ = ready.send(Err(err));
-                return;
+                return stats;
             }
         };
         let mut init = mpv::OpenGlInitParams {
             get_proc_address: Some(gl::get_proc_address),
             get_proc_address_ctx: std::ptr::null_mut(),
         };
+        let mut advanced: c_int = 1;
         let mut params = [
             mpv::RenderParam {
                 kind: mpv::RENDER_PARAM_API_TYPE,
@@ -813,6 +981,14 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             mpv::RenderParam {
                 kind: mpv::RENDER_PARAM_OPENGL_INIT_PARAMS,
                 data: (&raw mut init).cast(),
+            },
+            // This thread never waits for mpv's core: it calls only the
+            // render API, and mpv_render_context_update at each callback.
+            // Lets mpv decode straight into its textures when it decodes on
+            // the CPU (vd-lavc-dr).
+            mpv::RenderParam {
+                kind: mpv::RENDER_PARAM_ADVANCED_CONTROL,
+                data: (&raw mut advanced).cast(),
             },
             mpv::RenderParam {
                 kind: mpv::RENDER_PARAM_INVALID,
@@ -828,7 +1004,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 "mpv_render_context_create: {}",
                 mpv::error(err)
             )));
-            return;
+            return stats;
         }
         // SAFETY: this thread holds `shared` until after rc is freed.
         unsafe {
@@ -861,31 +1037,118 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         // token come, not with every frame.
         let mut refused: Option<(String, Instant)> = None;
         let mut last = 0;
-        let mut stats = Stats::default();
         // New surfaces, or surfaces Pepper hasn't seen: draw the frame again
         // even if libmpv has no new one (it's paused, say).
         let mut redraw = false;
+        // The size surfaces are wanted at and since when; since when the
+        // ring hasn't fitted it; whether the ring was made at a size Pepper
+        // reported; and when to make new ones once the size has settled.
+        let mut wanted = DEFAULT_SIZE;
+        let mut wanted_since = Instant::now();
+        let mut stale_since: Option<Instant> = None;
+        let mut ring_reported = false;
+        let mut remake: Option<Instant> = None;
+        // With a display link: what to show at the display's next refresh,
+        // a surface drawn last, or none for a frame that repeats the one on
+        // screen.
+        let mut waiting: Option<Option<usize>> = None;
 
         loop {
-            let (token, size) = {
+            let (token, size, reported, work, refresh, idle, interpolation) = {
                 let mut state = shared.lock();
-                while !(state.frame || state.changed || state.stop) {
-                    state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                let mut due = false;
+                while !(state.frame
+                    || state.changed
+                    || state.stop
+                    || state.refresh
+                    || state.link_idle)
+                {
+                    // Surfaces to make at a size that has settled.
+                    let Some(at) = remake else {
+                        state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
+                        continue;
+                    };
+                    let Some(left) = at.checked_duration_since(Instant::now()) else {
+                        due = true;
+                        break;
+                    };
+                    state = shared
+                        .wake
+                        .wait_timeout(state, left)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0;
                 }
                 if state.stop {
                     break;
                 }
+                let work = state.frame || state.changed || due;
                 state.frame = false;
                 state.changed = false;
-                (state.token.clone(), state.size.unwrap_or(DEFAULT_SIZE))
+                (
+                    state.token.clone(),
+                    state.size.unwrap_or(DEFAULT_SIZE),
+                    state.size.is_some(),
+                    work,
+                    std::mem::take(&mut state.refresh),
+                    std::mem::take(&mut state.link_idle),
+                    state.interpolation,
+                )
             };
+            if refresh && let Some(slot) = waiting.take() {
+                shared.lock().awaiting = false;
+                show(client.as_ref(), attached.as_deref(), slot, &mut stats);
+                // At the refresh, as a window's swap: what mpv times the
+                // display by.
+                // SAFETY: rc is live.
+                unsafe { mpv::mpv_render_context_report_swap(rc) };
+            }
+            // Nothing was drawn for a while (paused): the link stops until
+            // the next frame.
+            if idle
+                && let Some(vsync) = &vsync
+                && !shared.lock().awaiting
+            {
+                vsync.stop();
+            }
+            if !work {
+                continue;
+            }
 
-            if ring.first().map(|t| (t.surface.width, t.surface.height)) != Some(size) {
+            let have = ring.first().map(|t| (t.surface.width, t.surface.height));
+            remake = None;
+            let now = Instant::now();
+            if wanted != size {
+                wanted = size;
+                wanted_since = now;
+            }
+            stale_since = if have == Some(size) {
+                None
+            } else {
+                Some(stale_since.unwrap_or(now))
+            };
+            if let Some(stale) = stale_since
+                && !ring.is_empty()
+                && ring_reported
+                && let Err(at) = remake_due(now, wanted_since, stale)
+            {
+                // Still changing: the old surfaces for now.
+                remake = Some(at);
+            } else if have != Some(size) {
+                stale_since = None;
+                ring_reported = reported;
+                if waiting.take().is_some() {
+                    // That frame's surfaces go; mpv waits for its swap.
+                    shared.lock().awaiting = false;
+                    // SAFETY: rc is live.
+                    unsafe { mpv::mpv_render_context_report_swap(rc) };
+                }
                 ring.clear();
                 attached = None;
                 refused = None;
                 redraw = true;
-                match (0..pepper::MAX_SURFACES)
+                stats.rings += 1;
+                stats.surfaces += RING as u64;
+                match (0..RING)
                     .map(|_| gl::Target::new(&context, size.0, size.1))
                     .collect()
                 {
@@ -895,7 +1158,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             }
 
             if let Some(client) = &client
-                && ring.len() == pepper::MAX_SURFACES
+                && ring.len() == RING
                 && let Some(token) = &token
                 && Some(token) != attached.as_ref()
                 && !refused
@@ -905,7 +1168,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 if let Some(old) = attached.take() {
                     client.detach(&old);
                 }
-                let surfaces = std::array::from_fn(|i| &ring[i].surface);
+                let surfaces: [_; RING] = std::array::from_fn(|i| &ring[i].surface);
                 match client.attach(token, surfaces) {
                     Ok(()) => {
                         attached = Some(token.clone());
@@ -924,6 +1187,53 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             // SAFETY: rc is live and its OpenGL context is current.
             let flags = unsafe { mpv::mpv_render_context_update(rc) };
             if (flags & mpv::RENDER_UPDATE_FRAME == 0 && !redraw) || ring.is_empty() {
+                continue;
+            }
+            // Another frame before the refresh: only it is told shown. mpv
+            // waits for a frame's swap before the next, so this happens only
+            // when it was told of one it didn't wait for; telling it of this
+            // one too would keep it a frame ahead of the display for good.
+            // A surface drawn and not shown yet is shown at the refresh if
+            // what comes repeats it, and isn't drawn over if not.
+            let unshown = waiting.take().flatten();
+            if let Some(slot) = unshown {
+                last = slot;
+            }
+            let mut info = mpv::FrameInfo::default();
+            // SAFETY: rc is live; info is the param's type.
+            unsafe {
+                mpv::mpv_render_context_get_info(
+                    rc,
+                    mpv::RenderParam {
+                        kind: mpv::RENDER_PARAM_NEXT_FRAME_INFO,
+                        data: (&raw mut info).cast(),
+                    },
+                )
+            };
+            let at_refresh = vsync.is_some() && info.flags & mpv::FRAME_INFO_BLOCK_VSYNC != 0;
+            if at_refresh
+                && info.flags & mpv::FRAME_INFO_REPEAT != 0
+                && !interpolation
+                && !redraw
+                && attached.is_some()
+            {
+                // The same picture again, at the next refresh: what's on
+                // screen stays, and mpv draws nothing.
+                let mut skip: c_int = 1;
+                let mut params = [
+                    mpv::RenderParam {
+                        kind: mpv::RENDER_PARAM_SKIP_RENDERING,
+                        data: (&raw mut skip).cast(),
+                    },
+                    mpv::RenderParam {
+                        kind: mpv::RENDER_PARAM_INVALID,
+                        data: std::ptr::null_mut(),
+                    },
+                ];
+                // SAFETY: rc is live and its OpenGL context current.
+                unsafe { mpv::mpv_render_context_render(rc, params.as_mut_ptr()) };
+                stats.repeated += 1;
+                wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, unshown);
                 continue;
             }
             redraw = false;
@@ -953,38 +1263,100 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             ];
             // SAFETY: as above; the framebuffer is the target's, alive here.
             unsafe { mpv::mpv_render_context_render(rc, params.as_mut_ptr()) };
+            let waited = Instant::now();
             context.finish();
+            stats.gpu_wait += waited.elapsed();
             stats.drawn += 1;
-            if let (Some(client), Some(token)) = (&client, &attached) {
-                stats.presented += client.present(token, slot) as u64;
-            }
-            // SAFETY: rc is live.
-            unsafe { mpv::mpv_render_context_report_swap(rc) };
             last = slot;
+            if at_refresh {
+                wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, Some(slot));
+            } else {
+                show(client.as_ref(), attached.as_deref(), Some(slot), &mut stats);
+                // Only a frame of mpv's that isn't a redraw is waited for.
+                if info.flags & mpv::FRAME_INFO_PRESENT != 0
+                    && info.flags & mpv::FRAME_INFO_REDRAW == 0
+                {
+                    // SAFETY: rc is live.
+                    unsafe { mpv::mpv_render_context_report_swap(rc) };
+                }
+            }
         }
 
         if let (Some(client), Some(token)) = (&client, &attached) {
             client.detach(token);
         }
-        if debug {
-            eprintln!(
-                "pepper-play: {} frames drawn, {} shown, {} into a surface still on screen",
-                stats.drawn, stats.presented, stats.on_screen
-            );
-        }
+        // No more refreshes.
+        drop(vsync);
         // SAFETY: rc is live and its OpenGL context current; freed before the
         // targets and the context, and before mpv_terminate_destroy.
         unsafe { mpv::mpv_render_context_free(rc) };
         drop(ring);
         drop(context);
+        stats
     }
 
+    /// What the render thread did, said at the end under PEPPER_PLAY_DEBUG.
     #[derive(Default)]
     struct Stats {
         drawn: u64,
         presented: u64,
         /// Every surface was on screen, so one was drawn over anyway.
         on_screen: u64,
+        /// IOSurfaces made, and rings of them: one at each new size.
+        surfaces: u64,
+        rings: u64,
+        /// Frames that repeated the one on screen, not drawn again.
+        repeated: u64,
+        /// Spent waiting for the graphics chip to finish frames.
+        gpu_wait: Duration,
+    }
+
+    const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(class: u32, relative_priority: c_int) -> c_int;
+    }
+
+    /// Shows surface `slot` (none: the one on screen stays).
+    fn show(
+        client: Option<&pepper::Client>,
+        token: Option<&str>,
+        slot: Option<usize>,
+        stats: &mut Stats,
+    ) {
+        if let (Some(client), Some(token), Some(slot)) = (client, token, slot) {
+            stats.presented += client.present(token, slot) as u64;
+        }
+    }
+
+    /// Whether to make surfaces at a new size now: once it has stayed the
+    /// same SETTLE, or REMAKE_EVERY after the surfaces stopped fitting the
+    /// box, whichever is first. If not, when.
+    fn remake_due(
+        now: Instant,
+        wanted_since: Instant,
+        stale_since: Instant,
+    ) -> Result<(), Instant> {
+        let at = (wanted_since + SETTLE).min(stale_since + REMAKE_EVERY);
+        if now >= at { Ok(()) } else { Err(at) }
+    }
+
+    /// Keeps `slot` to show at the display's next refresh.
+    fn wait_for_refresh(
+        shared: &Shared,
+        vsync: Option<&Vsync>,
+        waiting: &mut Option<Option<usize>>,
+        slot: Option<usize>,
+    ) {
+        *waiting = Some(slot);
+        {
+            let mut state = shared.lock();
+            state.awaiting = true;
+            state.idle_refreshes = 0;
+        }
+        if let Some(vsync) = vsync {
+            vsync.start();
+        }
     }
 
     /// The next surface after `last` that the window server isn't showing,
@@ -1035,6 +1407,81 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 strings(&["a.mp4", "https://example.com/v", "-", "--odd-name.mp4"])
             );
             assert!(parse_args(&strings(&["--=x"])).is_err());
+        }
+
+        #[test]
+        fn own_options_first_so_the_users_win() {
+            let last = |options: &[(String, String)], name: &str| {
+                options
+                    .iter()
+                    .rev()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, v)| v.clone())
+            };
+            let args = parse_args(&strings(&["a.mp4"])).unwrap();
+            let (options, ipc) = mpv_options(Mode::Shell, &args, Some(60.0)).unwrap();
+            assert_eq!(options[0], ("vo".into(), "libmpv".into()));
+            assert_eq!(last(&options, "hwdec").as_deref(), Some("auto-safe"));
+            assert_eq!(
+                last(&options, "video-sync").as_deref(),
+                Some("display-resample")
+            );
+            assert_eq!(
+                last(&options, "display-fps-override").as_deref(),
+                Some("60.000000")
+            );
+            assert!(ipc.is_empty());
+
+            // The user's own timing wins; with no display link, mpv's stays.
+            let args = parse_args(&strings(&["--video-sync=audio", "a.mp4"])).unwrap();
+            let (options, _) = mpv_options(Mode::Shell, &args, Some(60.0)).unwrap();
+            assert_eq!(last(&options, "video-sync").as_deref(), Some("audio"));
+            let (options, _) = mpv_options(Mode::Shell, &args, None).unwrap();
+            assert!(last(&options, "display-fps-override").is_none());
+
+            let args = parse_args(&strings(&[
+                "--hwdec=no",
+                "--input-ipc-client=fd://3",
+                "--force-window",
+            ]))
+            .unwrap();
+            let (options, ipc) = mpv_options(Mode::App, &args, None).unwrap();
+            assert_eq!(last(&options, "hwdec").as_deref(), Some("no"));
+            assert_eq!(ipc, vec![("input-ipc-client".into(), "fd://3".into())]);
+            assert!(last(&options, "force-window").is_none());
+            assert!(last(&options, "terminal").is_none());
+
+            let args = parse_args(&strings(&["--vo=gpu"])).unwrap();
+            assert!(mpv_options(Mode::App, &args, None).is_err());
+        }
+
+        #[test]
+        fn a_ring_of_four() {
+            // At 60 fps shown at each refresh, three surfaces are busy at a
+            // time: with a ring of three, 40% of frames were drawn into one
+            // still on screen (notes/player-perf.md, 10.5).
+            assert_eq!(RING, 4);
+            const { assert!(RING <= pepper::MAX_SURFACES) };
+        }
+
+        #[test]
+        fn surfaces_wait_for_the_size_to_settle() {
+            let t0 = Instant::now();
+            let ms = Duration::from_millis;
+            // The size changed 10 ms ago, after a long time the same: wait
+            // till it's 80 ms old.
+            let now = t0 + ms(1000);
+            let changed = now - ms(10);
+            assert_eq!(remake_due(now, changed, changed), Err(now + ms(70)));
+            assert_eq!(remake_due(now + ms(70), changed, changed), Ok(()));
+            // A drag since t0 that never stops: new surfaces every 500 ms all
+            // the same.
+            let made = t0;
+            let now = t0 + ms(400);
+            assert_eq!(remake_due(now, now, made), Err(t0 + ms(480)));
+            let now = t0 + ms(490);
+            assert_eq!(remake_due(now, now, made), Err(t0 + ms(500)));
+            assert_eq!(remake_due(t0 + ms(500), t0 + ms(500), made), Ok(()));
         }
 
         #[test]

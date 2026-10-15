@@ -28,8 +28,18 @@ unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    static kCGColorSpaceSRGB: *const c_void;
+    fn CGColorSpaceCreateWithName(name: *const c_void) -> *const c_void;
+    fn CGColorSpaceCopyPropertyList(space: *const c_void) -> *const c_void;
+    fn CGColorSpaceRelease(space: *const c_void);
+}
+
 #[link(name = "IOSurface", kind = "framework")]
 unsafe extern "C" {
+    static kIOSurfaceColorSpace: *const c_void;
+    fn IOSurfaceSetValue(surface: SurfaceRef, key: *const c_void, value: *const c_void);
     static kIOSurfaceWidth: *const c_void;
     static kIOSurfaceHeight: *const c_void;
     static kIOSurfaceBytesPerElement: *const c_void;
@@ -71,6 +81,9 @@ impl Surface {
             let raw = IOSurfaceCreate(properties);
             CFRelease(properties);
             numbers.iter().for_each(|n| CFRelease(*n));
+            if !raw.is_null() {
+                tag_srgb(raw);
+            }
             (!raw.is_null()).then_some(Surface { raw, width, height })
         }
     }
@@ -89,6 +102,27 @@ impl Surface {
     pub fn in_use(&self) -> bool {
         // SAFETY: self.raw is a live IOSurface.
         unsafe { IOSurfaceIsInUse(self.raw) != 0 }
+    }
+}
+
+/// Says the surface holds sRGB, which mpv draws, so that Pepper's layer
+/// shows it as sRGB on any display. Untagged, its values went to a wide-gamut
+/// display as they were, too saturated (notes/player-perf.md, 10.6). The
+/// value is the colour space serialized, as IOSurfaceRef.h asks.
+fn tag_srgb(surface: SurfaceRef) {
+    // SAFETY: CoreGraphics calls on a static name; what's made here is
+    // released, and the surface retains the value it's given.
+    unsafe {
+        let space = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+        if space.is_null() {
+            return;
+        }
+        let value = CGColorSpaceCopyPropertyList(space);
+        CGColorSpaceRelease(space);
+        if !value.is_null() {
+            IOSurfaceSetValue(surface, kIOSurfaceColorSpace, value);
+            CFRelease(value);
+        }
     }
 }
 
