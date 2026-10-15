@@ -70,6 +70,13 @@ pub struct OpenGlInitParams {
 }
 
 #[repr(C)]
+#[derive(Default)]
+pub struct FrameInfo {
+    pub flags: u64,
+    pub target_time: i64,
+}
+
+#[repr(C)]
 pub struct OpenGlFbo {
     pub fbo: c_int,
     pub w: c_int,
@@ -96,6 +103,21 @@ pub const RENDER_PARAM_API_TYPE: c_int = 1;
 pub const RENDER_PARAM_OPENGL_INIT_PARAMS: c_int = 2;
 pub const RENDER_PARAM_OPENGL_FBO: c_int = 3;
 pub const RENDER_PARAM_FLIP_Y: c_int = 4;
+pub const RENDER_PARAM_ADVANCED_CONTROL: c_int = 10;
+pub const RENDER_PARAM_NEXT_FRAME_INFO: c_int = 11;
+pub const RENDER_PARAM_SKIP_RENDERING: c_int = 13;
+
+/// The next frame is one of mpv's (not only a request to draw again).
+pub const FRAME_INFO_PRESENT: u64 = 1 << 0;
+/// mpv draws the current frame again (an OSD change, paused): it doesn't
+/// wait for its swap.
+pub const FRAME_INFO_REDRAW: u64 = 1 << 1;
+/// The next frame reproduces the one before exactly (display-synced
+/// playback draws a frame again at each refresh it's shown for).
+pub const FRAME_INFO_REPEAT: u64 = 1 << 2;
+/// mpv's timing expects the frame shown at a refresh, and told then
+/// (`mpv_render_context_report_swap`).
+pub const FRAME_INFO_BLOCK_VSYNC: u64 = 1 << 3;
 
 pub const RENDER_UPDATE_FRAME: u64 = 1;
 
@@ -188,6 +210,7 @@ api! {
     fn mpv_render_context_create(res: *mut *mut RenderContext, mpv: *mut Handle, params: *mut RenderParam) -> c_int;
     fn mpv_render_context_set_update_callback(ctx: *mut RenderContext, callback: Option<UpdateCallback>, callback_ctx: *mut c_void);
     fn mpv_render_context_update(ctx: *mut RenderContext) -> u64;
+    fn mpv_render_context_get_info(ctx: *mut RenderContext, param: RenderParam) -> c_int;
     fn mpv_render_context_render(ctx: *mut RenderContext, params: *mut RenderParam) -> c_int;
     fn mpv_render_context_report_swap(ctx: *mut RenderContext);
     fn mpv_render_context_free(ctx: *mut RenderContext);

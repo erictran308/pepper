@@ -73,11 +73,13 @@ struct PortDescriptor {
     kind: u8,
 }
 
+/// An attach with `N` surfaces: Pepper reads the token after however many
+/// there are.
 #[repr(C)]
-struct Attach {
+struct Attach<const N: usize> {
     header: Header,
     descriptor_count: u32,
-    surfaces: [PortDescriptor; MAX_SURFACES],
+    surfaces: [PortDescriptor; N],
     token: [u8; TOKEN_SIZE],
 }
 
@@ -229,8 +231,14 @@ impl Client {
         if kr == 0 { Ok(()) } else { Err(kr) }
     }
 
-    /// Hands Pepper the surfaces of `token`'s stream, replacing any before.
-    pub fn attach(&self, token: &str, surfaces: [&Surface; MAX_SURFACES]) -> Result<(), String> {
+    /// Hands Pepper the surfaces of `token`'s stream, replacing any before:
+    /// 1 to MAX_SURFACES of them.
+    pub fn attach<const N: usize>(
+        &self,
+        token: &str,
+        surfaces: [&Surface; N],
+    ) -> Result<(), String> {
+        const { assert!(N >= 1 && N <= MAX_SURFACES) };
         let ports = surfaces.map(|surface| surface.mach_port());
         let free = |ports: &[u32]| {
             for &port in ports.iter().filter(|&&port| port != 0) {
@@ -251,7 +259,7 @@ impl Client {
                 id: MSG_ATTACH,
                 ..Default::default()
             },
-            descriptor_count: MAX_SURFACES as u32,
+            descriptor_count: N as u32,
             surfaces: ports.map(|name| PortDescriptor {
                 name,
                 disposition: MACH_MSG_TYPE_MOVE_SEND,
@@ -260,7 +268,11 @@ impl Client {
             }),
             token: padded(token),
         };
-        let sent = self.send(&mut message.header, size_of::<Attach>(), ATTACH_TIMEOUT_MS);
+        let sent = self.send(
+            &mut message.header,
+            size_of::<Attach<N>>(),
+            ATTACH_TIMEOUT_MS,
+        );
         if let Err(kr) = sent {
             // The surfaces' rights didn't go to Pepper: free them.
             if kr == MACH_SEND_TIMED_OUT || kr == MACH_SEND_INTERRUPTED {
@@ -462,5 +474,9 @@ mod tests {
         assert_eq!(size_of::<Header>(), 24);
         assert_eq!(size_of::<Present>(), 24 + 64 + 4);
         assert_eq!(size_of::<SizeMessage>(), 24 + 64 + 12);
+        // Header, descriptor count, a 12-byte descriptor each, the token:
+        // where Pepper looks for it.
+        assert_eq!(size_of::<Attach<3>>(), 24 + 4 + 3 * 12 + 64);
+        assert_eq!(size_of::<Attach<4>>(), 24 + 4 + 4 * 12 + 64);
     }
 }
