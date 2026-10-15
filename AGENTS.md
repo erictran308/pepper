@@ -33,6 +33,6 @@ A file for [guiding coding agents](https://agents.md/).
 
 If `pepper-agent` is on the PATH (every Pepper shell has it) and the task
 involves video, a web UI, a mobile app, visual output or streams, run
-`pepper-agent guide` first. It shows the human video in a viewer pane they
-run (`pepper-agent view`) and hands back what they mark; see
-`pepper-agent/README.md`.
+`pepper-agent guide` first. It shows the human video or a live page of
+your web app in a viewer pane they run (`pepper-agent view`) and hands back
+what they mark and point at; see `pepper-agent/README.md`.

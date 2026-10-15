@@ -42,7 +42,7 @@ Everything Pepper adds to Ghostty 1.3.1 is in this table, and in [a handful of c
 | The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 693 lines, plus 22 that hook it in |
 | Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says where new releases are. | About 2,100 lines fewer |
 | The player (Rust) | [`pepper-play`](pepper-play/), a program of its own inside the app. Pepper never starts it: you do, or a program you run does. | Separate program |
-| A helper for AI agents (Rust) | [`pepper-agent`](pepper-agent/), a program of its own inside the app: a viewer pane you run, and commands an AI agent runs to show you video there. Pepper never starts it either. | Separate program |
+| A helper for AI agents (Rust) | [`pepper-agent`](pepper-agent/), a program of its own inside the app: a viewer pane you run, and commands an AI agent runs to show you video or a live page there. Pepper never starts it either. | Separate program |
 | The name and icon | "Pepper" in menus, About and alerts, its own app id and icon, so it can't be confused with Ghostty or replace it. | Text and images |
 | The build | Builds with Zig 0.15.2 on Apple's newest SDKs, plus one fix from Ghostty's own later code. Signs Pepper and its player with macOS's hardened runtime, and checks what their signatures allow. | Build files only |
 
@@ -75,15 +75,15 @@ Any program can do the same. [`pepper-play/README.md`](pepper-play/README.md) ex
 
 ## Pepper for AI agents
 
-An AI coding agent (Claude Code, Codex, Gemini CLI, Aider, your own) can show you video in Pepper and hear back what you point out. Open a split next to the agent (⌘D) and run:
+An AI coding agent (Claude Code, Codex, Gemini CLI, Aider, your own) can show you video, or the web app it's building, in Pepper and hear back what you point out. Open a split next to the agent (⌘D) and run:
 
 ```sh
 pepper-agent view
 ```
 
-That pane becomes the agent's screen. The agent opens a video in it, tells you what to watch on the line at the bottom, and plays the parts it wants you to see; you press `m` to mark a moment, `n` to write a note, and Enter when you're done, and the agent gets your marks with their times. It sees the same frames you do, as pictures made from the file, never from your screen.
+That pane becomes the agent's screen. The agent opens a video or a page in it, tells you what to look at on the line at the bottom, and plays or clicks through what it wants you to see. You click anything that's wrong (or drag around it), type what's wrong with it, and press Enter when you're done. The agent gets where you clicked, a picture of it, and for a page the element itself: its selector, its styles, the source file it comes from. `m` marks a moment of a video. The agent sees what you see as pictures made from the file or the browser, never from your screen.
 
-An agent finds out how with `pepper-agent guide`, and one line in its instructions tells it to look. [`pepper-agent/README.md`](pepper-agent/README.md) has that line and the rest: the keys, the commands, how it works. It's built in stages: this one does video review; web previews, editing, recordings, devices and streams come next.
+An agent finds out how with `pepper-agent guide`, and one line in its instructions tells it to look. [`pepper-agent/README.md`](pepper-agent/README.md) has that line and the rest: the keys, the commands, how it works. It's built in stages: this one does video review and live web pages; editing, recordings, devices and streams come next.
 
 ## Security
 
@@ -93,7 +93,8 @@ A terminal sees everything you type and runs your commands, so what Pepper adds 
 - **Pepper shows pictures, nothing more.** Its message port takes only frames already on the graphics chip, and the number of the one to show. Every message is checked for its size and kind, and the rest are dropped. A stream answers only to the program that started it. There are limits on how many streams and boxes there can be, and a tab's output can use up only its own boxes.
 - **A video shows only where it was placed, by the same random token.** A program must be able to write to that tab and know the token. Frames sent with any other token show nowhere, and a box never shows outside its tab.
 - **The player runs on its own.** `pepper-play` is a separate program, started by you or by a program you run, with the same rights as any other. Pepper only tells your shell where it is.
-- **An agent gets a viewer, not your screen.** `pepper-agent view` runs only when you start it, in a pane of yours. An agent's commands reach it through a socket only your user can open, and it does only what those commands say: open a file or a video's web address, play, seek, take a frame from the file, show a line of text. Nothing is passed on to mpv, and nothing an agent sends is run. What it shows the agent are files made from the video, never a capture of the screen.
+- **An agent gets a viewer, not your screen.** `pepper-agent view` runs only when you start it, in a pane of yours. An agent's commands reach it through a socket only your user can open, and it does only what those commands say: open a file, a video's web address or a page, play, seek, click and type in that page, take a frame from the file or the browser, show a line of text. Nothing is passed on to mpv, and nothing an agent sends is run. What it shows the agent are files made from the video or the page, never a capture of the screen.
+- **Pages are kept to this machine.** A page runs in a headless Chrome of the viewer's own, with a new profile (none of your cookies or logins) that's deleted after, reached over a pipe rather than a port. Unless the agent opens it with `--allow-remote`, the page and everything it loads reach only this machine's addresses, and the agent's JavaScript runs only in pages from here.
 - **Nothing a video says reaches your terminal raw.** A video's tags, subtitles, a playlist or a web page could hold escape sequences. From a shell, mpv prints nothing to the terminal: pepper-play draws the status line itself, from numbers, subtitles and mpv's on-screen text are drawn inside the video's box, and mpv's errors are shown with any control characters escaped. (Your own mpv options, such as `--term-title` or `--msg-level`, can turn mpv's terminal output back on.)
 - **Signed to keep code out.** Pepper and pepper-play run with macOS's hardened runtime: no debugger can attach, and `DYLD_` variables can't put code in them. Pepper loads no libraries but its own and the system's.
 
