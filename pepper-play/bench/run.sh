@@ -18,11 +18,35 @@
 # .txt (the table). Clips by default: every clip clips.sh makes for the
 # bench, and clips/real-1080p.* if there is one. --drag N first drags the
 # box's size about for N seconds (measure.sh --drag); --env sets a variable
-# for the players; --player measures that pepper-play instead of building
-# this checkout's. --look runs the checks only eyes can make instead
+# for the whole bench (the players and the bench's own commands); --player
+# measures that pepper-play instead of building this checkout's. --look runs the checks only eyes can make instead
 # (look.py): a screenshot of colours, and a window drag.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
+nl='
+'
+die() {
+    echo "run.sh: $*" >&2
+    exit 2
+}
+# $1 as one shell word: in single quotes, each ' as '\''.
+q() {
+    printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"
+}
+# Calls "$@" NAME=VALUE for each --env, values kept whole (no splitting or
+# globbing).
+each_env() {
+    old_ifs=$IFS
+    IFS=$nl
+    set -f
+    for env in $envs; do
+        IFS=$old_ifs
+        "$@" "$env"
+        IFS=$nl
+    done
+    IFS=$old_ifs
+    set +f
+}
 seconds=60
 clips=1080p30-h264,1080p30-hevc,1080p60-h264,1080p60-hevc,2160p30-h264,2160p30-hevc,1080p24-h264
 label=
@@ -34,6 +58,7 @@ drag=
 envs=
 player=
 look=
+stamp=
 while [ "$#" -gt 0 ]; do
     case "$1" in
     --new-pepper)
@@ -49,8 +74,10 @@ while [ "$#" -gt 0 ]; do
     --player) player=$2 && shift ;;
     --look) look=yes ;;
     --env)
-        case "$2" in [A-Za-z_]*=*) ;; *) echo "run.sh: --env NAME=VALUE" >&2 && exit 2 ;; esac
-        envs="$envs $2" && shift
+        case "${2%%=*}" in "" | [!A-Za-z_]* | *[!A-Za-z0-9_]*) die "--env NAME=VALUE" ;; esac
+        case "$2" in *=*) ;; *) die "--env NAME=VALUE" ;; esac
+        case "$2" in *"$nl"*) die "--env: no newlines in values" ;; esac
+        envs="$envs$2$nl" && shift
         ;;
     --stamp) stamp=$2 && shift ;;
     --) shift && break ;;
@@ -60,7 +87,8 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 mkdir -p "$here/results"
-stamp=${stamp:-$(date +%Y%m%d-%H%M%S)${label:+-$(printf %s "$label" | tr -c 'A-Za-z0-9_.-' -)}}
+# A file name in results/, whatever the label (or an inner run's --stamp) holds.
+stamp=$(printf %s "${stamp:-$(date +%Y%m%d-%H%M%S)${label:+-$label}}" | tr -c 'A-Za-z0-9_.-' -)
 out="$here/results/$stamp"
 
 if [ -n "$new_pepper" ]; then
@@ -69,30 +97,43 @@ if [ -n "$new_pepper" ]; then
     # by LaunchServices gets launchd's), its output kept, then a mark that
     # it's done.
     dir=$(mktemp -d "${TMPDIR:-/tmp}/pepper-bench.XXXXXX")
+    trap 'rm -rf "$dir"' EXIT
+    export_line() {
+        printf 'export %s\n' "$(q "$1")"
+    }
     {
         echo '#!/bin/sh'
-        printf 'export PATH=%s\n' "'$PATH'"
-        for env in $envs; do printf "export '%s'\n" "$env"; done
-        printf '%s' "exec >'$out.log' 2>&1; '$here/run.sh' --stamp '$stamp' --seconds '$seconds' --clips '$clips'"
-        [ -n "$label" ] && printf " --label '%s'" "$label"
+        printf 'export PATH=%s\n' "$(q "$PATH")"
+        each_env export_line
+        printf 'exec >%s 2>&1; %s --stamp %s --seconds %s --clips %s' \
+            "$(q "$out.log")" "$(q "$here/run.sh")" "$(q "$stamp")" "$(q "$seconds")" "$(q "$clips")"
+        [ -n "$label" ] && printf ' --label %s' "$(q "$label")"
         [ -n "$window" ] && printf ' --no-window'
         [ -n "$idle" ] || printf ' --no-idle'
-        [ -n "$drag" ] && printf " --drag '%s'" "$drag"
-        [ -n "$player" ] && printf " --player '%s'" "$player"
+        [ -n "$drag" ] && printf ' --drag %s' "$(q "$drag")"
+        [ -n "$player" ] && printf ' --player %s' "$(q "$player")"
         [ -n "$look" ] && printf ' --look'
         printf ' --'
-        for option in "$@"; do printf " '%s'" "$option"; done
-        printf "; echo \$? >'%s.done'\n" "$out"
+        for option in "$@"; do printf ' %s' "$(q "$option")"; done
+        printf '; echo $? >%s\n' "$(q "$out.done")"
     } >"$dir/bench"
     chmod 700 "$dir/bench"
     rm -f "$out.done"
-    open -n "$app" --args --command="$dir/bench" --window-save-state=never \
+    # This user's Pepper processes from that very app, before and after:
+    # the new one is the one to wait on.
+    uid=$(id -u)
+    exe=$(printf %s "$app/Contents/MacOS/ghostty" | sed 's/[][\\.*^$+?(){}|]/\\&/g')
+    before=" $(pgrep -u "$uid" -f "^$exe( |$)" | tr '\n' ' ' || true) "
+    # direct: runs the path itself, not through a shell.
+    open -n "$app" --args --command="direct:$dir/bench" --window-save-state=never \
         --quit-after-last-window-closed=true --confirm-close-surface=false \
         --window-width=160 --window-height=50
     # It opens its first window only once it's the active app.
     pid=
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
-        pid=$(pgrep -n -f "^$app/Contents/MacOS/ghostty" || true)
+        for new in $(pgrep -u "$uid" -f "^$exe( |$)" || true); do
+            case "$before" in *" $new "*) ;; *) pid=$new ;; esac
+        done
         [ -n "$pid" ] && break
         sleep 0.5
     done
@@ -103,7 +144,6 @@ if [ -n "$new_pepper" ]; then
         >/dev/null
     echo "run.sh: benching in Pepper $pid; log: $out.log" >&2
     while [ ! -f "$out.done" ] && kill -0 "$pid" 2>/dev/null; do sleep 2; done
-    rm -rf "$dir"
     [ -f "$out.txt" ] && cat "$out.txt"
     status=$(cat "$out.done" 2>/dev/null || echo 1)
     [ "$status" = 0 ] || echo "run.sh: the bench failed ($status); see $out.log" >&2
@@ -130,7 +170,7 @@ names=$(printf %s "$clips" | tr , ' ')
 "$here/clips.sh" $names
 # What Pepper and WindowServer cost with nothing playing, to set the rest
 # against.
-for env in $envs; do export "${env?}"; done
+each_env export
 [ -z "$idle" ] || "$here/measure.sh" --idle --seconds 20 --label "$label" --out "$out.jsonl"
 for name in $names; do
     "$here/measure.sh" --seconds "$seconds" --label "$label" --out "$out.jsonl" $window \

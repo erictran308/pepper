@@ -75,7 +75,7 @@ for bit in 0 1 2 3 4 5 6 7 8 9 10 11; do
 color=white:t=fill:enable='eq(mod(floor(n/pow(2,$bit)),2),1)'"
     done
 done
-counter="$counter[out0]"
+counter="${counter}[out0]"
 pick counter-1080p60-h264 && make counter-1080p60-h264 "$counter" "$h264"
 
 # Six sRGB patches (primaries, secondaries) over mid grey: what Pepper shows

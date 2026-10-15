@@ -57,6 +57,7 @@ import tempfile
 import termios
 import threading
 import time
+import unicodedata
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_PLAYER = os.path.join(HERE, "..", "target", "release", "pepper-play")
@@ -66,12 +67,30 @@ AT_END = ["hwdec-current", "hwdec", "video-sync", "vsync-jitter", "estimated-dis
           "display-fps", "container-fps", "estimated-vf-fps", "current-vo", "osd-width",
           "osd-height", "width", "height", "mpv-version"]
 GPU = re.compile(rb'"Device Utilization %"=(\d+)')
+# pepper-play's own lines only: anchored at a line's start, since mpv's log
+# messages (holding a video's tags) share the stream as `mpv [...] ...`.
 DEBUG_LINE = re.compile(
-    r"(\d+) frames drawn, (\d+) shown, (\d+) into a surface still on screen; "
+    r"^pepper-play: (\d+) frames drawn, (\d+) shown, (\d+) into a surface still on screen; "
     r"(\d+) surfaces made(?: in (\d+) rings)?;(?: (\d+) repeats not drawn;)? "
-    r"([\d.]+) s waiting on the graphics chip; "
-    r"hwdec (\S+)")
-BOX_LINE = re.compile(r"Pepper says the box is BoxSize \{ width: (\d+), height: (\d+), visible: true")
+    r"(\d+(?:\.\d+)?) s waiting on the graphics chip; "
+    r"hwdec (\S+)$", re.M)
+BOX_LINE = re.compile(
+    r"^pepper-play: Pepper says the box is BoxSize \{ width: (\d+), height: (\d+), visible: true \}$",
+    re.M)
+# How much of a player's stderr is read after a run.
+STDERR_TAIL = 1 << 20
+
+
+def safe(text):
+    """Text made inert for the terminal: control and invisible format
+    characters shown escaped, as pepper-play's printable() does."""
+    out = []
+    for c in str(text):
+        if unicodedata.category(c) in ("Cc", "Cf"):
+            out.append(c.encode("unicode_escape").decode())
+        else:
+            out.append(c)
+    return "".join(out)
 
 
 # --- the processes' use ----------------------------------------------------
@@ -89,19 +108,27 @@ TICK = _tb.numer / _tb.denom / 1e9  # seconds per mach tick
 
 
 def rusage(pid):
-    """(cpu seconds, wakeups, rss bytes, footprint bytes) of a process of
-    this user's, from proc_pid_rusage (RUSAGE_INFO_V2), or None."""
+    """(cpu seconds, wakeups, rss bytes, footprint bytes, start time) of a
+    process of this user's, from proc_pid_rusage (RUSAGE_INFO_V2), or None.
+    The start time tells a reused pid from the process sampled before."""
     buf = (ctypes.c_uint64 * 64)()
     if LIBC.proc_pid_rusage(pid, 2, ctypes.byref(buf)) != 0:
         return None
     # rusage_info_v2: uuid (2 words), user, system, pkg idle wakeups,
-    # interrupt wakeups, pageins, wired, resident, footprint, ...
-    return ((buf[2] + buf[3]) * TICK, buf[4] + buf[5], buf[8], buf[9])
+    # interrupt wakeups, pageins, wired, resident, footprint, start, ...
+    return ((buf[2] + buf[3]) * TICK, buf[4] + buf[5], buf[8], buf[9], buf[10])
+
+
+def pid_path(pid):
+    """The program a pid runs, or None."""
+    buf = ctypes.create_string_buffer(4096)
+    n = LIBC.proc_pidpath(pid, buf, ctypes.sizeof(buf))
+    return buf.raw[:n].decode(errors="replace") if n > 0 else None
 
 
 def ps_cpu(pid):
     """CPU seconds from ps, for a process that isn't this user's."""
-    out = subprocess.run(["ps", "-o", "time=", "-p", str(pid)],
+    out = subprocess.run(["/bin/ps", "-o", "time=", "-p", str(pid)],
                          capture_output=True, text=True).stdout.strip()
     if not out:
         return None
@@ -130,7 +157,8 @@ class Sampler:
 
     def __init__(self, pids):
         self.pids = pids  # name -> pid
-        self.samples = []  # (time, {name: (cpu, wakeups, rss, footprint)}, gpu)
+        self.started = {}  # name -> the sampled process's start time
+        self.samples = []  # (time, {name: (cpu, wakeups, rss, footprint, start)}, gpu)
         self.done = threading.Event()
         self.take()
         self.thread = threading.Thread(target=self.loop, daemon=True)
@@ -143,7 +171,9 @@ class Sampler:
             usage = rusage(pid)
             if usage is None:
                 cpu = ps_cpu(pid)
-                usage = (cpu, None, None, None) if cpu is not None else None
+                usage = (cpu, None, None, None, None) if cpu is not None else None
+            elif self.started.setdefault(name, usage[4]) != usage[4]:
+                usage = None  # the pid now belongs to another process
             row[name] = usage
         self.samples.append((now, row, gpu_percent()))
 
@@ -302,7 +332,7 @@ def fit_window(ipc, pid, box):
 
 
 def say(text):
-    os.write(TTY, f"\x1b[{status_row};1H\x1b[J{text}\r\n".encode())
+    os.write(TTY, f"\x1b[{status_row};1H\x1b[J{safe(text)}\r\n".encode())
 
 
 status_row = 1
@@ -370,21 +400,34 @@ def run_player(kind, argv, sock, args, pids, place=None, window=None):
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait()
-    stderr.seek(0)
-    text = stderr.read().decode(errors="replace")
-    debug = DEBUG_LINE.findall(text)
-    if debug:
-        d = debug[-1]
-        result["pepper_play"] = {"drawn": int(d[0]), "shown": int(d[1]), "on_screen": int(d[2]),
-                                 "surfaces": int(d[3]), "rings": int(d[4]) if d[4] else None,
-                                 "repeats": int(d[5]) if d[5] else None,
-                                 "gpu_wait_s": float(d[6]), "hwdec": d[7]}
-    boxes = BOX_LINE.findall(text)
-    if boxes:
-        result["box_px"] = [int(boxes[-1][0]), int(boxes[-1][1])]
+    text = read_tail(stderr)
+    result.update(parse_stderr(text))
     if "error" in result:
         result["stderr_tail"] = text[-2000:]
     return result
+
+
+def read_tail(f):
+    """The last STDERR_TAIL bytes of a file, as text."""
+    size = f.seek(0, os.SEEK_END)
+    f.seek(max(0, size - STDERR_TAIL))
+    return f.read().decode(errors="replace")
+
+
+def parse_stderr(text):
+    """pepper-play's debug counts and the box's size, from its own lines."""
+    out = {}
+    debug = DEBUG_LINE.findall(text)
+    if debug:
+        d = debug[-1]
+        out["pepper_play"] = {"drawn": int(d[0]), "shown": int(d[1]), "on_screen": int(d[2]),
+                              "surfaces": int(d[3]), "rings": int(d[4]) if d[4] else None,
+                              "repeats": int(d[5]) if d[5] else None,
+                              "gpu_wait_s": float(d[6]), "hwdec": d[7]}
+    boxes = BOX_LINE.findall(text)
+    if boxes:
+        out["box_px"] = [int(boxes[-1][0]), int(boxes[-1][1])]
+    return out
 
 
 def parse(argv):
@@ -439,7 +482,7 @@ def parse(argv):
             rest = list(it)
             args.clip, args.options = rest[0], rest[1:]
         elif arg.startswith("--") and args.clip is None:
-            sys.exit(f"measure: unknown option {arg} (--help)")
+            sys.exit(f"measure: unknown option {safe(arg)} (--help)")
         elif args.clip is None:
             args.clip = arg
             args.options = list(it)
@@ -452,10 +495,20 @@ def parse(argv):
 
 
 def pids_of(port):
-    """Pepper's (PEPPER_PORT ends in it) and WindowServer's."""
-    pids = {"pepper": int(port.rsplit(".", 1)[1])}
-    ws = subprocess.run(["pgrep", "-x", "WindowServer"], capture_output=True, text=True).stdout.split()
-    if ws:
+    """Pepper's (PEPPER_PORT ends in its pid, which must be a running
+    Pepper, as pepper-play checks) and WindowServer's (the system's, run by
+    _windowserver (its effective user), not any process of that name)."""
+    try:
+        pepper = int(port.rsplit(".", 1)[1])
+    except (IndexError, ValueError):
+        sys.exit(f"measure: PEPPER_PORT ({safe(port)}) doesn't end in Pepper's pid")
+    path = pid_path(pepper) if pepper > 0 else None
+    if not path or not path.endswith(".app/Contents/MacOS/ghostty"):
+        sys.exit(f"measure: no Pepper runs as pid {pepper} (PEPPER_PORT is left from one that quit?)")
+    pids = {"pepper": pepper}
+    ws = subprocess.run(["/usr/bin/pgrep", "-x", "-u", "_windowserver", "WindowServer"],
+                        capture_output=True, text=True).stdout.split()
+    if len(ws) == 1:
         pids["windowserver"] = int(ws[0])
     return pids
 
@@ -486,7 +539,7 @@ def main():
     if args.idle:
         return idle(args, pids_of(port))
     if not os.path.exists(args.clip):
-        sys.exit(f"measure: no such clip: {args.clip}")
+        sys.exit(f"measure: no such clip: {safe(args.clip)}")
     pids = pids_of(port)
 
     rows, cols, cw, ch = terminal()
@@ -546,19 +599,19 @@ def table(results):
              "player MB rss/foot   drops mistimed delayed  hwdec"]
     for r in results:
         if "error" in r:
-            lines.append(f"{r['clip']:<20} {r['kind']:<7} ERROR {r['error']}")
+            lines.append(f"{safe(r['clip']):<20} {safe(r['kind']):<7} ERROR {safe(r['error'])}")
             continue
         p = r.get("player") or {}
         c = r.get("counts", {})
         props = r.get("props", {})
         lines.append(
-            f"{r['clip']:<20} {r['kind']:<7} {p.get('cpu_mean', 0):>6.1f} ({p.get('cpu_p95') or 0:>5.1f})"
+            f"{safe(r['clip']):<20} {safe(r['kind']):<7} {p.get('cpu_mean', 0):>6.1f} ({p.get('cpu_p95') or 0:>5.1f})"
             f"   {r.get('pepper', {}).get('cpu_mean', 0):>6.1f}"
             f"  {r.get('windowserver', {}).get('cpu_mean', 0):>4.0f}"
             f"  {r.get('gpu_mean') or 0:>5.0f}"
             f"  {p.get('rss_peak_mb', 0):>8.0f}/{p.get('footprint_peak_mb', 0):<6.0f}"
             f"  {c.get('frame-drop-count')!s:>6} {c.get('mistimed-frame-count')!s:>8}"
-            f" {c.get('vo-delayed-frame-count')!s:>7}  {props.get('hwdec-current')}")
+            f" {c.get('vo-delayed-frame-count')!s:>7}  {safe(props.get('hwdec-current'))}")
     return "\n".join(lines)
 
 
