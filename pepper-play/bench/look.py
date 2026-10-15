@@ -16,7 +16,9 @@ Writes what it saw to --out (JSON): the screenshot's path and the answer.
 import importlib.util
 import json
 import os
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,19 +40,24 @@ def screenshot_dir():
 
 def new_screenshots(folder, since):
     """PNGs made since `since` in the folder or a folder in it (Snapzy and
-    other tools keep their own)."""
+    other tools keep their own): regular files of this user's only, each
+    looked at once (not through a link)."""
     found = []
+    me = os.getuid()
     for root, dirs, names in os.walk(folder):
-        if root.count(os.sep) - folder.count(os.sep) >= 1:
+        if root.count(os.sep) - folder.rstrip(os.sep).count(os.sep) >= 1:
             dirs[:] = []
         for n in names:
+            if not n.lower().endswith(".png"):
+                continue
             path = os.path.join(root, n)
             try:
-                if n.lower().endswith(".png") and os.path.getmtime(path) > since:
-                    found.append(path)
+                st = os.lstat(path)
             except OSError:
-                pass
-    return sorted(found, key=os.path.getmtime)
+                continue
+            if stat.S_ISREG(st.st_mode) and st.st_uid == me and st.st_mtime > since:
+                found.append((st.st_mtime, path))
+    return [path for _, path in sorted(found)]
 
 
 def key(fd, timeout=None):
@@ -69,11 +76,21 @@ def write(text):
     os.write(measure.TTY, text.encode())
 
 
+# Every process this script starts, so that none outlives it, whatever fails.
+STARTED = []
+
+
+def spawn(argv, **kwargs):
+    p = subprocess.Popen(argv, **kwargs)
+    STARTED.append(p)
+    return p
+
+
 def start_player(player, sock, clip, options, env):
     stderr = tempfile.TemporaryFile()
-    p = subprocess.Popen([player, f"--input-ipc-server={sock}", *options, "--", clip],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
-                         env=dict(os.environ, PEPPER_PLAY_DEBUG="1", **env))
+    p = spawn([player, f"--input-ipc-server={sock}", *options, "--", clip],
+              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=stderr,
+              env=dict(os.environ, PEPPER_PLAY_DEBUG="1", **env))
     return p, measure.Ipc(sock, p), stderr
 
 
@@ -101,14 +118,14 @@ def colors(args, tmp, result):
     players = [(p, ipc)]
     # mpv's own window, the same frame, and the YUV test window.
     sock = os.path.join(tmp, "mpv.sock")
-    mpv = subprocess.Popen([args.mpv, f"--input-ipc-server={sock}", "--no-config", "--osc=no",
+    mpv = spawn([args.mpv, f"--input-ipc-server={sock}", "--no-config", "--osc=no",
                             "--terminal=no", "--hwdec=auto-safe", "--title=mpv window",
                             *common, "--", clip],
                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     mpv_ipc = measure.Ipc(sock, mpv)
     mpv_ipc.wait_playing(mpv)
     measure.fit_window(mpv_ipc, mpv.pid, (960, 540))
-    yuv = subprocess.Popen([args.yuv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    yuv = spawn([args.yuv], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2)
     write(f"\x1b[{rows};1H\x1b[2K\x1b[1mStep 1 of 2:\x1b[m make sure this window, mpv's and the yuv-layer "
           "window can all be seen, then press Cmd-Shift-3 (or press s to skip).")
@@ -150,10 +167,9 @@ def drag(args, tmp, result):
     signal.signal(signal.SIGWINCH, signal.SIG_DFL)
     result["drag_blank"] = answer == "y"
     stop(p, ipc)
-    err.seek(0)
-    debug = measure.DEBUG_LINE.findall(err.read().decode(errors="replace"))
+    debug = measure.parse_stderr(measure.read_tail(err)).get("pepper_play")
     if debug:
-        result["drag_rings"] = int(debug[-1][4] or 0)
+        result["drag_rings"] = debug["rings"] or 0
 
 
 def main():
@@ -174,6 +190,14 @@ def main():
         colors(args, tmp, result)
         drag(args, tmp, result)
     finally:
+        for p in STARTED:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+        shutil.rmtree(tmp, ignore_errors=True)
         write("\x1b[?25h\x1b[H\x1b[2J")
         if args.out:
             with open(args.out, "w") as f:
