@@ -15,10 +15,10 @@ Report here problems in what Pepper adds to Ghostty:
 - the escape sequence `OSC 777;pepper`, and how Ghostty's core takes it to the app;
 - the macOS app's video server, `macos/Sources/Features/Pepper/PepperServer.swift`, and its Mach port (`PEPPER_PORT`);
 - `pepper-play`, the player inside `Pepper.app`;
-- `pepper-agent`, inside `Pepper.app` too: the viewer the human runs for AI agents, its control socket, and the files it writes (`.pepper/`);
+- `pepper-agent`, inside `Pepper.app` too: the viewer the human runs for AI agents, its control socket, the headless Chrome it runs for pages, and the files it writes (`.pepper/`);
 - how Pepper is built and signed (`pepper-build.sh`), and the releases here.
 
-Above all, anything that lets terminal output or another program run a command, read the screen or type into a tab, or show a picture where it wasn't placed; and anything that lets an agent's commands, or a video, a file name or a note, do more through `pepper-agent` than its commands say.
+Above all, anything that lets terminal output or another program run a command, read the screen or type into a tab, or show a picture where it wasn't placed; and anything that lets an agent's commands, or a video, a page, a file name or a note, do more through `pepper-agent` than its commands say (a page reaching the network when it wasn't opened with `--allow-remote`, among them).
 
 ## What isn't
 

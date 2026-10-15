@@ -87,3 +87,64 @@ AGENTS.md and CLAUDE.md reach an agent working in this repo. In any other folder
 
 - **By hand, in a test Pepper:** two sources stacked, each label right over its box, the agent's line and the keys at the bottom. The user played, focused, zoomed, marked twice, wrote a note and pressed Enter; `events --wait --until done` answered with all four.
 - **A fresh agent:** `claude -p "review video.mp4 with me in Pepper"` in a folder holding `video.mp4` and a `CLAUDE.md` of only the README's line, with Pepper's `PATH` (the build's folder last, as Pepper adds it). A viewer ran in a pseudo-terminal, and a script played the human: space, `m`, `m`, `n` and a note, Enter, once the agent waited. The agent's first command was `command -v pepper-agent && pepper-agent guide`. Then it ran `status`, `probe` and `sheet` (and looked at the sheet), then `open`, `say`, and `events --wait 580 --until done --since 0` with a 10-minute timeout on its shell tool. It had the two marks and the note 14 s later. On its own it then looked at the marked times (`frames`, `seek` and `snapshot`, the pixels' values). It found the file steady there, `loop`ed 0:03–0:07, and asked a follow-up with `say` and `events --since 4`, the guide's loop. It was stopped there, since the scripted human answers only once.
+
+## Phase 2: web previews and pointing (2026-10-15)
+
+A source can be a page: the viewer runs a headless Chrome of its own (an installed Chrome or Chromium, Playwright's, or `PEPPER_CHROME`), shows each page live in a box, and the agent drives it with `pepper-agent web …` (`open`, `goto`, `reload`, `back`, `click`, `type`, `press`, `scroll`, `hover`, `viewport`, `wait-for`, `shot`, `console`, `errors`, `dom`, `a11y`, `eval`). The human points: a click on any source is a `point` event, a drag a `region`, with pictures from the source and, for a page, what's there. Tests: 63 unit tests (and a measurement, ignored) and 87 integration checks, 30 of them on a local page in the real Chrome.
+
+### Where it differs from the spec, and why
+
+- **The DevTools protocol over a pipe, not a WebSocket** (`--remote-debugging-pipe`: commands on the browser's fd 3, answers on 4, NUL-separated JSON). No port is opened, so no other program on the Mac can reach the browser, and no WebSocket code is needed.
+- **One Chrome per viewer, a browser context per page**: each page has its own cookies, storage and cache, and the browser starts with the first page and ends with the last. Its profile is new, in the viewer's own folder, and deleted after; it's never the user's. Downloads are refused, JavaScript dialogs accepted (nothing in a headless page would answer them) and logged to the console.
+- **This machine only, by a proxy**: a page's context has a proxy that answers nothing, bypassed for `localhost`, `*.localhost`, `127.0.0.1` and `[::1]`, so the page and everything it loads (fetches, images, WebSockets) reach only this machine; WebRTC's UDP is kept to the proxy too. `open`, `goto` and `back` to an address elsewhere are `ORIGIN_BLOCKED` before they go, and `eval` runs only on a page of this machine. `--allow-remote` opens a context with no proxy.
+- **The frame path is neither of the spec's two**: Chrome's screencast JPEGs are decoded by the graphics chip's JPEG decoder (VideoToolbox) and copied into an IOSurface of the frame's size, which goes to Pepper through pepper-play's own Mach client (`pepper.rs` and `surface.rs`, shared by `#[path]`, both MIT). Pepper fits it to the box (`.resizeAspect`), and Chrome sends frames no bigger than the box, so nothing is scaled. Measured below against ImageIO on the CPU and against mpv fed the same JPEGs.
+- **Frames at twice the CSS size, 30 a second**: headless Chrome's screencast is at the browser's own scale whatever the page's emulated one, so it runs with `--force-device-scale-factor=2`, sharp on a Retina display. It sends every second frame of an animation: making 2880×1800 JPEGs costs Chrome 151% of a core at 60 a second, 85% at 30 (below). A still page sends nothing.
+- **Points and regions on videos too**: with the media time, and pictures from the player's frame. The pictures (`snapshot`, the whole frame; `crop`, the part around) go in `.pepper/points/` of the viewer's project. After a click a note prompt opens: Enter sends the event with the note, Esc sends it without.
+- **A click in a box is a point, not a click on the page**: the agent drives the page. The wheel scrolls it, `r` reloads, `↑` `↓` and Page Up/Down scroll. Clicking through to the page could come later as a mode.
+- **What's at a point** is worked out in an isolated world (the page's scripts can't change what describes it): a selector that finds only it (an id, a test attribute, else a short path of classes and `:nth-of-type`), tag, classes, text, box, the styles that place it, its parent's selector and box; role and name from Chrome's accessibility tree. `source` comes from the app's dev build, in the page's own world and only on this machine's pages: React 17/18's `_debugSource`, the first app frame of React 19's `_debugStack` (its lines are those of the code the dev server sends), Vue's component file, Svelte's location, or an inspector plugin's `data-` attribute.
+- **The title is the page's own `document.title`**: Chrome's target info gives the address until much later, if ever.
+- **`open` takes a page too**: a localhost address or an `.html` file opens as a web source; `--kind web` for another address.
+- **Device presets**: `desktop-1440` (the default, 1440×900 at 2), `desktop-1920`, `laptop-1280`, `ipad`, `iphone-15`, `pixel-8` (with their user agents and touch), or `WxH@DPR`.
+- **Not here yet:** `schema` (spec section 3) comes with the edit project, Phase 3, the first thing with a schema of its own.
+
+### The frame path, measured
+
+60 JPEGs of 2880×1800 (ffmpeg's `testsrc2`, busier than a page), on the M5 Pro:
+
+| Way | Time a frame | CPU a frame |
+| --- | --- | --- |
+| VideoToolbox decode, copy into the surface (used) | 5.1 ms median, 6.0 ms p95 | about 1 ms (the copy) |
+| ImageIO on the CPU, drawn into the surface (for frames under 64 px a side) | 16.6 ms median (8.7 decode, 4.0 draw) | the same |
+| mpv: pepper-play fed the JPEGs over a pipe (mpjpeg), no Pepper, drawing at 640×360 | 4.5 to 7.8 ms to mpv's frame count moving | about 10 ms |
+
+mpv's number stops before pepper-play draws the frame and waits for the display's next refresh, and it decodes on the CPU and needs a player per page: the graphics chip's decoder is quicker to the screen and nearly free. It traps inside VideoToolbox, taking the process with it, on frames under about 64 pixels a side (4×2, 64×16, 17×63 and 1×1 did; 64×17, 49×17, odd sizes, a phone's 1179×2556, truncated and corrupted JPEGs didn't), so those go to ImageIO. Run again with `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture`.
+
+Chrome's own cost for a page animating all the time (a box sliding, 1440×900 CSS pixels):
+
+| Scale | Frames a second | Chrome |
+| --- | --- | --- |
+| 2 | 60 | 151% of a core |
+| 2 | 30 (used) | 85% |
+| 1 | 60 | 49% |
+| 1 | 30 | 40% |
+
+JPEG quality 60 instead of 85 changed nothing (148%).
+
+### Measured in a test Pepper (release build)
+
+| What | Result |
+| --- | --- |
+| An agent's `web click` to its frame from Chrome | 33.7 ms median (27.6 to 44.9) |
+| … to that frame shown in Pepper | 40.0 ms median (34.9 to 98.0); the spec's target is under 100 |
+| A page animating, 30 frames a second | viewer 2.4%, Chrome 85.3%, the test Pepper 2.7% of a core |
+| A still page | viewer 0.0%, Chrome 0.1% |
+| `web open`, the browser starting | 0.44 s (4.4 s the very first time on this Mac) |
+| `web open` of another page, `goto` | 0.13 s, 18 ms |
+| `click` (100 ms of it waiting for the page), `type`, `eval`, `dom`, `a11y` | 116 ms; 6 to 70 ms |
+
+At 60 frames a second the same click was 29.3 ms to Chrome's frame and 36.2 ms to Pepper (25.3 to 53.4).
+
+### Checked
+
+- **By hand, in a test Pepper:** the page sharp in its box (frames of 2870×1794 decoded by the graphics chip), its label and the keys under it. The user dragged around the misaligned card and wrote "this card is out of line", then dragged around the button and sent it without a note, then pressed Enter: two `region` events, each naming its element (`div[data-testid="second"]` with its 41 px left margin, `#b`), with a crop of the part and a picture of the whole view, and `done`.
+- **A fresh agent:** `claude -p "Let's review this app's UI together in Pepper. Its dev server is running at http://localhost:5173."` in a Vite and React app (`npm create vite`) whose promo banner sat 18 px right of the header's title, with a `CLAUDE.md` of only the README's line and the viewer in a pseudo-terminal. A script played the human: once the agent waited for events, it clicked the banner and typed "align with the header", then pressed Enter. The agent ran `pepper-agent guide` first, then `status`, `web open`, `web shot` (and looked at it), `web errors`, `say`, and `events --wait 580 --until done`. From the point (`div.promo-banner`, its margin `24px 0px 24px 18px`, the note) it changed `margin: 24px 0 24px 18px` to `margin: 24px 0` in `src/App.css`. It then checked with `web eval` that the title, the stat cards, the banner and the table all start at 32 px, and looked at a new `web shot`. 38 s and $0.42 in all; the banner lined up.
