@@ -37,7 +37,7 @@ Everything Pepper adds to Ghostty 1.3.1 is in this table, and in [a handful of c
 | Where | What Pepper adds | Size |
 | --- | --- | --- |
 | Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box. | 332 lines, tests included |
-| The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 663 lines, plus 22 that hook it in |
+| The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 693 lines, plus 22 that hook it in |
 | Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says where new releases are. | About 2,100 lines fewer |
 | The player (Rust) | [`pepper-play`](pepper-play/), a program of its own inside the app. Pepper never starts it: you do, or a program you run does. | Separate program |
 | The name and icon | "Pepper" in menus, About and alerts, its own app id and icon, so it can't be confused with Ghostty or replace it. | Text and images |

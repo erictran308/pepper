@@ -74,6 +74,11 @@ final class PepperServer {
     private static let tokenSize = 64
     private static let maxSurfaces = 4
     private static let maxSide = 8192
+    /// A surface's memory, at most: maxSide² BGRA, plus room for row padding.
+    private static let maxSurfaceBytes = 4 * maxSide * maxSide + (1 << 20)
+    /// How long a box keeps the replaced stream's last frame (see `attach`)
+    /// if the new stream presents nothing.
+    private static let keptFrameLimit: TimeInterval = 2
     private static let maxStreams = 16
     private static let maxPlacementsPerView = 4
     private static let maxPlacements = 64
@@ -114,6 +119,8 @@ final class PepperServer {
         var slot: Int?
         /// What the client was last told of its box.
         var reported: BoxSize?
+        /// Which attach made it, to tell it from a later one on the token.
+        var serial = 0
     }
 
     /// Where a token's frames show.
@@ -148,6 +155,7 @@ final class PepperServer {
     private var streams: [String: Stream] = [:]
     private var placements: [String: Placement] = [:]
     private var placementsMade = 0
+    private var streamsMade = 0
 
     /// Registers the port and listens on the main queue. Call it before any
     /// surface starts, so every shell gets PEPPER_PORT.
@@ -300,8 +308,15 @@ final class PepperServer {
     }
 
     /// Puts the token's current frame (or nothing) in its placement's layer.
+    /// A placement whose view has gone goes instead.
     private func show(_ token: String) {
         guard let placement = placements[token] else { return }
+        guard placement.view != nil else {
+            placements.removeValue(forKey: token)
+            remove(placement.layer)
+            report(token)
+            return
+        }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         placement.layer.contents = currentSurface(token)
@@ -464,12 +479,13 @@ final class PepperServer {
     }
 
     /// A surface as pepper-play makes them: BGRA, not planar, at most
-    /// `maxSide` pixels a side.
+    /// `maxSide` pixels a side and the memory that takes.
     private static func usable(_ surface: IOSurface) -> Bool {
         surface.pixelFormat == 0x4247_5241 // 'BGRA'
             && surface.planeCount == 0
             && (1...maxSide).contains(surface.width)
             && (1...maxSide).contains(surface.height)
+            && surface.allocationSize <= maxSurfaceBytes
     }
 
     private func attach(_ token: String, _ ports: [mach_port_t], from sender: Sender) {
@@ -524,10 +540,19 @@ final class PepperServer {
         // Keep the client's right past mach_msg_destroy.
         header.pointee.msgh_remote_port = mach_port_t(MACH_PORT_NULL)
         dropStream(token)
-        streams[token] = Stream(surfaces: surfaces, client: client, owner: sender, slot: nil)
+        streamsMade += 1
+        let serial = streamsMade
+        streams[token] = Stream(surfaces: surfaces, client: client, owner: sender, slot: nil, serial: serial)
         // Not shown yet: the box keeps the last frame of the stream this
         // replaces (its client attaches again at a new size) until the first
-        // `present`, rather than going blank between them.
+        // `present`, rather than going blank between them; the same owner's
+        // frame (checked above). Not for long: if this stream presents
+        // nothing, the box empties.
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.keptFrameLimit) { [weak self] in
+            guard let self, let stream = self.streams[token],
+                  stream.serial == serial, stream.slot == nil else { return }
+            self.show(token)
+        }
         report(token)
         Self.logger.info("attached \(surfaces.count) surfaces")
     }
@@ -563,6 +588,9 @@ final class PepperServer {
         show(token)
     }
 
+    /// Ends the token's stream. Its box may still show the stream's last
+    /// frame: every caller but a same-owner `attach` (which replaces it, and
+    /// bounds that) clears or removes the box after.
     private func dropStream(_ token: String) {
         guard let stream = streams.removeValue(forKey: token) else { return }
         mach_port_deallocate(mach_task_self_, stream.client)
