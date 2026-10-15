@@ -12,8 +12,10 @@
 # its path to Zig. xcodebuild keeps using the real SDK.
 #
 # Then it builds pepper-play (pepper-play/, Rust) and puts it in the app as
-# Contents/Helpers/Pepper.app, signs both ad hoc with the hardened runtime and
-# entitlements of their own, and checks what the signatures say.
+# Contents/Helpers/Pepper.app, and pepper-agent (pepper-agent/, Rust) as
+# Contents/MacOS/pepper-agent, signs them all ad hoc with the hardened runtime
+# and entitlements of their own (pepper-agent: none), and checks what the
+# signatures say.
 #
 # Usage: ./pepper-build.sh [zig build options]   (default: -Doptimize=ReleaseFast)
 set -eu
@@ -113,6 +115,12 @@ if [ -n "$icon" ] && [ -f "$app/Contents/Resources/$icon.icns" ]; then
     cp "$app/Contents/Resources/$icon.icns" "$helper/Contents/Resources/pepper.icns"
 fi
 
+echo "pepper-build: building pepper-agent" >&2
+PATH="$path_before" cargo build --release --locked --manifest-path pepper-agent/Cargo.toml
+# On every shell's PATH, next to pepper-play.
+cp pepper-agent/target/release/pepper-agent "$app/Contents/MacOS/pepper-agent"
+agent_version=$("$app/Contents/MacOS/pepper-agent" --version | cut -d' ' -f2)
+
 # What About and Finder say (the Xcode project has a placeholder).
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $pepper_version" \
     -c "Set :CFBundleVersion $pepper_build" "$app/Contents/Info.plist"
@@ -130,6 +138,8 @@ ln -sf ../Helpers/Pepper.app/Contents/MacOS/pepper-play "$app/Contents/MacOS/pep
 # debugger may attach).
 codesign --force --sign - --options runtime \
     --entitlements pepper-play/pepper-play.entitlements "$helper"
+# pepper-agent loads nothing and makes no code: no entitlements at all.
+codesign --force --sign - --options runtime "$app/Contents/MacOS/pepper-agent"
 codesign --force --sign - --options runtime \
     --entitlements macos/GhosttyReleaseLocal.entitlements "$app"
 codesign --verify --deep --strict "$app"
@@ -140,7 +150,7 @@ fail() {
     echo "pepper-build: $*" >&2
     exit 1
 }
-for code in "$app" "$helper"; do
+for code in "$app" "$helper" "$app/Contents/MacOS/pepper-agent"; do
     case "$(codesign -d --verbose=2 "$code" 2>&1)" in
     *"flags=0x10002(adhoc,runtime)"*) ;;
     *) fail "$code isn't signed with the hardened runtime" ;;
@@ -155,5 +165,7 @@ case "$(codesign -d --entitlements - --xml "$app" 2>/dev/null)" in
     fail "$app loads libraries not its own, or makes code" ;;
 esac
 [ ! -e "$app/Contents/Frameworks" ] || fail "$app has frameworks (Sparkle is taken out)"
+[ -z "$(codesign -d --entitlements - --xml "$app/Contents/MacOS/pepper-agent" 2>/dev/null)" ] ||
+    fail "pepper-agent has entitlements"
 
-echo "pepper-build: $app $pepper_version, with pepper-play $version" >&2
+echo "pepper-build: $app $pepper_version, with pepper-play $version and pepper-agent $agent_version" >&2
