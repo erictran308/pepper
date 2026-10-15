@@ -43,6 +43,7 @@ class Viewer:
     """pepper-agent view in a pseudo-terminal: keys in, screen out."""
 
     def __init__(self, agent, env, cwd):
+        self.agent, self.env, self.cwd = agent, env, cwd
         self.out = bytearray()
         self.lock = threading.Lock()
         pid, fd = pty.fork()
@@ -114,6 +115,161 @@ def make_media(dir):
     sound = os.path.join(dir, "sound.m4a")
     ff("-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000", "-t", "4", "-c:a", "aac", sound)
     return clip, hostile, sound
+
+
+PAGE = """<!doctype html><html><head><title>Shop &#x1b;]2;pwned&#x07; admin</title>
+<style>body{font:16px system-ui;margin:0} header{padding:16px 24px;background:#223;color:#fff}
+.card{margin:24px;padding:16px;border:1px solid #ccc} .card.bad{margin-left:41px} .tall{height:2400px}</style></head>
+<body><header><h1 id="title">Dashboard</h1></header>
+<div class="card">First card</div><div class="card bad" data-testid="second">Second card</div>
+<button id="b" onclick="this.textContent='clicked '+(window.n=(window.n||0)+1)">Click me</button>
+<input id="in" aria-label="Name"><div class="tall"></div>
+<script>
+console.log("from the page \x1b]52;c;cHduZWQ=\x07");
+setTimeout(() => { throw new Error("boom"); }, 50);
+fetch("https://example.com/x").catch(() => {});
+setTimeout(() => { const d = document.createElement("p"); d.id = "late"; d.textContent = "late"; document.body.append(d); }, 500);
+</script></body></html>"""
+
+
+def serve(root):
+    """A static server on 127.0.0.1, on a thread; its port."""
+    import functools
+    import http.server
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+    handler = functools.partial(Quiet, directory=root)
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def press_at(viewer, box, viewport, css, cell=(10, 20)):
+    """Pane pixels of a page's CSS point, as the viewer lays it out."""
+    col, row, cols, rows = box
+    bx, by, bw, bh = col * cell[0], row * cell[1], cols * cell[0], rows * cell[1]
+    aspect = viewport["width"] / viewport["height"]
+    cw, ch = (round(bh * aspect), bh) if bw / bh > aspect else (bw, round(bw / aspect))
+    ox, oy = (bw - cw) // 2, (bh - ch) // 2
+    return (int(bx + ox + css[0] * cw / viewport["width"]), int(by + oy + css[1] * ch / viewport["height"]))
+
+
+def web_checks(cli, viewer, work, run_dir):
+    if not cli("status").get("deps", {}).get("chrome", {}).get("ok"):
+        print("skip web: no Chrome (PEPPER_CHROME)")
+        return
+    # Room for two pages: the media sources go.
+    for source in cli("sources").get("sources", []):
+        cli("close", source["name"])
+    site = os.path.join(work, "site")
+    os.makedirs(site)
+    with open(os.path.join(site, "index.html"), "w") as f:
+        f.write(PAGE)
+    server = serve(site)
+    url = f"http://127.0.0.1:{server.server_address[1]}/"
+
+    opened = cli("web", "open", url, "--name", "app")
+    src = opened.get("source", {})
+    check("web open answers once it has loaded", src.get("status") == "ready" and src.get("kind") == "web", src)
+    check("web open says the page's title", "Shop" in (src.get("title") or ""), src)
+    check("the page gets a box", viewer.wait_for(b"app  ready"))
+    check("the page's title never reaches the terminal raw", b"\x1b]2;pwned" not in viewer.screen())
+    blocked = cli("web", "open", "https://example.com/", "--name", "far", ok=False)
+    check("a page off this machine is ORIGIN_BLOCKED", blocked.get("error", {}).get("code") == "ORIGIN_BLOCKED", blocked)
+    blocked = cli("web", "goto", "https://example.com/", ok=False)
+    check("so is going to one", blocked.get("error", {}).get("code") == "ORIGIN_BLOCKED", blocked)
+    playback = cli("pause", "--source", "app", ok=False)
+    check("a page has no playback: NOT_PLAYABLE", playback.get("error", {}).get("code") == "NOT_PLAYABLE", playback)
+
+    shot = cli("web", "shot")
+    check("web shot writes a PNG", os.path.isfile(shot.get("path", "")) and shot.get("width") == 1568, shot)
+    head = cli("web", "shot", "--selector", "header")
+    check("web shot --selector is the element", head.get("width") == 1568 and 0 < head.get("height", 0) < 200, head)
+
+    raw = subprocess.run([viewer.agent, "web", "console", "--viewer", str(viewer.pid)], capture_output=True, cwd=viewer.cwd, env=viewer.env)
+    check("web console escapes the page's text", b"from the page" in raw.stdout and b"\x1b" not in raw.stdout, raw.stdout[:200])
+    errors = cli("web", "errors").get("errors", [])
+    kinds = {e.get("kind") for e in errors}
+    check("web errors has the exception", any("boom" in e.get("text", "") for e in errors), errors)
+    check("and the remote request that was stopped",
+          any(e.get("kind") == "network" and "example.com" in e.get("url", "") for e in errors), errors)
+    check("and the 404", any(e.get("status") == 404 for e in errors), kinds)
+
+    clicked = cli("web", "click", "#b")
+    check("web click clicks", cli("web", "eval", "document.querySelector('#b').textContent").get("value") == "clicked 1", clicked)
+    cli("web", "type", "#in", "hello")
+    cli("web", "press", "Shift+a")
+    check("web type and press type", cli("web", "eval", "document.querySelector('#in').value").get("value") == "helloA")
+    dom = cli("web", "dom", ".card.bad")
+    check("web dom finds it", dom.get("matches") == 1 and "data-testid" in dom.get("html", ""), dom)
+    tree = cli("web", "a11y").get("tree", "")
+    check("web a11y has the button and the field", 'button "clicked 1"' in tree and 'textbox "Name"' in tree, tree[:300])
+    check("web wait-for waits for an element", cli("web", "wait-for", "#late").get("waited_for") == "#late")
+    check("web wait-for network-idle", cli("web", "wait-for", "network-idle").get("waited_for") == "network-idle")
+    missing = cli("web", "click", "#nope", ok=False)
+    check("no such element: NOT_FOUND", missing.get("error", {}).get("code") == "NOT_FOUND", missing)
+
+    phone = cli("web", "viewport", "iphone-15")
+    box = cli("where", "app").get("box")
+    check("web viewport changes the page and its box",
+          phone.get("viewport", {}).get("width") == 393 and box and box[2] < box[3] * 2, (phone, box))
+    cli("web", "viewport", "desktop-1440")
+    time.sleep(0.3)
+
+    # The human points at the misaligned card and says what's wrong.
+    app = cli("where", "app")
+    rect = json.loads(cli("web", "eval", "JSON.stringify(document.querySelector('.card.bad').getBoundingClientRect())")["value"])
+    since = cli("events").get("last_id", 0)
+    x, y = press_at(viewer, app["box"], app["viewport"], (rect["x"] + 30, rect["y"] + rect["height"] / 2))
+    viewer.keys(f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
+    check("a click opens the note prompt", viewer.wait_for(b"note on the point"))
+    viewer.keys(b"align with the header\r")
+    got = cli("events", "--since", str(since), "--wait", "10")
+    point = (got.get("events") or [{}])[0]
+    element = point.get("element") or {}
+    check("a click is a point event", point.get("type") == "point" and point.get("note") == "align with the header", point)
+    check("in the page's CSS pixels", abs(point.get("x", 0) - (rect["x"] + 30)) <= 2, point)
+    check("with a selector that finds it", "second" in element.get("selector", ""), element)
+    check("and its styles", "41px" in element.get("styles", {}).get("margin", ""), element)
+    check("and pictures of it", os.path.isfile(point.get("snapshot", "")) and os.path.isfile(point.get("crop", "")), point)
+    since = point.get("id", since)
+    a = press_at(viewer, app["box"], app["viewport"], (20, 10))
+    b = press_at(viewer, app["box"], app["viewport"], (400, 200))
+    viewer.keys(f"\x1b[<0;{a[0]};{a[1]}M\x1b[<32;{b[0]};{b[1]}M\x1b[<0;{b[0]};{b[1]}m".encode())
+    viewer.keys(b"\x1b")
+    got = cli("events", "--since", str(since), "--wait", "10")
+    region = (got.get("events") or [{}])[0]
+    check("a drag is a region event", region.get("type") == "region" and 370 <= region.get("w", 0) <= 390, region)
+    viewer.keys(f"\x1b[<65;{a[0]};{a[1]}M".encode() * 3)
+    time.sleep(0.5)
+    check("the wheel scrolls the page", (cli("web", "eval", "scrollY").get("value") or 0) > 0)
+
+    # --watch: the page reloads when its folder changes.
+    watched = os.path.join(site, "w.html")
+    with open(watched, "w") as f:
+        f.write("<title>one</title>")
+    cli("web", "open", watched, "--name", "w", "--watch", site)
+    with open(watched, "w") as f:
+        f.write("<title>two</title>")
+    deadline = time.time() + 5
+    while time.time() < deadline and cli("where", "w").get("title") != "two":
+        time.sleep(0.2)
+    check("--watch reloads on a change", cli("where", "w").get("title") == "two")
+
+    chrome = lambda: subprocess.run(["pgrep", "-f", f"user-data-dir={run_dir}/{viewer.pid}-chrome"],
+                                    capture_output=True, text=True).stdout.split()
+    check("the browser runs while pages are open", chrome())
+    cli("close", "w")
+    cli("close", "app")
+    deadline = time.time() + 5
+    while time.time() < deadline and chrome():
+        time.sleep(0.2)
+    check("the browser ends with the last page", not chrome())
+    profiles = [d for d in os.listdir(run_dir) if d.startswith(f"{viewer.pid}-chrome")]
+    check("and its profile is deleted", not profiles, profiles)
+    server.shutdown()
 
 
 def main():
@@ -256,6 +412,8 @@ def main():
     sock_path = os.path.join(tmp, f"pepper-agent-{os.getuid()}", f"{viewer.pid}.sock")
     check("the socket is the user's only", oct(os.stat(sock_path).st_mode & 0o777) == "0o600")
     check("its folder too", oct(os.stat(os.path.dirname(sock_path)).st_mode & 0o777) == "0o700")
+
+    web_checks(cli, viewer, work, os.path.dirname(sock_path))
 
     def raw(payload):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
