@@ -1,0 +1,14 @@
+[package]
+name = "pepper-agent"
+version = "0.1.0"
+edition = "2024"
+description = "Lets AI agents use Pepper: a viewer the human runs, and commands an agent runs"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "pepper-agent"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
