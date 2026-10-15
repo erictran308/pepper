@@ -14,3 +14,7 @@ path = "src/main.rs"
 
 [profile.release]
 strip = true
+# A panic stops the program at once rather than unwinding: unwinding past the
+# render thread's live libmpv render context (or an FFI callback) would leave
+# libmpv freeing a context in use.
+panic = "abort"

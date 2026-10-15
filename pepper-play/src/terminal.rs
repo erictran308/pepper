@@ -84,8 +84,8 @@ impl Tty {
     }
 }
 
-/// The box run from a shell: the window but its last row, mpv's status
-/// line; or, filling it, the whole window.
+/// The box run from a shell: the window but its last row, the status line;
+/// or, filling it, the whole window.
 pub fn screen_box(cols: u16, rows: u16, fill: bool) -> Cells {
     Cells {
         col: 0,
@@ -99,10 +99,23 @@ pub fn screen_box(cols: u16, rows: u16, fill: bool) -> Cells {
     }
 }
 
-/// Where the box was last placed: the window's size, and whether it fills it.
+/// Where the box was last placed: the window's size, and whether it fills
+/// it; and the status line under it.
 struct Placed {
     size: (u16, u16),
     fill: bool,
+    status: String,
+}
+
+/// Draws `status` on the last row, cut to the window's width. The text is
+/// this program's own (numbers and fixed words, main.rs `status_text`).
+fn status_line((cols, rows): (u16, u16), status: &str) -> String {
+    let text: String = status
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(cols as usize)
+        .collect();
+    format!("\x1b[{rows};1H\x1b[2K{text}")
 }
 
 /// Run from a shell: the video takes the screen (the alternate one, as a
@@ -117,9 +130,8 @@ pub struct Screen {
 }
 
 impl Screen {
-    /// Switches to the alternate screen, hides the cursor and puts it on the
-    /// last row, so what mpv prints scrolls up under the video and its
-    /// status line stays at the bottom; then places the box.
+    /// Switches to the alternate screen and hides the cursor, then places the
+    /// box over all but the last row, where [`Screen::status`] goes.
     pub fn enter(tty: Arc<Tty>, token: String) -> Screen {
         let (cols, rows) = tty.size().unwrap_or((80, 24));
         tty.write(&format!(
@@ -129,6 +141,7 @@ impl Screen {
         let placed = Arc::new(Mutex::new(Placed {
             size: (cols, rows),
             fill: false,
+            status: String::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let watch = std::thread::spawn({
@@ -143,7 +156,11 @@ impl Screen {
                     let mut placed = placed.lock().unwrap_or_else(|e| e.into_inner());
                     if now != placed.size && !stop.load(Ordering::Acquire) {
                         placed.size = now;
-                        tty.write(&place(&token, screen_box(now.0, now.1, placed.fill)));
+                        let mut out = place(&token, screen_box(now.0, now.1, placed.fill));
+                        if !placed.fill {
+                            out += &status_line(now, &placed.status);
+                        }
+                        tty.write(&out);
                     }
                 }
             }
@@ -157,15 +174,29 @@ impl Screen {
         }
     }
 
-    /// Makes the video fill the whole window, over mpv's status line, or
+    /// Makes the video fill the whole window, over the status line, or
     /// leave it the last row again: mpv's fullscreen (`f`).
     pub fn set_fill(&self, fill: bool) {
         let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
         if placed.fill != fill {
             placed.fill = fill;
             let (cols, rows) = placed.size;
-            self.tty
-                .write(&place(&self.token, screen_box(cols, rows, fill)));
+            let mut out = place(&self.token, screen_box(cols, rows, fill));
+            if !fill {
+                out += &status_line(placed.size, &placed.status);
+            }
+            self.tty.write(&out);
+        }
+    }
+
+    /// Shows `status` on the last row, if it changed (and isn't covered).
+    pub fn status(&self, status: &str) {
+        let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+        if placed.status != status {
+            placed.status = status.to_owned();
+            if !placed.fill {
+                self.tty.write(&status_line(placed.size, status));
+            }
         }
     }
 
@@ -194,6 +225,19 @@ mod tests {
         };
         assert_eq!(place("ab", at), "\x1b]777;pepper;place;ab;2;3;40;11\x1b\\");
         assert_eq!(remove("ab"), "\x1b]777;pepper;remove;ab\x1b\\");
+    }
+
+    #[test]
+    fn the_status_line_is_inert_and_fits() {
+        assert_eq!(
+            status_line((80, 24), "(Paused) 00:00:03 / 00:01:10 (4%)"),
+            "\x1b[24;1H\x1b[2K(Paused) 00:00:03 / 00:01:10 (4%)"
+        );
+        assert_eq!(status_line((5, 2), "0123456789"), "\x1b[2;1H\x1b[2K01234");
+        assert_eq!(
+            status_line((80, 2), "a\x1b]2;x\x07b"),
+            "\x1b[2;1H\x1b[2Ka]2;xb"
+        );
     }
 
     #[test]
