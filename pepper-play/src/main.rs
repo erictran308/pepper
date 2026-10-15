@@ -102,6 +102,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     const REMAKE_EVERY: Duration = Duration::from_millis(500);
     /// Refreshes with nothing to show before the display link stops.
     const LINK_IDLE: u32 = 30;
+    /// How long a frame waits for the display's refresh before it's shown
+    /// anyway (the displays asleep, the link not running).
+    const REFRESH_LATE: Duration = Duration::from_millis(100);
+    /// How long after surfaces couldn't be made they're tried again.
+    const ALLOC_AGAIN: Duration = Duration::from_secs(1);
     /// How long after Pepper didn't take the surfaces they're offered again.
     const ATTACH_AGAIN: Duration = Duration::from_secs(1);
 
@@ -159,6 +164,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         link_idle: bool,
         /// mpv blends frames (`interpolation`), so no frame repeats another.
         interpolation: bool,
+        /// The render thread's messages, for mpv's thread to print: under
+        /// ADVANCED_CONTROL the render thread must never wait on a thread
+        /// that calls libmpv, and stderr's lock (or a full pipe) could make
+        /// it.
+        notes: Vec<String>,
     }
 
     #[derive(Default)]
@@ -175,6 +185,17 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         fn update(&self, f: impl FnOnce(&mut State)) {
             f(&mut self.lock());
             self.wake.notify_one();
+        }
+
+        /// From the render thread: a message for mpv's thread to print.
+        fn note(&self, mpv: Mpv, text: String) {
+            let mut state = self.lock();
+            if state.notes.len() < MAX_ERRORS {
+                state.notes.push(text);
+            }
+            drop(state);
+            // SAFETY: a live handle; safe from a render thread.
+            unsafe { mpv::mpv_wakeup(mpv.0) };
         }
 
         /// At each of the display's refreshes, while the link runs.
@@ -211,6 +232,9 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         errors: Vec<String>,
         /// A file or URL couldn't be played.
         failed: bool,
+        /// From a shell: the render thread's messages, shown once the screen
+        /// is back.
+        notes: Vec<String>,
         /// PEPPER_PLAY_DEBUG: mpv's hardware decoder, as last said
         /// (`hwdec-current`), and the render thread's counts, said at the end.
         hwdec: Option<String>,
@@ -246,6 +270,9 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 for error in &self.errors {
                     eprint!("{error}");
                 }
+            }
+            for note in &self.notes {
+                eprintln!("pepper-play: {note}");
             }
             if let Some(stats) = &self.stats {
                 eprintln!(
@@ -382,14 +409,19 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             placed: false,
             errors: Vec::new(),
             failed: false,
+            notes: Vec::new(),
             hwdec: None,
             stats: None,
         };
         // The display's refresh, to show frames at and time video to; without
         // it, each frame is shown as soon as it's drawn.
         let vsync = Vsync::new(Box::new({
-            let shared = session.shared.clone();
-            move || shared.on_refresh()
+            let shared = Arc::downgrade(&session.shared);
+            move || {
+                if let Some(shared) = shared.upgrade() {
+                    shared.on_refresh();
+                }
+            }
         }))
         .inspect_err(|err| eprintln!("pepper-play: {err}"))
         .ok();
@@ -477,14 +509,22 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         ];
         if mode == Mode::Shell {
             own.extend([
-                // mpv's status line, and its keys from the terminal.
+                // mpv's keys from the terminal.
                 ("terminal", "yes"),
                 ("input-terminal", "yes"),
-                // But none of mpv's messages: they hold the video's tags, file
-                // names and URLs, which mpv prints with any escape sequences
-                // in them. Its errors are shown, made safe, once the screen is
-                // back.
-                ("msg-level", "all=no,statusline=status"),
+                // But nothing of mpv's on it: its messages hold the video's
+                // tags, file names and URLs, and its status line also carries
+                // subtitles and OSD text whenever there's no video output,
+                // all printed with any escape sequences in them (a subtitle
+                // could set the clipboard). This program draws the status
+                // line itself, from numbers (`status_text`); mpv's errors
+                // are shown, made safe, once the screen is back.
+                ("msg-level", "all=no"),
+                // And a video output always, even for sound alone, so that
+                // subtitles and OSD text are drawn in the box, never on the
+                // terminal.
+                ("force-window", "yes"),
+                ("term-osd", "no"),
             ]);
         }
         let mut options: Vec<(String, String)> = own
@@ -504,7 +544,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         for (name, value) in &args.options {
             match name.as_str() {
                 name if IPC_OPTIONS.contains(&name) => ipc.push((name.to_owned(), value.clone())),
-                // There's no window here to force.
+                // This program's own: forced from a shell (above), and an
+                // app's box shows nothing until there's video.
                 "force-window" => {}
                 // Only to keep from mistakes: the options are the user's or
                 // the app's, who could still change the output with
@@ -566,6 +607,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
 
         shared.update(|state| state.stop = true);
         let stats = render.join().ok();
+        take_notes(session);
         if setup.debug {
             session.stats = stats;
         }
@@ -657,6 +699,43 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         ))
     }
 
+    /// What the status line shows, run from a shell: numbers and fixed
+    /// words only, from mpv's properties (mpv's own status line is off).
+    #[derive(Debug, Default, Clone, Copy, PartialEq)]
+    struct Status {
+        position: Option<f64>,
+        duration: Option<f64>,
+        paused: bool,
+        buffering: bool,
+    }
+
+    /// `HH:MM:SS`, as mpv shows times.
+    fn clock(seconds: f64) -> String {
+        let s = seconds.max(0.0) as u64;
+        format!("{:02}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    }
+
+    fn status_text(status: Status) -> String {
+        let state = if status.buffering {
+            "(Buffering) "
+        } else if status.paused {
+            "(Paused) "
+        } else {
+            ""
+        };
+        let finite = |v: Option<f64>| v.filter(|v| v.is_finite());
+        match (finite(status.position), finite(status.duration)) {
+            (Some(position), Some(duration)) if duration > 0.0 => format!(
+                "{state}{} / {} ({}%)",
+                clock(position),
+                clock(duration),
+                (position / duration * 100.0).clamp(0.0, 100.0) as u32
+            ),
+            (Some(position), _) => format!("{state}{}", clock(position)),
+            _ => state.trim_end().to_owned(),
+        }
+    }
+
     /// mpv's events, until it shuts down.
     fn events(mpv: Mpv, debug: bool, session: &mut Session) {
         /// How often Now Playing is told it all again, with no event.
@@ -666,6 +745,12 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         const FULLSCREEN: u64 = 1000;
         const HWDEC: u64 = 1001;
         const INTERPOLATION: u64 = 1002;
+        /// The status line's properties, run from a shell.
+        const POSITION: u64 = 1003;
+        const DURATION: u64 = 1004;
+        const PAUSED: u64 = 1005;
+        const BUFFERING: u64 = 1006;
+        let mut status = Status::default();
         let mut now_playing = NowPlaying::start(mpv.0, session.mode == Mode::App);
         // With interpolation, a frame shown at several refreshes is drawn
         // anew at each; without, the render thread skips its repeats.
@@ -691,21 +776,24 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         }
         if session.screen.is_some() {
             // From a shell, mpv's fullscreen (`f`) fills the whole window,
-            // over its status line: there's no window of mpv's to fill.
-            // SAFETY: a live handle and a C string.
-            unsafe {
-                mpv::mpv_observe_property(
-                    mpv.0,
-                    FULLSCREEN,
-                    c"fullscreen".as_ptr(),
-                    mpv::FORMAT_FLAG,
-                )
-            };
+            // over the status line: there's no window of mpv's to fill.
+            let observe = [
+                (FULLSCREEN, c"fullscreen", mpv::FORMAT_FLAG),
+                (POSITION, c"time-pos", mpv::FORMAT_DOUBLE),
+                (DURATION, c"duration", mpv::FORMAT_DOUBLE),
+                (PAUSED, c"pause", mpv::FORMAT_FLAG),
+                (BUFFERING, c"paused-for-cache", mpv::FORMAT_FLAG),
+            ];
+            for (id, name, format) in observe {
+                // SAFETY: a live handle and a C string.
+                unsafe { mpv::mpv_observe_property(mpv.0, id, name.as_ptr(), format) };
+            }
         }
         loop {
             // SAFETY: mpv is a live handle; the event stays valid until the
             // next mpv_wait_event.
             let event = unsafe { &*mpv::mpv_wait_event(mpv.0, REFRESH) };
+            take_notes(session);
             match event.event_id {
                 mpv::EVENT_SHUTDOWN => return,
                 mpv::EVENT_NONE => now_playing.refresh(),
@@ -719,6 +807,24 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                             && unsafe { *property.data.cast::<c_int>() } != 0;
                         if let Some(screen) = &session.screen {
                             screen.set_fill(on);
+                        }
+                    } else if (POSITION..=BUFFERING).contains(&event.reply_userdata) {
+                        // SAFETY: as the format says: a double or an int,
+                        // or nothing (no file, no duration).
+                        let double = (property.format == mpv::FORMAT_DOUBLE
+                            && !property.data.is_null())
+                        .then(|| unsafe { *property.data.cast::<f64>() });
+                        let flag = property.format == mpv::FORMAT_FLAG
+                            && !property.data.is_null()
+                            && unsafe { *property.data.cast::<c_int>() } != 0;
+                        match event.reply_userdata {
+                            POSITION => status.position = double,
+                            DURATION => status.duration = double,
+                            PAUSED => status.paused = flag,
+                            _ => status.buffering = flag,
+                        }
+                        if let Some(screen) = &session.screen {
+                            screen.status(&status_text(status));
                         }
                     } else if event.reply_userdata == INTERPOLATION {
                         // SAFETY: a flag property's data is an int.
@@ -776,10 +882,24 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         }
     }
 
+    /// Prints the render thread's messages (App mode) or keeps them for the
+    /// end (from a shell, where the video has the screen).
+    fn take_notes(session: &mut Session) {
+        let notes = std::mem::take(&mut session.shared.lock().notes);
+        for note in notes.iter().map(|note| printable(note)) {
+            match session.mode {
+                Mode::App => eprintln!("pepper-play: {note}"),
+                Mode::Shell => session.notes.push(note),
+            }
+        }
+    }
+
     /// mpv's text made safe to print to a terminal: it can hold a playlist
     /// entry's name, a URL or yt-dlp's output, so its control characters (C0,
     /// DEL, C1), which would start escape sequences, are shown escaped
-    /// (`\u{1b}`). Cut at MAX_LINE bytes; a newline at the end stays.
+    /// (`\u{1b}`), and so are the invisible format characters that would
+    /// reorder or hide part of the line (bidi controls, zero-width ones).
+    /// Cut at MAX_LINE bytes; a newline at the end stays.
     fn printable(text: &str) -> String {
         let (body, newline) = match text.strip_suffix('\n') {
             Some(body) => (body, "\n"),
@@ -793,11 +913,23 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             }
             if c.is_control() {
                 out.extend(c.escape_default());
+            } else if invisible(c) {
+                out.extend(c.escape_unicode());
             } else {
                 out.push(c);
             }
         }
         out + newline
+    }
+
+    /// Unicode format characters that change how a line reads without being
+    /// seen: bidi embeddings, overrides and isolates, zero-width ones, the
+    /// soft hyphen, the byte-order mark.
+    fn invisible(c: char) -> bool {
+        matches!(c,
+            '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
     }
 
     unsafe fn client_args(message: *const mpv::ClientMessage) -> Vec<String> {
@@ -1018,10 +1150,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
 
         let client = match port {
             Some(name) => pepper::Client::connect(&name)
-                .inspect_err(|err| eprintln!("pepper-play: {err}"))
+                .inspect_err(|err| shared.note(mpv, err.clone()))
                 .ok(),
             None => {
-                eprintln!("pepper-play: PEPPER_PORT is not set; drawing to nowhere");
+                shared.note(mpv, "PEPPER_PORT is not set; drawing to nowhere".into());
                 None
             }
         };
@@ -1050,26 +1182,34 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         let mut remake: Option<Instant> = None;
         // With a display link: what to show at the display's next refresh,
         // a surface drawn last, or none for a frame that repeats the one on
-        // screen.
+        // screen; and since when it has waited. No link, or one that wouldn't
+        // start: frames are shown as soon as they're drawn.
         let mut waiting: Option<Option<usize>> = None;
+        let mut waiting_since = Instant::now();
+        let mut synced = vsync.is_some();
+        // When surfaces couldn't be made: not again before ALLOC_AGAIN.
+        let mut alloc_failed: Option<Instant> = None;
 
         loop {
             let (token, size, reported, work, refresh, idle, interpolation) = {
                 let mut state = shared.lock();
-                let mut due = false;
+                let (mut due, mut late) = (false, false);
                 while !(state.frame
                     || state.changed
                     || state.stop
                     || state.refresh
                     || state.link_idle)
                 {
-                    // Surfaces to make at a size that has settled.
-                    let Some(at) = remake else {
+                    // Surfaces to make at a size that has settled, or a frame
+                    // that has waited too long for a refresh.
+                    let late_at = waiting.is_some().then(|| waiting_since + REFRESH_LATE);
+                    let Some(at) = [remake, late_at].into_iter().flatten().min() else {
                         state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
                         continue;
                     };
                     let Some(left) = at.checked_duration_since(Instant::now()) else {
-                        due = true;
+                        due = remake.is_some_and(|r| r <= at);
+                        late = late_at.is_some_and(|l| l <= at);
                         break;
                     };
                     state = shared
@@ -1081,6 +1221,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 if state.stop {
                     break;
                 }
+                // A refresh due by now that didn't come counts as one.
+                state.refresh |= late;
                 let work = state.frame || state.changed || due;
                 state.frame = false;
                 state.changed = false;
@@ -1126,6 +1268,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             } else {
                 Some(stale_since.unwrap_or(now))
             };
+            let retry = alloc_failed.map(|failed| failed + ALLOC_AGAIN);
             if let Some(stale) = stale_since
                 && !ring.is_empty()
                 && ring_reported
@@ -1133,6 +1276,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             {
                 // Still changing: the old surfaces for now.
                 remake = Some(at);
+            } else if have != Some(size)
+                && let Some(retry) = retry.filter(|&retry| now < retry)
+            {
+                // Surfaces couldn't be made a moment ago: not at every frame.
+                remake = Some(retry);
             } else if have != Some(size) {
                 stale_since = None;
                 ring_reported = reported;
@@ -1152,8 +1300,17 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                     .map(|_| gl::Target::new(&context, size.0, size.1))
                     .collect()
                 {
-                    Ok(targets) => ring = targets,
-                    Err(err) => eprintln!("pepper-play: {err}"),
+                    Ok(targets) => {
+                        ring = targets;
+                        alloc_failed = None;
+                    }
+                    Err(err) => {
+                        if alloc_failed.is_none() {
+                            shared.note(mpv, err);
+                        }
+                        alloc_failed = Some(Instant::now());
+                        remake = Some(Instant::now() + ALLOC_AGAIN);
+                    }
                 }
             }
 
@@ -1177,7 +1334,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                     }
                     Err(err) => {
                         if refused.as_ref().is_none_or(|(t, _)| t != token) {
-                            eprintln!("pepper-play: {err}");
+                            shared.note(mpv, err);
                         }
                         refused = Some((token.clone(), Instant::now()));
                     }
@@ -1195,13 +1352,18 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             // one too would keep it a frame ahead of the display for good.
             // A surface drawn and not shown yet is shown at the refresh if
             // what comes repeats it, and isn't drawn over if not.
-            let unshown = waiting.take().flatten();
+            let held = waiting.take();
+            if held.is_some() {
+                // Waited for again below if the new frame is display-synced.
+                shared.lock().awaiting = false;
+            }
+            let unshown = held.flatten();
             if let Some(slot) = unshown {
                 last = slot;
             }
             let mut info = mpv::FrameInfo::default();
             // SAFETY: rc is live; info is the param's type.
-            unsafe {
+            let got = unsafe {
                 mpv::mpv_render_context_get_info(
                     rc,
                     mpv::RenderParam {
@@ -1210,7 +1372,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                     },
                 )
             };
-            let at_refresh = vsync.is_some() && info.flags & mpv::FRAME_INFO_BLOCK_VSYNC != 0;
+            if got < 0 {
+                // Nothing known about it: shown at once, as without a link.
+                info = mpv::FrameInfo::default();
+            }
+            let at_refresh = synced && info.flags & mpv::FRAME_INFO_BLOCK_VSYNC != 0;
             if at_refresh
                 && info.flags & mpv::FRAME_INFO_REPEAT != 0
                 && !interpolation
@@ -1233,7 +1399,15 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 // SAFETY: rc is live and its OpenGL context current.
                 unsafe { mpv::mpv_render_context_render(rc, params.as_mut_ptr()) };
                 stats.repeated += 1;
-                wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, unshown);
+                if wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, unshown) {
+                    waiting_since = Instant::now();
+                } else {
+                    // The link wouldn't start: no more waiting for it.
+                    synced = false;
+                    show(client.as_ref(), attached.as_deref(), unshown, &mut stats);
+                    // SAFETY: rc is live.
+                    unsafe { mpv::mpv_render_context_report_swap(rc) };
+                }
                 continue;
             }
             redraw = false;
@@ -1268,9 +1442,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             stats.gpu_wait += waited.elapsed();
             stats.drawn += 1;
             last = slot;
-            if at_refresh {
-                wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, Some(slot));
+            if at_refresh && wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, Some(slot)) {
+                waiting_since = Instant::now();
             } else {
+                // The link wouldn't start: no more waiting for it.
+                synced &= !at_refresh;
                 show(client.as_ref(), attached.as_deref(), Some(slot), &mut stats);
                 // Only a frame of mpv's that isn't a redraw is waited for.
                 if info.flags & mpv::FRAME_INFO_PRESENT != 0
@@ -1341,22 +1517,28 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         if now >= at { Ok(()) } else { Err(at) }
     }
 
-    /// Keeps `slot` to show at the display's next refresh.
+    /// Keeps `slot` to show at the display's next refresh. False if the
+    /// display link isn't there or won't start; then nothing waits.
     fn wait_for_refresh(
         shared: &Shared,
         vsync: Option<&Vsync>,
         waiting: &mut Option<Option<usize>>,
         slot: Option<usize>,
-    ) {
-        *waiting = Some(slot);
+    ) -> bool {
+        let Some(vsync) = vsync else {
+            return false;
+        };
         {
             let mut state = shared.lock();
             state.awaiting = true;
             state.idle_refreshes = 0;
         }
-        if let Some(vsync) = vsync {
-            vsync.start();
+        if !vsync.start() {
+            shared.lock().awaiting = false;
+            return false;
         }
+        *waiting = Some(slot);
+        true
     }
 
     /// The next surface after `last` that the window server isn't showing,
@@ -1431,6 +1613,13 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 Some("60.000000")
             );
             assert!(ipc.is_empty());
+            // From a shell, nothing of mpv's reaches the terminal: no module
+            // (not even the status line, which carries subtitles and OSD
+            // text without a video output), and a video output always.
+            assert_eq!(last(&options, "msg-level").as_deref(), Some("all=no"));
+            assert_eq!(last(&options, "force-window").as_deref(), Some("yes"));
+            assert_eq!(last(&options, "term-osd").as_deref(), Some("no"));
+            assert!(!options.iter().any(|(_, v)| v.contains("statusline")));
 
             // The user's own timing wins; with no display link, mpv's stays.
             let args = parse_args(&strings(&["--video-sync=audio", "a.mp4"])).unwrap();
@@ -1450,9 +1639,41 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             assert_eq!(ipc, vec![("input-ipc-client".into(), "fd://3".into())]);
             assert!(last(&options, "force-window").is_none());
             assert!(last(&options, "terminal").is_none());
+            assert!(last(&options, "msg-level").is_none());
 
             let args = parse_args(&strings(&["--vo=gpu"])).unwrap();
             assert!(mpv_options(Mode::App, &args, None).is_err());
+        }
+
+        #[test]
+        fn the_status_line_is_numbers() {
+            let status = |position, duration, paused, buffering| {
+                status_text(Status {
+                    position,
+                    duration,
+                    paused,
+                    buffering,
+                })
+            };
+            assert_eq!(
+                status(Some(3.7), Some(70.0), false, false),
+                "00:00:03 / 00:01:10 (5%)"
+            );
+            assert_eq!(
+                status(Some(3725.0), Some(7200.0), true, false),
+                "(Paused) 01:02:05 / 02:00:00 (51%)"
+            );
+            assert_eq!(
+                status(Some(12.0), None, false, true),
+                "(Buffering) 00:00:12"
+            );
+            assert_eq!(status(None, None, true, false), "(Paused)");
+            assert_eq!(status(None, None, false, false), "");
+            assert_eq!(status(Some(f64::NAN), Some(0.0), false, false), "");
+            assert_eq!(
+                status(Some(-4.0), Some(10.0), false, false),
+                "00:00:00 / 00:00:10 (0%)"
+            );
         }
 
         #[test]
@@ -1539,6 +1760,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             assert_eq!(printable("Failed to open é ✓.\n"), "Failed to open é ✓.\n");
             let long = printable(&format!("{}\n", "x".repeat(5000)));
             assert_eq!(long, format!("{}…\n", "x".repeat(MAX_LINE)));
+            assert_eq!(
+                printable("evil\u{202e}txt.exe\u{200b}x"),
+                "evil\\u{202e}txt.exe\\u{200b}x"
+            );
             let printed = printable("\x1b[2J\x1bP\u{90}\u{85}\n");
             assert!(
                 printed

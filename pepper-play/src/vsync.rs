@@ -6,10 +6,10 @@
 //!
 //! The render thread starts the link when a frame waits for a refresh, and
 //! stops it once refreshes have come with nothing to show for a while
-//! (main.rs, LINK_IDLE), so a paused video costs no wakeups.
+//! (main.rs, LINK_IDLE), so a paused video costs no wakeups. A frame that
+//! waits too long (the displays asleep) is shown anyway (REFRESH_LATE).
 
 use std::ffi::c_void;
-use std::sync::Arc;
 
 type DisplayLink = *mut c_void;
 
@@ -53,8 +53,6 @@ pub type OnRefresh = Box<dyn Fn() + Send + Sync>;
 
 pub struct Vsync {
     link: DisplayLink,
-    /// Kept alive for the callback, which has a pointer to it.
-    _on_refresh: Arc<OnRefresh>,
 }
 
 // SAFETY: a CVDisplayLink may be started and stopped from any thread.
@@ -69,7 +67,7 @@ unsafe extern "C" fn output(
     _flags_out: *mut u64,
     context: *mut c_void,
 ) -> i32 {
-    // SAFETY: the context is the Vsync's OnRefresh, which outlives the link.
+    // SAFETY: the context is an OnRefresh that is never freed (Vsync::new).
     let on_refresh = unsafe { &*context.cast::<OnRefresh>() };
     on_refresh();
     0
@@ -78,46 +76,53 @@ unsafe extern "C" fn output(
 impl Vsync {
     /// A link on the displays there are, stopped, calling `on_refresh` at
     /// each refresh while it runs.
+    ///
+    /// `on_refresh` is never freed (one per program): CoreVideo doesn't
+    /// document that stopping a link waits for a callback under way, so a
+    /// late one must still find it. It should hold only weak references.
     pub fn new(on_refresh: OnRefresh) -> Result<Vsync, String> {
-        let on_refresh = Arc::new(on_refresh);
         let mut link = std::ptr::null_mut();
-        // SAFETY: valid out-pointer; the callback's context lives as long as
-        // the link (released in Drop before it goes).
-        unsafe {
-            let err = CVDisplayLinkCreateWithActiveCGDisplays(&mut link);
-            if err != 0 || link.is_null() {
-                return Err(format!(
-                    "CVDisplayLinkCreateWithActiveCGDisplays failed: {err}"
-                ));
+        // SAFETY: valid out-pointer; a link made on failure is released.
+        let err = unsafe { CVDisplayLinkCreateWithActiveCGDisplays(&mut link) };
+        if err != 0 || link.is_null() {
+            if !link.is_null() {
+                // SAFETY: ours, never started.
+                unsafe { CVDisplayLinkRelease(link) };
             }
+            return Err(format!(
+                "CVDisplayLinkCreateWithActiveCGDisplays failed: {err}"
+            ));
+        }
+        let context: &'static OnRefresh = Box::leak(Box::new(on_refresh));
+        // SAFETY: a live link; the context lives as long as the program.
+        let err = unsafe {
             CVDisplayLinkSetOutputCallback(
                 link,
                 output,
-                Arc::as_ptr(&on_refresh).cast_mut().cast(),
-            );
+                (context as *const OnRefresh).cast_mut().cast(),
+            )
+        };
+        if err != 0 {
+            // SAFETY: ours, never started.
+            unsafe { CVDisplayLinkRelease(link) };
+            return Err(format!("CVDisplayLinkSetOutputCallback failed: {err}"));
         }
-        Ok(Vsync {
-            link,
-            _on_refresh: on_refresh,
-        })
+        Ok(Vsync { link })
     }
 
     /// The display's refreshes a second, as it says it runs.
     pub fn rate(&self) -> Option<f64> {
         // SAFETY: a live link.
         let period = unsafe { CVDisplayLinkGetNominalOutputVideoRefreshPeriod(self.link) };
-        (period.flags & TIME_INDEFINITE == 0 && period.value > 0)
+        (period.flags & TIME_INDEFINITE == 0 && period.value > 0 && period.scale > 0)
             .then(|| period.scale as f64 / period.value as f64)
     }
 
-    /// Calls at each refresh from now on (the first at the next one).
-    pub fn start(&self) {
+    /// Calls at each refresh from now on (the first at the next one). False
+    /// if the link won't run.
+    pub fn start(&self) -> bool {
         // SAFETY: a live link.
-        unsafe {
-            if CVDisplayLinkIsRunning(self.link) == 0 {
-                CVDisplayLinkStart(self.link);
-            }
-        }
+        unsafe { CVDisplayLinkIsRunning(self.link) != 0 || CVDisplayLinkStart(self.link) == 0 }
     }
 
     pub fn stop(&self) {
@@ -132,8 +137,9 @@ impl Vsync {
 
 impl Drop for Vsync {
     fn drop(&mut self) {
-        // SAFETY: stopping waits for a callback under way; then nothing calls
-        // it again, and the link is ours to release.
+        // SAFETY: after the stop nothing starts it again, and the link is
+        // ours to release; a callback still under way finds its context
+        // alive (never freed).
         unsafe {
             CVDisplayLinkStop(self.link);
             CVDisplayLinkRelease(self.link);

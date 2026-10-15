@@ -64,7 +64,7 @@ pepper-play video.mp4
 pepper-play 'https://www.youtube.com/watch?v=…'
 ```
 
-The video fills the tab, with mpv's status line at the bottom. mpv's keys work: space pauses, the arrows seek, `f` covers the status line too, and `q` quits and gives the screen back as it was. ⌘↩ makes Pepper's window full screen, and the video grows with it. It shows in macOS's Now Playing, and the media keys work.
+The video fills the tab, with a status line at the bottom. mpv's keys work: space pauses, the arrows seek, `f` covers the status line too, and `q` quits and gives the screen back as it was. ⌘↩ makes Pepper's window full screen, and the video grows with it. It shows in macOS's Now Playing, and the media keys work.
 
 [tuitube](https://github.com/erictran308/tuitube), a YouTube client for the terminal, plays its videos inside Pepper too: on the video's page, and in a small box while you browse.
 
@@ -78,7 +78,7 @@ A terminal sees everything you type and runs your commands, so what Pepper adds 
 - **Pepper shows pictures, nothing more.** Its message port takes only frames already on the graphics chip, and the number of the one to show. Every message is checked for its size and kind, and the rest are dropped. A stream answers only to the program that started it. There are limits on how many streams and boxes there can be, and a tab's output can use up only its own boxes.
 - **A video shows only where it was placed, by the same random token.** A program must be able to write to that tab and know the token. Frames sent with any other token show nowhere, and a box never shows outside its tab.
 - **The player runs on its own.** `pepper-play` is a separate program, started by you or by a program you run, with the same rights as any other. Pepper only tells your shell where it is.
-- **Nothing a video says reaches your terminal raw.** A video's tags, a playlist or a web page could hold escape sequences. pepper-play shows only mpv's status line, and mpv's errors with any control characters escaped.
+- **Nothing a video says reaches your terminal raw.** A video's tags, subtitles, a playlist or a web page could hold escape sequences. From a shell, mpv prints nothing to the terminal: pepper-play draws the status line itself, from numbers, subtitles and mpv's on-screen text are drawn inside the video's box, and mpv's errors are shown with any control characters escaped. (Your own mpv options, such as `--term-title` or `--msg-level`, can turn mpv's terminal output back on.)
 - **Signed to keep code out.** Pepper and pepper-play run with macOS's hardened runtime: no debugger can attach, and `DYLD_` variables can't put code in them. Pepper loads no libraries but its own and the system's.
 
 The most a program can do with what Pepper adds: show a picture in a box of a tab it can already write to. It can't read the screen, type into a tab, or start anything.
@@ -91,6 +91,8 @@ In October 2026 everything Pepper adds, and tuitube's use of it, went through a 
 4. Ghostty's updater, unused, kept macOS's library check off.
 5. Output in one tab could use up the video boxes of every tab.
 6. and 7. Two ways a local program could upset Pepper's bookkeeping of the Mach ports it holds.
+
+A second review, of the changes after that release, found one more: from a shell, mpv's own status line also printed a video's subtitles, unescaped, when there was no video picture (a sound-only file). A subtitle could change the tab's title or, with Ghostty's default `clipboard-write = allow`, set the clipboard. Fixed: mpv now prints nothing to the terminal, as above.
 
 Found a security problem in what Pepper adds? Please report it privately through [this repository's security advisories](https://github.com/erictran308/pepper/security/advisories/new), not in a public issue ([what's Pepper's](SECURITY.md)). Problems in Ghostty itself belong to [Ghostty](https://github.com/ghostty-org/ghostty/security).
 

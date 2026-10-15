@@ -205,6 +205,7 @@ api! {
     fn mpv_get_property_string(ctx: *mut Handle, name: *const c_char) -> *mut c_char;
     fn mpv_free(data: *mut c_void);
     fn mpv_terminate_destroy(ctx: *mut Handle);
+    fn mpv_wakeup(ctx: *mut Handle);
     fn mpv_error_string(error: c_int) -> *const c_char;
 
     fn mpv_render_context_create(res: *mut *mut RenderContext, mpv: *mut Handle, params: *mut RenderParam) -> c_int;

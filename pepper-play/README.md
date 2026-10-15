@@ -15,9 +15,9 @@ pepper-play -- "$name"                            # all after -- is a file or UR
 
 Put `--` before a name you didn't write yourself: one that starts with `--` would otherwise be taken as one of mpv's options, and some of those run commands.
 
-The video takes the terminal (the alternate screen, as a full-screen program does) but for its last row, where mpv's status line is, and follows the window as it resizes. mpv's keys work: `q` quits, space pauses, the arrows seek, and `f` makes the video fill the whole tab, over the status line (again to bring it back). For the whole screen, make Pepper's window full screen too (⌘↩). When it ends, the terminal is as it was.
+The video takes the terminal (the alternate screen, as a full-screen program does) but for its last row, where the status line is (time, length, paused), and follows the window as it resizes. mpv's keys work: `q` quits, space pauses, the arrows seek, and `f` makes the video fill the whole tab, over the status line (again to bring it back). For the whole screen, make Pepper's window full screen too (⌘↩). When it ends, the terminal is as it was.
 
-mpv prints only its status line: its other messages hold the video's tags, file names and URLs, and so could hold escape sequences. If something couldn't play, its errors are shown once the screen is back, with any control characters escaped (`\u{1b}`).
+mpv prints nothing to the terminal: its messages hold the video's tags, file names and URLs, and its own status line would carry subtitles and on-screen text, all of which could hold escape sequences. pepper-play draws the status line itself, from numbers only, and keeps a video output even for sound alone (a black box), so subtitles and mpv's on-screen text are drawn in the box. If something couldn't play, mpv's errors are shown once the screen is back, with control and invisible format characters escaped (`\u{1b}`, `\u{202e}`). Your own options can turn mpv's terminal output back on (`--msg-level`, `--term-osd=force`, `--term-title`); don't put text from a video in them.
 
 Pepper puts `pepper-play` on every shell's `PATH`. A shell that sets its own `PATH` from scratch can run `"$PEPPER_PLAY"`.
 
@@ -142,7 +142,7 @@ pepper-play sets these among its own options, before yours, so yours win (it rea
 
 | Default | What it does | To turn it off |
 | --- | --- | --- |
-| `--hwdec=auto-safe` | Decodes on the graphics chip (VideoToolbox) what it can: H.264, HEVC, ProRes, VP9, and AV1 on M3 and later; the CPU decodes the rest. mpv hands the decoded frames to its render pass with no copy. | `--hwdec=no` |
+| `--hwdec=auto-safe` | Decodes on the graphics chip (VideoToolbox) what it can: H.264, HEVC, ProRes, VP9, and AV1 on M3 and later; the CPU decodes the rest. mpv hands the decoded frames to its render pass with no copy. A video from the web is then parsed by Apple's decoder, as in mpv's own window with this setting or in Safari. | `--hwdec=no` |
 | `--video-sync=display-resample` | Shows each frame at one of the display's refreshes and plays the sound a hair faster or slower to match, as mpv's own window can: a steady cadence, a 24 fps film too. pepper-play tells mpv the display's rate (`--display-fps-override`, the main display's). | `--video-sync=audio` |
 
 And, with no option: frames are drawn into a ring of four IOSurfaces tagged sRGB, so a wide-gamut display shows mpv's colours as they are; a frame that only repeats the one on screen isn't drawn again; new surfaces aren't made at every size while a window is being dragged, but once the size settles.
