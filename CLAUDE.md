@@ -4,13 +4,15 @@ Pepper: a personal fork of [Ghostty](https://github.com/ghostty-org/ghostty) (MI
 
 The research behind it, with measurements, the routes weighed and sources: `notes/Inline video.md`. The test scripts and clients it used: `notes/inline-video/` (`pepper_play.c`, a raw client of the Mach port and the escape sequence; `bench_pepper.py`, against mpv's window; `nowplaying_dump.m` and `nowplaying_name.m`, what Now Playing holds and what it calls the player).
 
-**Where it stands (2026-10-15):** released, [Pepper 1.3.1-pepper.2](https://github.com/erictran308/pepper/releases/tag/v1.3.1-pepper.2) (`pepper` is the default branch) and tuitube 0.10.0, which plays inside it. 1.3.1-pepper.2 fixes a security problem in pepper-play run from a shell (mpv's status line printed subtitles raw), found by a second audit of the changes since 1.3.1-pepper.1, and brings the player's Phase 0 optimizations (`notes/player-perf.md`). The audits' reports are outside the repo (`~/security-audit-skill/pepper/run-1/` for everything Pepper adds, `run-2/` for the changes after the first release); the README's Security section says what they found and fixed. Next: the pepper-agent spec's Phase 1 (`notes/agent.md`), and each new Ghostty release (see Releasing).
+**Where it stands (2026-10-15):** released, [Pepper 1.3.1-pepper.2](https://github.com/erictran308/pepper/releases/tag/v1.3.1-pepper.2) (`pepper` is the default branch) and tuitube 0.10.0, which plays inside it. 1.3.1-pepper.2 fixes a security problem in pepper-play run from a shell (mpv's status line printed subtitles raw), found by a second audit of the changes since 1.3.1-pepper.1, and brings the player's Phase 0 optimizations (`notes/player-perf.md`). The audits' reports are outside the repo (`~/security-audit-skill/pepper/run-1/` for everything Pepper adds, `run-2/` for the changes after the first release); the README's Security section says what they found and fixed. The pepper-agent spec's Phase 1 is in, not released yet: `pepper-agent/`, a viewer the human runs in a split and the commands an agent uses to review video with them (`notes/agent.md`). Next: its Phase 2 (web previews and pointing), and each new Ghostty release (see Releasing).
 
 Ghostty's own guide for agents holds here too (its build, test and format commands, where things are):
 
 @AGENTS.md
 
 Its rule against creating issues or PRs is about Ghostty's repository; anything ever sent upstream also falls under `AI_POLICY.md` (AI use disclosed, and the human understands all of it).
+
+In a Pepper shell: if `pepper-agent` is on the PATH and the task involves video, a web UI, a mobile app, visual output or streams, run `pepper-agent guide` first (`pepper-agent/`, and AGENTS.md's "AI agents in Pepper").
 
 ## Why a fork
 

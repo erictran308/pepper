@@ -44,3 +44,46 @@ Sources: Qt's "The curious case of the responsible process" (qt.io/blog), LLDB's
 ### YUV surfaces as `CALayer.contents`: not checked yet
 
 Wanted only for the optional raw decoder path (player-perf 10.7). Chromium shows NV12 IOSurfaces as layer contents for its video overlays, which suggests it works; to be checked on this Mac with a test window and a known pattern before any code depends on it.
+
+## Phase 1: the viewer, video review (2026-10-15)
+
+Built as `pepper-agent/`, a Rust crate of its own beside pepper-play, with no dependencies (a small JSON reader and writer of its own, `json.rs`). `pepper-build.sh` puts it in the app as `Contents/MacOS/pepper-agent`, on every Pepper shell's PATH, signed with the hardened runtime and no entitlements. It never links libmpv: the viewer runs one pepper-play per source as an app's player (IPC on fd 3, the token over the IPC) and places the boxes itself, so pepper-agent stays MIT and needs nothing loaded.
+
+What's in it: `view`, the socket, `status`, `open`/`close`/`sources`, `layout`/`focus`, `snapshot`, `say`, `events` (marks, notes, done), the playback commands, `probe`/`frames`/`sheet`, `guide`, and the AGENTS.md, CLAUDE.md and README sections. Tests: `cargo test` (40 unit tests) and `tests/integration.py` (57 checks: the real viewer, pepper-play and mpv in a pseudo-terminal, with a PEPPER_PORT no Pepper holds; hostile file names, tags, `say` text and typed and pasted notes; the socket's refusals).
+
+### Where it differs from the spec, and why
+
+- **The socket's folder** comes from `confstr(_CS_DARWIN_USER_TEMP_DIR)`, what `TMPDIR` says in a login shell, not from `TMPDIR` itself: an agent's tool can set its own `TMPDIR` for the commands it runs, and the viewer and the agent must find the same folder. A viewer's id is its pid.
+- **`open` shows the first frame paused**; `--play` plays. Nothing starts making sound before the human is looking. Opening a `--name` that exists shows the new target in that source's box (a re-rendered file, the next take).
+- **A `done` event and `events --until`**, not in the spec: with marks in a video, the first mark would end an `events --wait` while the human is still watching. The human presses Enter when they've finished; `--until done` returns everything up to it. Plain `--wait` still answers at the first event.
+- **More error codes:** `BAD_ARGS` (a command line), `BAD_REQUEST` (the socket), `NOT_FOUND`, `NOT_IN_PEPPER` (`view` outside Pepper or in tmux), `LOAD_FAILED` (mpv couldn't play it), `FAILED` (anything else, with the message). `events --wait` that runs out is `TIMEOUT`.
+- **`snapshot`**: the viewer asks the source's pepper-play for the frame it shows (`screenshot-to-file … video`: mpv's decoded frame, not Pepper's screen; 88 ms for 1080p, VideoToolbox included) into its own folder; the command then crops and shrinks it with ffmpeg into `.pepper/snapshots/` in the agent's folder. The viewer writes only in its own folders.
+- **Events are kept** in `.pepper/events.jsonl` of the viewer's project: the folder it started in (a Ghostty split starts in the agent's), or `--project`.
+- **Contact sheets' times** are drawn by pepper-agent in a 5×7 pixel font: Homebrew's ffmpeg 9 has no `drawtext` (no freetype) and no `subtitles`. ffmpeg decodes each tile (VideoToolbox) as raw RGB, pepper-agent lays them out, and ffmpeg writes the PNG.
+- **The cache key** is a fingerprint (path, size, time, inode, first and last 64 KB), not a hash of the whole file: a 4K file would take seconds to hash on every command.
+- **Keys passed to a source** are a fixed list of mpv's: pause, seeks, frame steps, speed, volume, subtitle and audio tracks, mpv's progress and stats. Not passed: `q` (the viewer's), `m` (mark; mpv's mute), `l`/`L` (mpv's A-B loop; the agent's `loop` owns it), mpv's console and screenshots.
+- **Layout** came in Phase 1 already (`auto`, `single`, `split-h`, `split-v`, `grid`, `z`): two sources need somewhere to go. Each box takes its picture's shape in its tile, the label right over it.
+- **Only media** in this phase: a localhost address (a web preview) and other schemes (streams) are `UNSUPPORTED` until their phases.
+- **SECURITY.md** is the reporting policy, so it names pepper-agent among what's Pepper's; what pepper-agent does for safety is in the README's Security section and `pepper-agent/README.md`.
+
+### Measured (debug build, M5 Pro)
+
+| What | Time |
+| --- | --- |
+| `status`, `where`, `say`, `sources` | 6–20 ms |
+| `seek` (answers once the frame shows) | about 220 ms |
+| `snapshot` of 1080p (mpv's frame, then ffmpeg) | about 200 ms |
+| `probe` (not cached) | 0.4 s |
+| `frames`, three of 1080p | 0.3 s |
+| `sheet`, 4×4 of a 70 s 2160p HEVC | 2.6 s |
+
+The viewer itself, two 1080p sources playing: 0.9% of a core (it follows each player's `time-pos`, at the frame rate); 0.67% built for release, as Pepper.app has it. The players under it cost what they cost alone (9.9% for 1080p30, 18.5% for 1080p60, as `notes/player-perf.md`), and pepper-play didn't change, so the Phase 0 bench wasn't run again.
+
+### Discovery
+
+AGENTS.md and CLAUDE.md reach an agent working in this repo. In any other folder an agent learns of pepper-agent only if it tries `pepper-agent --help` (its first line says to run `guide`), from the line `pepper-agent/README.md` gives the human for their own agent instructions, or from the skill (`install-skill`, Phase 7).
+
+### Checked
+
+- **By hand, in a test Pepper:** two sources stacked, each label right over its box, the agent's line and the keys at the bottom. The user played, focused, zoomed, marked twice, wrote a note and pressed Enter; `events --wait --until done` answered with all four.
+- **A fresh agent:** `claude -p "review video.mp4 with me in Pepper"` in a folder holding `video.mp4` and a `CLAUDE.md` of only the README's line, with Pepper's `PATH` (the build's folder last, as Pepper adds it). A viewer ran in a pseudo-terminal, and a script played the human: space, `m`, `m`, `n` and a note, Enter, once the agent waited. The agent's first command was `command -v pepper-agent && pepper-agent guide`. Then it ran `status`, `probe` and `sheet` (and looked at the sheet), then `open`, `say`, and `events --wait 580 --until done --since 0` with a 10-minute timeout on its shell tool. It had the two marks and the note 14 s later. On its own it then looked at the marked times (`frames`, `seek` and `snapshot`, the pixels' values). It found the file steady there, `loop`ed 0:03–0:07, and asked a follow-up with `say` and `events --since 4`, the guide's loop. It was stopped there, since the scripted human answers only once.
