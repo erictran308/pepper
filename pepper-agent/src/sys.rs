@@ -211,19 +211,50 @@ pub fn catch_signals() {
 /// # Safety
 /// Only between fork and exec (async-signal-safe calls only).
 pub unsafe fn as_fd3(fd: RawFd) -> std::io::Result<()> {
+    // SAFETY: as the caller promises.
+    unsafe { as_fd(fd, 3) }
+}
+
+/// In a child before exec: `fd` as file descriptor `to`, kept open across
+/// exec.
+///
+/// # Safety
+/// Only between fork and exec (async-signal-safe calls only).
+pub unsafe fn as_fd(fd: RawFd, to: RawFd) -> std::io::Result<()> {
     const F_SETFD: c_int = 2;
     // SAFETY: plain calls on file descriptors.
     unsafe {
-        if fd == 3 {
+        if fd == to {
             // dup2 onto itself leaves close-on-exec set.
-            if fcntl(3, F_SETFD, 0) != 0 {
+            if fcntl(to, F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
-        } else if dup2(fd, 3) != 3 {
+        } else if dup2(fd, to) != to {
             return Err(std::io::Error::last_os_error());
         }
     }
     Ok(())
+}
+
+/// In a child before exec: `a` as file descriptor 3 and `b` as 4, whatever
+/// numbers they have now.
+///
+/// # Safety
+/// Only between fork and exec (async-signal-safe calls only).
+pub unsafe fn as_fd3_and_4(a: RawFd, b: RawFd) -> std::io::Result<()> {
+    const F_DUPFD_CLOEXEC: c_int = 67;
+    // SAFETY: plain calls on file descriptors.
+    unsafe {
+        // Out of the way first, so that putting one in place can't close
+        // the other.
+        let a = fcntl(a, F_DUPFD_CLOEXEC, 10);
+        let b = fcntl(b, F_DUPFD_CLOEXEC, 10);
+        if a < 0 || b < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        as_fd(a, 3)?;
+        as_fd(b, 4)
+    }
 }
 
 #[cfg(test)]

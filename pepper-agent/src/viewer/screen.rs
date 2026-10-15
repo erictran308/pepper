@@ -73,14 +73,17 @@ pub struct Screen {
 
 impl Screen {
     /// Takes the pane: the alternate screen, no cursor, no autowrap,
-    /// bracketed paste.
+    /// bracketed paste, and the mouse (presses, releases and drags, in
+    /// pixels: SGR 1006 with 1016).
     pub fn enter(tty: File) -> Screen {
         let mut screen = Screen {
             tty,
             drawn: Vec::new(),
             cols: 0,
         };
-        screen.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[2J");
+        screen.write(
+            "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[?1016h\x1b[2J",
+        );
         screen
     }
 
@@ -109,7 +112,9 @@ impl Screen {
 
     /// Gives the pane back as it was.
     pub fn leave(&mut self) {
-        self.write("\x1b[0m\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l");
+        self.write(
+            "\x1b[0m\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l",
+        );
     }
 }
 

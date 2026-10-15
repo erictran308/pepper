@@ -1,42 +1,52 @@
 //! The viewer: `pepper-agent view`, which the human runs in a Pepper pane
 //! (usually a split next to the agent). It owns the pane: it places a box
 //! per source with `OSC 777;pepper`, draws a label over each, the agent's
-//! message and the keys, reads the human's keys, and runs a pepper-play per
-//! source. Agents reach it only through its control socket (`proto.rs`),
-//! with the commands there; it never runs anything they send.
+//! message and the keys, reads the human's keys and mouse, and shows each
+//! source: a pepper-play for media, a page of its own headless Chrome for
+//! the web (`web.rs`, `frames.rs`). Agents reach it only through its control
+//! socket (`proto.rs`), with the commands there; it never runs anything
+//! they send.
 //!
-//! One thread runs the viewer; others only read (the socket's connections,
-//! the terminal, each player's IPC and stderr) and hand what they read to it
+//! One thread runs the viewer; others read (the socket's connections, the
+//! terminal, each player's IPC and stderr, the browser, Pepper's reports)
+//! or do slow work (a web command, a capture) and hand what they have to it
 //! (`Msg`). A request that waits (an event, a file loading, a seek, a
-//! snapshot) is kept with its connection and answered when that comes or
-//! its time is up.
+//! snapshot, a web command) is kept with its connection and answered when
+//! that comes or its time is up.
 
+mod frames;
 mod input;
 mod layout;
+mod pages;
 mod player;
+mod pointing;
 mod screen;
+mod watch;
+mod web;
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
 use crate::json::Value;
 use crate::text::{self, Time};
-use crate::{files, proto, sys};
+use crate::{files, pepper, proto, sys};
 use input::{Input, Key};
 use layout::{Cells, Mode};
 use player::Player;
 use screen::{Row, Screen};
 
 pub use player::find_play;
+pub use web::is_local;
 
 /// A viewer shows at most this many sources: Pepper's limit of boxes in one
 /// pane.
@@ -65,12 +75,22 @@ pub const EVENT_TYPES: &[&str] = &[
     "mark", "note", "done", "point", "region", "approve", "reject",
 ];
 
-/// What the reading threads hand the viewer.
+/// What the reading and working threads hand the viewer.
 pub enum Msg {
     Input(Vec<u8>),
     TtyClosed,
     Request(Request),
     Player(u64, player::Event),
+    /// A web page's title, address or state changed.
+    Web(u64),
+    /// A web page is open, or couldn't be.
+    WebOpened(u64, Result<Arc<web::Page>>),
+    /// Slow work done: a web command, a capture.
+    Job(u64, Result<Value>),
+    /// What Pepper says of a box the viewer draws into itself.
+    BoxSize(String, pepper::BoxSize),
+    /// A file changed under a page's --watch folder.
+    Watch(u64),
 }
 
 /// A command from an agent, with the connection to answer on.
@@ -113,6 +133,7 @@ enum State {
 struct Source {
     sid: u64,
     name: String,
+    /// "media" (pepper-play) or "web" (a page).
     kind: &'static str,
     /// An absolute path or an http(s) URL, as loaded.
     target: String,
@@ -131,13 +152,20 @@ struct Source {
     loop_ab: Option<(f64, f64)>,
     placed: Option<Cells>,
     log: Vec<String>,
+    web: Option<pages::WebSource>,
 }
 
 impl Source {
+    /// Whether something shows it: its player, or its page.
+    fn alive(&self) -> bool {
+        self.player.is_some() || self.web.is_some()
+    }
+
     fn status(&self) -> &'static str {
         match self.state {
             State::Loading => "loading",
             State::Failed(_) | State::Gone(_) => "error",
+            State::Ready if self.web.is_some() => "ready",
             State::Ready if self.eof => "ended",
             State::Ready if self.buffering => "buffering",
             State::Ready if self.paused => "paused",
@@ -166,6 +194,9 @@ impl Source {
     }
 
     fn to_json(&self, focused: bool, visible: bool) -> Value {
+        if let Some(web) = &self.web {
+            return web.to_json(self, focused, visible);
+        }
         let mut v = Value::obj()
             .with("name", self.name.as_str())
             .with("kind", self.kind)
@@ -214,6 +245,8 @@ enum WaitFor {
         request: u64,
         result: Value,
     },
+    /// Slow work on another thread: its result is the answer.
+    Job { job: u64, sid: u64 },
 }
 
 struct Wait {
@@ -229,6 +262,8 @@ struct Prompt {
     time: Option<f64>,
     /// The source was playing, and plays again after.
     resume: bool,
+    /// The note is for a point or region the human just made.
+    point: Option<u64>,
 }
 
 /// The terminal's mode before the viewer, to put back even after a panic.
@@ -292,6 +327,10 @@ pub fn run(options: Options) -> Result<()> {
     files::private_dir(&shots)
         .map_err(|e| Error::new("FAILED", format!("{}: {e}", shots.display())))?;
     let log = options.debug.then(|| dir.join(format!("{id}.log")));
+    let points_dir = files::pepper_dir(&project, &["points"])
+        .unwrap_or_else(|_| dir.join(format!("{id}-points")));
+    files::private_dir(&points_dir)
+        .map_err(|e| Error::new("FAILED", format!("{}: {e}", points_dir.display())))?;
 
     sys::catch_signals();
     let fd = tty.as_raw_fd();
@@ -316,6 +355,23 @@ pub fn run(options: Options) -> Result<()> {
             .map_err(|e| Error::new("FAILED", e.to_string()))?;
         std::thread::spawn(move || read_keys(reader, tx));
     }
+    // The viewer's own Mach client, for the boxes it draws into itself (web
+    // pages): Pepper's reports of their sizes come to it.
+    let pepper = match pepper::Client::connect(&port) {
+        Ok(client) => {
+            let tx = tx.clone();
+            let reports = client.reports();
+            std::thread::spawn(move || {
+                while let Some((token, size)) = reports.next() {
+                    if tx.send(Msg::BoxSize(token, size)).is_err() {
+                        return;
+                    }
+                }
+            });
+            Some(Arc::new(client))
+        }
+        Err(_) => None,
+    };
     let screen = Screen::enter(
         tty.try_clone()
             .map_err(|e| Error::new("FAILED", e.to_string()))?,
@@ -350,14 +406,27 @@ pub fn run(options: Options) -> Result<()> {
         confirm_quit: false,
         flash: None,
         shot_count: 0,
+        pepper,
+        host: Arc::new(Mutex::new(None)),
+        next_job: 1,
+        point_jobs: HashMap::new(),
+        points: Vec::new(),
+        next_point: 1,
+        drag: None,
+        points_dir,
         quit: false,
         dirty: true,
         record_dirty: true,
         last_draw: Instant::now(),
     };
     viewer.note(&format!(
-        "viewer {id} started, pepper-play {}",
-        viewer.play.display()
+        "viewer {id} started, pepper-play {}, Pepper's port {}",
+        viewer.play.display(),
+        if viewer.pepper.is_some() {
+            "reached"
+        } else {
+            "not reached"
+        }
     ));
     viewer.run(rx);
     viewer.end();
@@ -455,6 +524,19 @@ struct Viewer {
     confirm_quit: bool,
     flash: Option<(String, Instant)>,
     shot_count: u64,
+    /// Pepper's port, for what the viewer draws itself.
+    pepper: Option<Arc<pepper::Client>>,
+    /// The browser for web sources, while any is open.
+    host: Arc<Mutex<Option<Arc<web::Host>>>>,
+    next_job: u64,
+    /// Jobs that capture for a point: the point's id.
+    point_jobs: HashMap<u64, u64>,
+    /// Points and regions waiting for their note or their pictures.
+    points: Vec<pointing::Pending>,
+    next_point: u64,
+    drag: Option<pointing::Drag>,
+    /// Where points' pictures go: `.pepper/points/` in the project.
+    points_dir: PathBuf,
     quit: bool,
     dirty: bool,
     record_dirty: bool,
@@ -496,6 +578,8 @@ impl Viewer {
                 self.look_at_size();
             }
             self.expire_waits();
+            self.expire_points();
+            self.reload_watched();
             if let Some((_, at)) = &self.flash
                 && at.elapsed() >= FLASH
             {
@@ -521,6 +605,11 @@ impl Viewer {
             Msg::TtyClosed => self.quit = true,
             Msg::Request(req) => self.on_request(req),
             Msg::Player(sid, event) => self.on_player(sid, event),
+            Msg::Web(sid) => self.on_web(sid),
+            Msg::WebOpened(sid, page) => self.on_web_opened(sid, page),
+            Msg::Job(job, result) => self.on_job(job, result),
+            Msg::BoxSize(token, size) => self.on_box_size(&token, size),
+            Msg::Watch(sid) => self.on_watch(sid),
         }
     }
 
@@ -574,20 +663,27 @@ impl Viewer {
             })
             .collect();
         let mut out = String::new();
+        let mut moved = Vec::new();
         for (i, source) in self.sources.iter_mut().enumerate() {
             let want = self
                 .tiles
                 .iter()
                 .find(|t| t.0 == i)
                 .map(|t| t.2)
-                .filter(|b| b.rows > 0 && b.cols > 0 && source.player.is_some());
+                .filter(|b| b.rows > 0 && b.cols > 0 && source.alive());
             if want != source.placed {
                 match want {
                     Some(at) => out.push_str(&screen::place(&source.token, at)),
                     None => out.push_str(&screen::remove(&source.token)),
                 }
                 source.placed = want;
+                if source.web.is_some() {
+                    moved.push(source.sid);
+                }
             }
+        }
+        for sid in moved {
+            self.web_box_changed(sid);
         }
         if !out.is_empty() {
             self.screen.write(&out);
@@ -637,7 +733,9 @@ impl Viewer {
             let width = tile.cols.saturating_sub(col - tile.col);
             let focused = self.focus == Some(i);
             let mut label = format!(" {} {}  {}", n + 1, source.name, source.status());
-            if let Some(t) = source.time_pos {
+            if let Some(web) = &source.web {
+                label += &web.label();
+            } else if let Some(t) = source.time_pos {
                 label += &format!("  {}", text::short_clock(t));
                 if let Some(d) = source.duration {
                     label += &format!(" / {}", text::short_clock(d));
@@ -662,14 +760,29 @@ impl Viewer {
                 None => say_row.put(0, cols, " (the agent hasn't said anything)", screen::DIM),
             }
         }
+        let drag = self.drag_text();
         let keys_row = &mut out[rows as usize - 1];
         if let Some(prompt) = &self.prompt {
-            let at = prompt
-                .time
-                .map(|t| format!(" at {}", text::clock(t)))
-                .unwrap_or_default();
-            let text = format!(" note{at}: {}_", prompt.text);
-            let hint = "  (Enter sends, Esc drops)";
+            let (what, hint) = match prompt
+                .point
+                .and_then(|id| self.points.iter().find(|p| p.id == id))
+            {
+                Some(point) => (
+                    format!(" note on {}", point.what()),
+                    "  (Enter sends, Esc sends it without a note)",
+                ),
+                None => (
+                    format!(
+                        " note{}",
+                        prompt
+                            .time
+                            .map(|t| format!(" at {}", text::clock(t)))
+                            .unwrap_or_default()
+                    ),
+                    "  (Enter sends, Esc drops)",
+                ),
+            };
+            let text = format!("{what}: {}_", prompt.text);
             // The end of the text, so the cursor stays in sight.
             let room = (cols as usize).saturating_sub(hint.len());
             let skip = text.chars().count().saturating_sub(room);
@@ -686,15 +799,27 @@ impl Viewer {
                 ),
                 screen::BOLD,
             );
+        } else if let Some(drag) = drag {
+            keys_row.put(0, cols, &format!(" {drag}"), screen::BOLD);
         } else if let Some((flash, _)) = &self.flash {
             keys_row.put(0, cols, &format!(" {flash}"), screen::BOLD);
         } else if self.sources.is_empty() {
             keys_row.put(0, cols, " q quits", screen::DIM);
+        } else if self
+            .focused()
+            .is_some_and(|i| self.sources[i].web.is_some())
+        {
+            keys_row.put(
+                0,
+                cols,
+                " click to point · drag a region · n note · Enter done · wheel scrolls · r reload · Tab focus · z zoom · q quit",
+                screen::DIM,
+            );
         } else {
             keys_row.put(
                 0,
                 cols,
-                " m mark · n note · Enter done · space pause · ←→ seek · Tab focus · z zoom · q quit",
+                " m mark · click to point · drag a region · n note · Enter done · space pause · ←→ seek · Tab focus · z zoom · q quit",
                 screen::DIM,
             );
         }
@@ -716,6 +841,10 @@ impl Viewer {
 
     fn on_key(&mut self, key: Key) {
         self.dirty = true;
+        if let Key::Mouse(mouse) = key {
+            self.on_mouse(mouse);
+            return;
+        }
         if self.prompt.is_some() {
             self.on_prompt_key(key);
             return;
@@ -759,15 +888,30 @@ impl Viewer {
                     self.relayout();
                 }
             }
+            Key::Char('m') if self.focused_web().is_some() => {
+                self.flash("A page has no timeline: click it to point at something instead.");
+            }
             Key::Char('m') => self.mark(),
             Key::Char('n') => self.start_note(),
+            Key::Char('r') if self.focused_web().is_some() => self.web_key_reload(),
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown if self.focused_web().is_some() => {
+                let by = match key {
+                    Key::Up => -80.0,
+                    Key::Down => 80.0,
+                    Key::PageUp => -600.0,
+                    _ => 600.0,
+                };
+                self.web_key_scroll(by, None);
+            }
             Key::Enter => {
                 self.add_event(Value::obj().with("type", "done"));
                 self.flash("Sent: done. The agent has your marks and notes.");
             }
             Key::Paste(_) => {}
             key => {
-                if let (Some(i), Some(name)) = (self.focused(), mpv_key(&key)) {
+                if let (Some(i), Some(name)) = (self.focused(), mpv_key(&key))
+                    && self.sources[i].web.is_none()
+                {
                     let source = &mut self.sources[i];
                     source.review_to = None;
                     if let Some(player) = &mut source.player {
@@ -814,19 +958,13 @@ impl Viewer {
             sid: None,
             time: None,
             resume: false,
+            point: None,
         };
         if let Some(i) = self.focused() {
             let source = &mut self.sources[i];
             prompt.sid = Some(source.sid);
             prompt.time = source.time_pos;
-            if source.state == State::Ready
-                && !source.paused
-                && !source.eof
-                && let Some(player) = &mut source.player
-            {
-                player.set("pause", true);
-                prompt.resume = true;
-            }
+            prompt.resume = pause_for_note(source);
         }
         self.prompt = Some(prompt);
     }
@@ -850,6 +988,15 @@ impl Viewer {
                 prompt.text.pop();
             }
             Key::Ctrl('u') => prompt.text.clear(),
+            Key::Enter | Key::Esc | Key::Ctrl('c') if prompt.point.is_some() => {
+                let prompt = self.prompt.take().unwrap_or_else(|| unreachable!());
+                let text = prompt.text.trim().to_owned();
+                let note = (key == Key::Enter && !text.is_empty()).then_some(text);
+                if let Some(id) = prompt.point {
+                    self.noted(id, note);
+                }
+                self.end_note(prompt.sid, prompt.resume);
+            }
             Key::Enter => {
                 let prompt = self.prompt.take().unwrap_or_else(|| unreachable!());
                 let text = prompt.text.trim().to_owned();
@@ -858,7 +1005,11 @@ impl Viewer {
                     if let Some(source) = prompt.sid.and_then(|sid| self.source(sid)) {
                         event.set("source", source.name.as_str());
                         event.set("kind", source.kind);
-                        event.set("file", source.shown_target());
+                        if source.web.is_some() {
+                            event.set("url", source.shown_target());
+                        } else {
+                            event.set("file", source.shown_target());
+                        }
                         if let Some(t) = prompt.time {
                             event.set("time", round3(t));
                             event.set("time_text", text::clock(t));
@@ -1032,6 +1183,9 @@ impl Viewer {
                     "TIMEOUT",
                     "the player didn't take the snapshot in time",
                 ))),
+                WaitFor::Job { .. } => wait
+                    .req
+                    .answer(Err(Error::new("TIMEOUT", "the page didn't finish in time"))),
                 WaitFor::Events { .. } => {}
             }
         }
@@ -1213,6 +1367,9 @@ impl Viewer {
     }
 
     fn on_reply(&mut self, sid: u64, request: u64, ok: bool, error: String) {
+        if self.point_shot_taken(sid, request, ok, &error) {
+            return;
+        }
         let waits = std::mem::take(&mut self.waits);
         for wait in waits {
             match wait.what {
@@ -1243,7 +1400,8 @@ impl Viewer {
             let on_it = match &wait.what {
                 WaitFor::Loaded { sid: s }
                 | WaitFor::Restart { sid: s, .. }
-                | WaitFor::Shot { sid: s, .. } => *s == sid,
+                | WaitFor::Shot { sid: s, .. }
+                | WaitFor::Job { sid: s, .. } => *s == sid,
                 WaitFor::Events { .. } => false,
             };
             if on_it {
@@ -1270,7 +1428,7 @@ impl Viewer {
         let result = match req.cmd.as_str() {
             "status" => Ok(self.status()),
             "sources" => Ok(Value::obj().with("sources", self.sources_json())),
-            "open" => return self.open(req),
+            "open" | "web.open" => return self.open(req),
             "close" => self.close(&args),
             "layout" => self.set_layout(&args),
             "focus" => self.set_focus(&args),
@@ -1285,6 +1443,7 @@ impl Viewer {
             "loop" => return self.set_loop(req),
             "where" => self.where_is(&args),
             "review" => return self.review(req),
+            cmd if cmd.starts_with("web.") => return self.web_request(req),
             _ => Err(Error::new("UNSUPPORTED", "unknown command")),
         };
         req.answer(result);
@@ -1318,6 +1477,14 @@ impl Viewer {
                 self.focused().map(|i| self.sources[i].name.as_str()),
             )
             .with("say", self.say.as_deref())
+            .with(
+                "browser",
+                self.host
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .map(|h| h.version()),
+            )
             .with("last_event_id", self.next_event - 1)
             .with("waiting_for_note", self.prompt.is_some())
             .with("sources", self.sources_json())
@@ -1387,6 +1554,19 @@ impl Viewer {
         }
     }
 
+    /// The source a request names, ready, and with a timeline.
+    fn pick_playable(&self, args: &Value) -> Result<usize> {
+        let i = self.pick(args)?;
+        if self.sources[i].web.is_some() {
+            return Err(Error::new(
+                "NOT_PLAYABLE",
+                format!("{} is a web page: it has no timeline", self.sources[i].name),
+            )
+            .hint("Drive a page with `pepper-agent web …` (click, scroll, goto); see `pepper-agent guide`."));
+        }
+        self.pick_ready(args)
+    }
+
     fn open(&mut self, req: Request) {
         let result = self.start_open(&req.args);
         match result {
@@ -1400,6 +1580,9 @@ impl Viewer {
             .get_str("target")
             .ok_or_else(|| Error::new("BAD_ARGS", "open: no target"))?;
         let kind = args.get_str("kind").unwrap_or("media");
+        if kind == "web" {
+            return self.start_web(args);
+        }
         if kind != "media" {
             return Err(Error::new(
                 "UNSUPPORTED",
@@ -1491,6 +1674,7 @@ impl Viewer {
             loop_ab: None,
             placed: None,
             log: Vec::new(),
+            web: None,
         });
         self.focus = Some(self.sources.len() - 1);
         self.record_dirty = true;
@@ -1541,6 +1725,11 @@ impl Viewer {
         let mut source = self.sources.remove(i);
         if source.placed.is_some() {
             self.screen.write(&screen::remove(&source.token));
+        }
+        if let Some(web) = source.web.take() {
+            web.close();
+            self.drop_points(source.sid);
+            self.close_browser_if_unused();
         }
         if let Some(mut player) = source.player.take() {
             player.stop();
@@ -1621,6 +1810,11 @@ impl Viewer {
     }
 
     fn snapshot(&mut self, req: Request) {
+        if let Ok(i) = self.pick(&req.args)
+            && self.sources[i].web.is_some()
+        {
+            return self.web_snapshot(req, i);
+        }
         let started = (|| {
             let i = self.pick_ready(&req.args)?;
             if self.sources[i].aspect().is_none() {
@@ -1726,7 +1920,7 @@ impl Viewer {
     }
 
     fn pause(&mut self, cmd: &str, args: &Value) -> Result<Value> {
-        let i = self.pick_ready(args)?;
+        let i = self.pick_playable(args)?;
         let source = &mut self.sources[i];
         let Some(player) = &mut source.player else {
             return Err(Error::new("NO_SOURCE", "its player ended"));
@@ -1759,7 +1953,7 @@ impl Viewer {
 
     fn seek(&mut self, req: Request) {
         let started = (|| {
-            let i = self.pick_ready(&req.args)?;
+            let i = self.pick_playable(&req.args)?;
             let to = req
                 .args
                 .get_str("to")
@@ -1797,7 +1991,7 @@ impl Viewer {
 
     fn set_loop(&mut self, req: Request) {
         let started = (|| {
-            let i = self.pick_ready(&req.args)?;
+            let i = self.pick_playable(&req.args)?;
             let source = &mut self.sources[i];
             let Some(player) = &mut source.player else {
                 return Err(Error::new("NO_SOURCE", "its player ended"));
@@ -1863,6 +2057,9 @@ impl Viewer {
     fn where_is(&self, args: &Value) -> Result<Value> {
         let i = self.pick(args)?;
         let s = &self.sources[i];
+        if s.web.is_some() {
+            return Ok(s.to_json(self.focus == Some(i), self.tiles.iter().any(|t| t.0 == i)));
+        }
         let mut v = Value::obj()
             .with("source", s.name.as_str())
             .with("kind", s.kind)
@@ -1886,7 +2083,7 @@ impl Viewer {
 
     fn review(&mut self, req: Request) {
         let started = (|| {
-            let i = self.pick_ready(&req.args)?;
+            let i = self.pick_playable(&req.args)?;
             let source = &mut self.sources[i];
             let from = req
                 .args
@@ -1943,6 +2140,7 @@ impl Viewer {
         }
         let mut out = String::new();
         let mut players = Vec::new();
+        let mut pages = Vec::new();
         for source in &mut self.sources {
             if source.placed.take().is_some() {
                 out.push_str(&screen::remove(&source.token));
@@ -1951,6 +2149,15 @@ impl Viewer {
                 player.stop();
                 players.push(player);
             }
+            if let Some(web) = source.web.take() {
+                pages.push(web);
+            }
+        }
+        for web in pages {
+            web.close();
+        }
+        if let Some(host) = self.host.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            host.close();
         }
         self.screen.write(&out);
         self.screen.leave();
@@ -2000,6 +2207,19 @@ fn mpv_key(key: &Key) -> Option<&'static str> {
         Key::Char('i') => "i",
         _ => return None,
     })
+}
+
+/// Pauses a playing source while the human writes; whether it was playing.
+fn pause_for_note(source: &mut Source) -> bool {
+    if source.state == State::Ready
+        && !source.paused
+        && !source.eof
+        && let Some(player) = &mut source.player
+    {
+        player.set("pause", true);
+        return true;
+    }
+    false
 }
 
 /// A time inside the media: from 0 to its length, if known.

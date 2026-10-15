@@ -19,9 +19,55 @@ pub enum Key {
     ShiftDown,
     ShiftLeft,
     ShiftRight,
+    PageUp,
+    PageDown,
+    Mouse(Mouse),
     Paste(String),
     /// A sequence the viewer doesn't use.
     Other,
+}
+
+/// A mouse report (SGR, `CSI < b ; x ; y M` or `m`): in pixels from the
+/// top left of the terminal's cells when SGR pixels (1016) are on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mouse {
+    /// 0 left, 1 middle, 2 right, 3 none (a move with no button).
+    pub button: u8,
+    /// The wheel: -1 up, 1 down (0 when it's not the wheel).
+    pub wheel: i8,
+    pub motion: bool,
+    pub release: bool,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Mouse {
+    /// From the parameters of an SGR report and its final byte.
+    fn parse(params: &[u8], last: u8) -> Option<Mouse> {
+        let text = std::str::from_utf8(params.strip_prefix(b"<")?).ok()?;
+        let mut numbers = text.split(';').map(|n| n.parse::<i32>().ok());
+        let (code, x, y) = (numbers.next()??, numbers.next()??, numbers.next()??);
+        if numbers.next().is_some() || code < 0 {
+            return None;
+        }
+        let wheel = if code & 64 != 0 {
+            match code & 3 {
+                0 => -1,
+                1 => 1,
+                _ => return None,
+            }
+        } else {
+            0
+        };
+        Some(Mouse {
+            button: if wheel != 0 { 3 } else { (code & 3) as u8 },
+            wheel,
+            motion: code & 32 != 0,
+            release: last == b'm',
+            x,
+            y,
+        })
+    }
 }
 
 /// The most bytes kept of a paste, or of a sequence not finished yet.
@@ -152,6 +198,11 @@ fn escape(data: &[u8]) -> Parsed {
                         (b'C', b"1;2") => Key::ShiftRight,
                         (b'D', b"1;2") => Key::ShiftLeft,
                         (b'Z', _) => Key::BackTab,
+                        (b'~', b"5") => Key::PageUp,
+                        (b'~', b"6") => Key::PageDown,
+                        (b'M' | b'm', [b'<', ..]) => {
+                            Mouse::parse(params, b).map_or(Key::Other, Key::Mouse)
+                        }
                         (b'~', b"200") => return Parsed::PasteStart(i + 1),
                         _ => Key::Other,
                     };
@@ -207,9 +258,44 @@ mod tests {
             input.feed("é✓".as_bytes()),
             vec![Key::Char('é'), Key::Char('✓')]
         );
+        assert_eq!(input.feed(b"\x1b[I\x1b[5~"), vec![Key::Other, Key::PageUp]);
+    }
+
+    #[test]
+    fn mouse() {
+        let mut input = Input::default();
+        let at = |button, wheel, motion, release, x, y| {
+            Key::Mouse(Mouse {
+                button,
+                wheel,
+                motion,
+                release,
+                x,
+                y,
+            })
+        };
         assert_eq!(
-            input.feed(b"\x1b[I\x1b[<0;10;5M"),
-            vec![Key::Other, Key::Other]
+            input.feed(b"\x1b[<0;812;403M\x1b[<32;900;450M\x1b[<0;901;451m"),
+            vec![
+                at(0, 0, false, false, 812, 403),
+                at(0, 0, true, false, 900, 450),
+                at(0, 0, false, true, 901, 451)
+            ]
+        );
+        assert_eq!(
+            input.feed(b"\x1b[<64;10;20M\x1b[<65;10;20M\x1b[<2;0;0M"),
+            vec![
+                at(3, -1, false, false, 10, 20),
+                at(3, 1, false, false, 10, 20),
+                at(2, 0, false, false, 0, 0)
+            ]
+        );
+        // Split across reads, and nonsense.
+        assert_eq!(input.feed(b"\x1b[<0;1"), vec![]);
+        assert_eq!(input.feed(b"2;3M"), vec![at(0, 0, false, false, 12, 3)]);
+        assert_eq!(
+            input.feed(b"\x1b[<0;;3M\x1b[<0;1;2;3M\x1b[<66;1;1M"),
+            vec![Key::Other, Key::Other, Key::Other]
         );
     }
 
