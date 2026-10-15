@@ -8,12 +8,21 @@
 //! the same pictures through files made from the source (`snapshot`,
 //! `frames`, `sheet`), and the human answers with events (`events`).
 
+mod cdp;
 mod error;
 mod files;
 mod font;
 mod json;
 mod media;
+// pepper-play's own Mach client and surfaces (MIT, the same repository):
+// the viewer hands Pepper a web page's frames as pepper-play does a video's.
+#[allow(dead_code)]
+#[path = "../../pepper-play/src/pepper.rs"]
+mod pepper;
 mod proto;
+#[allow(dead_code)]
+#[path = "../../pepper-play/src/surface.rs"]
+mod surface;
 mod sys;
 mod text;
 mod viewer;
@@ -251,6 +260,176 @@ const SPECS: &[Spec] = &[
         min: 1,
         max: 1,
     },
+    Spec {
+        name: "web open",
+        usage: "web open <url|file> [--name NAME] [--device D] [--dark] [--allow-remote] [--watch DIR]",
+        about: "Opens a page in the viewer, live: your dev server (http://localhost:5173) or an HTML file, in a headless Chrome of the viewer's own (a fresh profile). Answers once it has loaded. Only this machine's pages unless --allow-remote. --device: desktop-1440 (default), desktop-1920, laptop-1280, ipad, iphone-15, pixel-8, or WxH@DPR. --watch reloads it when files under DIR change.",
+        example: "pepper-agent web open http://localhost:5173 --name app",
+        values: &["name", "device", "watch"],
+        flags: &["dark", "allow-remote"],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web goto",
+        usage: "web goto <url> [--source NAME]",
+        about: "Takes the page to another address and waits for it to load.",
+        example: "pepper-agent web goto http://localhost:5173/settings",
+        values: &["source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web reload",
+        usage: "web reload [--source NAME]",
+        about: "Reloads the page and waits for it to load.",
+        example: "pepper-agent web reload",
+        values: &["source"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "web back",
+        usage: "web back [--source NAME]",
+        about: "Goes back a page.",
+        example: "pepper-agent web back",
+        values: &["source"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "web click",
+        usage: "web click <selector|x,y> [--source NAME]",
+        about: "Clicks an element (scrolled into view first) or a point (CSS pixels of the viewport), as a mouse would. The human sees it happen.",
+        example: "pepper-agent web click 'button[type=submit]'",
+        values: &["source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web type",
+        usage: "web type <selector> <text> [--clear] [--source NAME]",
+        about: "Types text into an element (focused first); --clear replaces what's there.",
+        example: "pepper-agent web type '#email' 'ada@example.com' --clear",
+        values: &["source"],
+        flags: &["clear"],
+        min: 2,
+        max: 2,
+    },
+    Spec {
+        name: "web press",
+        usage: "web press <key> [--source NAME]",
+        about: "Presses a key: Enter, Tab, Escape, Backspace, ArrowDown, PageDown, F5, a letter; Control+, Shift+, Alt+, Meta+ in front for more.",
+        example: "pepper-agent web press Enter",
+        values: &["source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web scroll",
+        usage: "web scroll <pixels|top|bottom|selector> [--source NAME]",
+        about: "Scrolls the page: by pixels (negative is up), to the top or bottom, or to an element. Says where it is.",
+        example: "pepper-agent web scroll 600",
+        values: &["source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web hover",
+        usage: "web hover <selector|x,y> [--source NAME]",
+        about: "Moves the mouse over an element or a point.",
+        example: "pepper-agent web hover nav .menu",
+        values: &["source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web viewport",
+        usage: "web viewport [<device>] [--dark|--light] [--source NAME]",
+        about: "Changes the size the page is shown at (a device or WxH@DPR) or its colour scheme.",
+        example: "pepper-agent web viewport iphone-15",
+        values: &["source"],
+        flags: &["dark", "light"],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "web wait-for",
+        usage: "web wait-for <selector|network-idle> [--timeout SECONDS] [--source NAME]",
+        about: "Waits until an element is on the page, or until no request has been open for half a second (10 s at most, --timeout up to 120).",
+        example: "pepper-agent web wait-for '.results li'",
+        values: &["timeout", "source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web shot",
+        usage: "web shot [<name>] [--full-page] [--selector S] [--region X,Y,W,H] [--max PIXELS]",
+        about: "A PNG of the page from the browser: what the viewport shows, the whole page (--full-page), or one element (--selector). --region crops, in CSS pixels. At most 1568 px on its long side; files go in .pepper/snapshots/.",
+        example: "pepper-agent web shot --selector header",
+        values: &["selector", "region", "max"],
+        flags: &["full-page"],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "web console",
+        usage: "web console [--since ID] [--level error,warning] [--source NAME]",
+        about: "The page's console: logs, warnings, errors, the browser's own messages. Pass --since the last_id you got for only new ones.",
+        example: "pepper-agent web console --level error,warning",
+        values: &["since", "level", "source"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "web errors",
+        usage: "web errors [--since ID] [--source NAME]",
+        about: "What went wrong in the page: uncaught exceptions, requests that failed, responses of 400 and up.",
+        example: "pepper-agent web errors --since 0",
+        values: &["since", "source"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "web dom",
+        usage: "web dom <selector> [--max CHARS] [--source NAME]",
+        about: "The HTML of the elements a selector finds (20000 characters at most, --max for more), and how many.",
+        example: "pepper-agent web dom 'main > .card'",
+        values: &["max", "source"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "web a11y",
+        usage: "web a11y [--selector S] [--max LINES] [--source NAME]",
+        about: "The accessibility tree, one line a node (role, name, value): what a screen reader gets. The whole page, or under one element.",
+        example: "pepper-agent web a11y --selector form",
+        values: &["selector", "max", "source"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "web eval",
+        usage: "web eval <javascript> [--source NAME]",
+        about: "Runs JavaScript in the page and answers with its value (awaited if a promise). Only on pages on this machine.",
+        example: "pepper-agent web eval 'document.title'",
+        values: &["source"],
+        flags: &[],
+        min: 1,
+        max: usize::MAX,
+    },
 ];
 
 const GROUPS: &[(&str, &[&str])] = &[
@@ -268,11 +447,33 @@ const GROUPS: &[(&str, &[&str])] = &[
         &["play", "pause", "toggle", "seek", "loop", "where", "review"],
     ),
     ("Footage, from the file", &["probe", "frames", "sheet"]),
+    (
+        "Web preview (a page of your dev server, live)",
+        &[
+            "web open",
+            "web goto",
+            "web reload",
+            "web back",
+            "web click",
+            "web type",
+            "web press",
+            "web scroll",
+            "web hover",
+            "web viewport",
+            "web wait-for",
+            "web shot",
+            "web console",
+            "web errors",
+            "web dom",
+            "web a11y",
+            "web eval",
+        ],
+    ),
 ];
 
 fn usage() -> String {
     let mut out = String::from(
-        "pepper-agent: lets AI agents use Pepper (video inside the terminal). Agents: run `pepper-agent guide` first.\n\n\
+        "pepper-agent: lets AI agents use Pepper (video and live web pages inside the terminal). Agents: run `pepper-agent guide` first.\n\n\
          usage: pepper-agent <command> [arguments] [--human] [--viewer ID]\n",
     );
     for (group, names) in GROUPS {
@@ -280,7 +481,7 @@ fn usage() -> String {
         for name in *names {
             if let Some(spec) = SPECS.iter().find(|s| s.name == *name) {
                 out += &format!(
-                    "  {:<10} {}\n",
+                    "  {:<13} {}\n",
                     spec.name,
                     spec.about.split(". ").next().unwrap_or("")
                 );
@@ -289,6 +490,22 @@ fn usage() -> String {
     }
     out += "\nEach command prints one JSON object; errors are JSON on stderr with a code and a hint.\n\
             --human prints them for people. `pepper-agent <command> --help` has an example.\n";
+    out
+}
+
+/// `pepper-agent web`: its commands.
+fn web_usage() -> String {
+    let mut out = String::from(
+        "pepper-agent web <action>: a page in the viewer, live (a headless Chrome of the viewer's own).\n\n",
+    );
+    for spec in SPECS.iter().filter(|s| s.name.starts_with("web ")) {
+        out += &format!(
+            "  {:<13} {}\n",
+            spec.name,
+            spec.about.split(". ").next().unwrap_or("")
+        );
+    }
+    out += "\n`pepper-agent web <action> --help` has an example; `pepper-agent guide` has the workflow.\n";
     out
 }
 
@@ -414,13 +631,22 @@ fn main() -> ExitCode {
         _ => {}
     }
     let human_anywhere = args.iter().any(|a| a == "--human");
+    // `web <action>` is one command.
+    let (name, rest) = match (name.as_str(), args.get(1)) {
+        ("web", Some(action)) if !action.starts_with('-') => (format!("web {action}"), &args[2..]),
+        ("web", _) => {
+            print!("{}", web_usage());
+            return ExitCode::SUCCESS;
+        }
+        _ => (name.clone(), &args[1..]),
+    };
     let Some(spec) = SPECS.iter().find(|s| s.name == name) else {
-        let error = Error::new("BAD_ARGS", format!("no command {}", text::inert(name, 40))).hint(
+        let error = Error::new("BAD_ARGS", format!("no command {}", text::inert(&name, 40))).hint(
             "Run `pepper-agent --help` for the commands, `pepper-agent guide` for how to use them.",
         );
         return fail(&error, human_anywhere);
     };
-    let args = match parse_args(spec, &args[1..]) {
+    let args = match parse_args(spec, rest) {
         Ok(args) => args,
         Err(error) => return fail(&error, human_anywhere),
     };
@@ -578,7 +804,7 @@ fn run(spec: &Spec, args: &Args) -> Result<Value> {
             };
             media::sheet(&work_dir()?, &file, &ask)
         }
-        "snapshot" => snapshot(args),
+        "snapshot" | "web shot" => snapshot(spec, args),
         _ => to_viewer(spec, args),
     }
 }
@@ -610,17 +836,17 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
     match spec.name {
         "open" => {
             let given = first.unwrap_or("");
-            let target = open_target(given)?;
-            let kind = args.value("kind").unwrap_or("media");
-            if kind != "media" {
-                return Err(Error::new(
-                    "UNSUPPORTED",
-                    format!(
-                        "--kind {}: this version shows media only",
-                        text::inert(kind, 20)
-                    ),
-                ));
-            }
+            let (target, kind) = match (open_target(given)?, args.value("kind")) {
+                (Target::Media(t), None | Some("media")) => (t, "media"),
+                (Target::Web(t), None | Some("web")) => (t, "web"),
+                (Target::Media(t), Some("web")) => (web_target(&t)?, "web"),
+                (_, Some(kind)) => {
+                    return Err(Error::new(
+                        "BAD_ARGS",
+                        format!("--kind {}: media or web", text::inert(kind, 20)),
+                    ));
+                }
+            };
             v.set("target", target);
             v.set("kind", kind);
             if let Some(name) = args.value("name") {
@@ -628,6 +854,83 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
             }
             v.set("play", args.flag("play"));
         }
+        "web open" => {
+            v.set("target", web_target(first.unwrap_or(""))?);
+            v.set("kind", "web");
+            for key in ["name", "device"] {
+                if let Some(value) = args.value(key) {
+                    v.set(key, value);
+                }
+            }
+            v.set("dark", args.flag("dark"));
+            v.set("allow_remote", args.flag("allow-remote"));
+            if let Some(dir) = args.value("watch") {
+                let dir =
+                    std::path::absolute(dir).map_err(|e| Error::new("BAD_ARGS", e.to_string()))?;
+                v.set("watch", dir.display().to_string());
+            }
+        }
+        "web goto" => v.set("url", web_target(first.unwrap_or(""))?),
+        "web click" | "web hover" => v.set("target", first),
+        "web type" => {
+            v.set("selector", first);
+            v.set("text", args.plain.get(1).map(String::as_str));
+            v.set("clear", args.flag("clear"));
+        }
+        "web press" => v.set("key", first),
+        "web scroll" => v.set("to", first),
+        "web viewport" => {
+            if let Some(device) = first {
+                v.set("device", device);
+            }
+            match (args.flag("dark"), args.flag("light")) {
+                (true, true) => return Err(bad_args(spec, "--dark or --light, not both".into())),
+                (true, false) => v.set("dark", true),
+                (false, true) => v.set("dark", false),
+                _ => {}
+            }
+        }
+        "web wait-for" => {
+            v.set("what", first);
+            if let Some(t) = args.value("timeout") {
+                let t: f64 = t
+                    .parse()
+                    .ok()
+                    .filter(|t: &f64| *t > 0.0 && *t <= 120.0)
+                    .ok_or_else(|| Error::new("BAD_ARGS", "--timeout: seconds, up to 120"))?;
+                v.set("timeout", t);
+            }
+        }
+        "web console" | "web errors" => {
+            if let Some(since) = args.value("since") {
+                let since: f64 = since
+                    .parse()
+                    .ok()
+                    .filter(|s: &f64| *s >= 0.0 && s.fract() == 0.0)
+                    .ok_or_else(|| {
+                        Error::new("BAD_ARGS", "--since: an id (last_id from before)")
+                    })?;
+                v.set("since", since);
+            }
+            if let Some(levels) = args.value("level") {
+                let items: Vec<Value> = levels.split(',').map(|l| Value::from(l.trim())).collect();
+                v.set("levels", Value::Arr(items));
+            }
+        }
+        "web dom" | "web a11y" => {
+            if let Some(selector) = first.or(args.value("selector")) {
+                v.set("selector", selector);
+            }
+            if let Some(max) = args.value("max") {
+                let max: f64 = max
+                    .parse()
+                    .ok()
+                    .filter(|m: &f64| *m >= 1.0)
+                    .ok_or_else(|| Error::new("BAD_ARGS", "--max: a number"))?;
+                v.set("max", max);
+            }
+        }
+        "web eval" => v.set("js", args.plain.join(" ")),
         "close" => v.set("name", first),
         "focus" => v.set("source", first),
         "where" => {
@@ -689,8 +992,17 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
     Ok(v)
 }
 
-/// What `open` loads: an absolute path to a file, or a web address.
-fn open_target(given: &str) -> Result<String> {
+/// What `open` shows: media (a file, a video's address) or a page.
+#[derive(Debug, PartialEq)]
+enum Target {
+    Media(String),
+    Web(String),
+}
+
+/// What `open` loads: an absolute path to a file, a video's web address, or
+/// a page on this machine (an address of localhost, an HTML file), which
+/// is a web source.
+fn open_target(given: &str) -> Result<Target> {
     if let Some((scheme, _)) = given.split_once("://")
         && scheme
             .chars()
@@ -698,26 +1010,9 @@ fn open_target(given: &str) -> Result<String> {
     {
         let lower = scheme.to_ascii_lowercase();
         return match lower.as_str() {
-            "http" | "https" => {
-                let host = given[scheme.len() + 3..]
-                    .split(['/', '?', '#'])
-                    .next()
-                    .unwrap_or("")
-                    .rsplit('@')
-                    .next()
-                    .unwrap_or("");
-                let host = host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host);
-                if ["localhost", "127.0.0.1", "[::1]"].contains(&host) {
-                    Err(Error::new(
-                        "UNSUPPORTED",
-                        "a local web page is a web preview, which this version doesn't have yet",
-                    )
-                    .hint("For a video file served locally, open the file itself."))
-                } else {
-                    Ok(given.to_owned())
-                }
-            }
-            "file" => media::local_file(&given[7..]).map(|p| p.display().to_string()),
+            "http" | "https" if viewer::is_local(given) => Ok(Target::Web(given.to_owned())),
+            "http" | "https" => Ok(Target::Media(given.to_owned())),
+            "file" => open_target(&given[7..]),
             _ => Err(Error::new(
                 "UNSUPPORTED",
                 format!(
@@ -727,35 +1022,79 @@ fn open_target(given: &str) -> Result<String> {
             )),
         };
     }
-    media::local_file(given).map(|p| p.display().to_string())
+    if let Some((host, _)) = given.split_once(':')
+        && ["localhost", "127.0.0.1"].contains(&host)
+    {
+        return Ok(Target::Web(format!("http://{given}")));
+    }
+    let file = media::local_file(given)?;
+    let html = file.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        matches!(
+            e.to_ascii_lowercase().as_str(),
+            "html" | "htm" | "xhtml" | "svg"
+        )
+    });
+    Ok(if html {
+        Target::Web(format!("file://{}", file.display()))
+    } else {
+        Target::Media(file.display().to_string())
+    })
+}
+
+/// A page's address as given: `localhost:5173` is `http://localhost:5173`,
+/// a file is its `file://` address.
+fn web_target(given: &str) -> Result<String> {
+    if given == "about:blank" || given.contains("://") {
+        return Ok(given.to_owned());
+    }
+    let host = given.split(['/', '?', '#']).next().unwrap_or("");
+    let name = host.split(':').next().unwrap_or("");
+    if name == "localhost"
+        || name.ends_with(".localhost")
+        || name.parse::<std::net::Ipv4Addr>().is_ok()
+    {
+        return Ok(format!("http://{given}"));
+    }
+    let file = media::local_file(given)?;
+    Ok(format!("file://{}", file.display()))
 }
 
 /// How long to wait for a viewer's answer.
 fn answer_wait(spec: &Spec, args: &Args) -> Duration {
     let base = match spec.name {
-        "open" => 45,
+        "open" | "web open" => 60,
         "seek" | "loop" | "review" => 20,
+        name if name.starts_with("web ") => 60,
         _ => 10,
     };
+    let timeout = args
+        .value("timeout")
+        .and_then(|w| w.parse::<f64>().ok())
+        .unwrap_or(0.0);
     let wait = args
         .value("wait")
         .and_then(|w| w.parse::<f64>().ok())
         .unwrap_or(0.0);
-    Duration::from_secs(base) + Duration::from_secs_f64(wait.clamp(0.0, viewer::MAX_WAIT))
+    Duration::from_secs(base)
+        + Duration::from_secs_f64(wait.clamp(0.0, viewer::MAX_WAIT))
+        + Duration::from_secs_f64(timeout.clamp(0.0, 120.0))
 }
 
 fn to_viewer(spec: &Spec, args: &Args) -> Result<Value> {
     let request = request_args(spec, args)?;
     let dir = proto::run_dir()?;
     let viewer = proto::pick(&dir, args.viewer.as_deref())?;
-    let mut answer = proto::request(&dir, &viewer, spec.name, request, answer_wait(spec, args))?;
+    let cmd = spec.name.replace(' ', ".");
+    let mut answer = proto::request(&dir, &viewer, &cmd, request, answer_wait(spec, args))?;
     if let Value::Obj(members) = &mut answer {
         members.insert(0, ("viewer".into(), Value::from(viewer.id.as_str())));
     }
     Ok(answer)
 }
 
-fn snapshot(args: &Args) -> Result<Value> {
+/// `snapshot`, and `web shot`: the viewer writes the picture in its own
+/// folder; here it's cropped, made smaller and put in `.pepper/snapshots/`.
+fn snapshot(spec: &Spec, args: &Args) -> Result<Value> {
     let region = match args.value("region") {
         Some(text) => {
             let parts: Vec<u32> = text
@@ -784,9 +1123,27 @@ fn snapshot(args: &Args) -> Result<Value> {
     if let Some(name) = args.plain.first() {
         request.set("source", name.as_str());
     }
+    let cmd = if spec.name == "web shot" {
+        request.set("full_page", args.flag("full-page"));
+        if let Some(selector) = args.value("selector") {
+            request.set("selector", selector);
+        }
+        "web.shot"
+    } else {
+        "snapshot"
+    };
     let dir = proto::run_dir()?;
     let viewer = proto::pick(&dir, args.viewer.as_deref())?;
-    let shot = proto::request(&dir, &viewer, "snapshot", request, Duration::from_secs(20))?;
+    let shot = proto::request(&dir, &viewer, cmd, request, Duration::from_secs(60))?;
+    // A page's region is in CSS pixels; its picture, in the device's.
+    let dpr = shot
+        .get("viewport")
+        .and_then(|v| v.get_num("dpr"))
+        .filter(|_| shot.get_str("kind") == Some("web") && shot.get("clip").is_none());
+    let region = match (region, dpr) {
+        (Some(r), Some(dpr)) => Some(r.map(|n| (n as f64 * dpr).round() as u32)),
+        (r, _) => r,
+    };
     let raw = PathBuf::from(shot.get_str("raw").unwrap_or(""));
     // Only a file in this user's own folder for the viewers.
     if !raw.starts_with(&dir) || !raw.is_file() {
@@ -838,6 +1195,10 @@ fn snapshot(args: &Args) -> Result<Value> {
         "source",
         "kind",
         "file",
+        "url",
+        "title",
+        "viewport",
+        "clip",
         "time_pos",
         "time_text",
         "duration",
@@ -887,6 +1248,13 @@ fn deps() -> Value {
             ),
         )
         .with("libmpv", found(libmpv, "brew install mpv"))
+        .with(
+            "chrome",
+            found(
+                cdp::find_chrome(),
+                "install Google Chrome or Chromium, or set PEPPER_CHROME (only for web pages)",
+            ),
+        )
         .with(
             "yt_dlp",
             found(
@@ -953,7 +1321,7 @@ fn status(args: &Args) -> Result<Value> {
         }
         (None, _) => format!("No viewer. {}", error::NO_VIEWER_HINT),
         (Some(_), true) => {
-            "The viewer is empty: pepper-agent open <file>, then pepper-agent say what to look for."
+            "The viewer is empty: pepper-agent open <file> (or web open <your dev server's address>), then pepper-agent say what to look for."
                 .to_owned()
         }
         (Some(v), false) => format!(
@@ -1019,14 +1387,17 @@ mod tests {
                 assert!(SPECS.iter().any(|s| s.name == *name), "{name}");
             }
         }
-        let viewer_side: Vec<&str> = SPECS
+        let viewer_side: Vec<String> = SPECS
             .iter()
-            .map(|s| s.name)
-            .filter(|n| !["guide", "view", "probe", "frames", "sheet", "snapshot"].contains(n))
+            .map(|s| s.name.replace(' ', "."))
+            .filter(|n| {
+                !["guide", "view", "probe", "frames", "sheet", "snapshot"].contains(&n.as_str())
+            })
             .collect();
         for name in viewer_side {
-            assert!(proto::COMMANDS.contains(&name), "{name}");
+            assert!(proto::COMMANDS.contains(&name.as_str()), "{name}");
         }
+        assert!(web_usage().contains("web wait-for"));
     }
 
     #[test]
@@ -1107,17 +1478,23 @@ mod tests {
 
     #[test]
     fn open_targets() {
+        let media = |t: &str| Target::Media(t.into());
+        let web = |t: &str| Target::Web(t.into());
         assert_eq!(
             open_target("https://example.com/v?x=1").unwrap(),
-            "https://example.com/v?x=1"
+            media("https://example.com/v?x=1")
         );
         assert_eq!(
-            open_target("http://localhost:3000").unwrap_err().code,
-            "UNSUPPORTED"
+            open_target("http://localhost:3000").unwrap(),
+            web("http://localhost:3000")
         );
         assert_eq!(
-            open_target("http://u:p@127.0.0.1/").unwrap_err().code,
-            "UNSUPPORTED"
+            open_target("http://u:p@127.0.0.1/").unwrap(),
+            web("http://u:p@127.0.0.1/")
+        );
+        assert_eq!(
+            open_target("localhost:5173").unwrap(),
+            web("http://localhost:5173")
         );
         assert_eq!(open_target("rtsp://cam/x").unwrap_err().code, "UNSUPPORTED");
         assert_eq!(open_target("av://lavfi:x").unwrap_err().code, "UNSUPPORTED");
@@ -1126,11 +1503,22 @@ mod tests {
             "NOT_FOUND"
         );
         let manifest = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
-        assert_eq!(open_target(manifest).unwrap(), manifest);
+        assert_eq!(open_target(manifest).unwrap(), media(manifest));
         assert_eq!(
             open_target(&format!("file://{manifest}")).unwrap(),
-            manifest
+            media(manifest)
         );
+        assert_eq!(
+            web_target("localhost:5173/a").unwrap(),
+            "http://localhost:5173/a"
+        );
+        assert_eq!(
+            web_target("127.0.0.1:8000").unwrap(),
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(web_target("https://x.dev").unwrap(), "https://x.dev");
+        assert_eq!(web_target(manifest).unwrap(), format!("file://{manifest}"));
+        assert_eq!(web_target("nope.html").unwrap_err().code, "NOT_FOUND");
     }
 
     #[test]

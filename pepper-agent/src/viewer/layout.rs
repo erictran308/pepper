@@ -158,6 +158,46 @@ pub fn fit(area: Cells, cell: (f64, f64), aspect: Option<f64>) -> Cells {
     }
 }
 
+/// Where a picture of `aspect` (width over height) shows in a box `w`×`h`
+/// pixels: centred, its shape kept, as large as fits (as mpv and the web
+/// frames draw it). Its left, top, width and height.
+pub fn content(w: f64, h: f64, aspect: f64) -> (f64, f64, f64, f64) {
+    if !(aspect.is_finite() && aspect > 0.0 && w > 0.0 && h > 0.0) {
+        return (0.0, 0.0, w.max(0.0), h.max(0.0));
+    }
+    let (cw, ch) = if w / h > aspect {
+        ((h * aspect).round().clamp(1.0, w), h)
+    } else {
+        (w, (w / aspect).round().clamp(1.0, h))
+    };
+    (((w - cw) / 2.0).floor(), ((h - ch) / 2.0).floor(), cw, ch)
+}
+
+/// A point of the pane, in pixels (as the mouse is reported), in the
+/// source's own units: pixels for a video, CSS pixels for a page, whatever
+/// its device pixel ratio. `at` is the box (left, top, width, height in
+/// pixels), `size` the source's. None outside the picture, unless `clamp`,
+/// which brings it to the nearest edge (for the end of a drag).
+pub fn to_source(
+    (px, py): (f64, f64),
+    at: (f64, f64, f64, f64),
+    size: (f64, f64),
+    clamp: bool,
+) -> Option<(f64, f64)> {
+    if !(size.0 > 0.0 && size.1 > 0.0) {
+        return None;
+    }
+    let (x, y, cw, ch) = content(at.2, at.3, size.0 / size.1);
+    let (mut lx, mut ly) = (px - at.0 - x, py - at.1 - y);
+    if clamp {
+        lx = lx.clamp(0.0, cw - 1.0);
+        ly = ly.clamp(0.0, ch - 1.0);
+    } else if lx < 0.0 || ly < 0.0 || lx >= cw || ly >= ch {
+        return None;
+    }
+    Some((lx * size.0 / cw, ly * size.1 / ch))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +326,52 @@ mod tests {
         assert_eq!(fit(a, CELL, None), a);
         assert_eq!(fit(a, CELL, Some(f64::NAN)), a);
         assert_eq!(fit(area(1, 1), CELL, Some(100.0)), area(1, 1));
+    }
+
+    #[test]
+    fn pictures_in_boxes() {
+        // 16:9 in 1600×1000: bars above and below.
+        assert_eq!(
+            content(1600.0, 1000.0, 16.0 / 9.0),
+            (0.0, 50.0, 1600.0, 900.0)
+        );
+        // 4:3 in 1600×900: bars at the sides.
+        assert_eq!(
+            content(1600.0, 900.0, 4.0 / 3.0),
+            (200.0, 0.0, 1200.0, 900.0)
+        );
+        assert_eq!(content(10.0, 10.0, f64::NAN), (0.0, 0.0, 10.0, 10.0));
+    }
+
+    #[test]
+    fn clicks_in_source_pixels() {
+        let at = (100.0, 40.0, 1600.0, 1000.0);
+        // A 1920×1080 video, letterboxed: its top edge is 50 px down.
+        assert_eq!(
+            to_source((900.0, 90.0), at, (1920.0, 1080.0), false),
+            Some((960.0, 0.0))
+        );
+        assert_eq!(to_source((900.0, 80.0), at, (1920.0, 1080.0), false), None);
+        assert_eq!(
+            to_source((900.0, 80.0), at, (1920.0, 1080.0), true),
+            Some((960.0, 0.0))
+        );
+        // A page 1440×900 CSS pixels at a device pixel ratio of 2 (frames of
+        // 2880×1800) fills a 1600×1000 box: the middle is its middle, in CSS
+        // pixels.
+        assert_eq!(
+            to_source((900.0, 540.0), at, (1440.0, 900.0), false),
+            Some((720.0, 450.0))
+        );
+        // A phone, 393×852 at 3, in the same box: bars at the sides.
+        let (x, _, w, _) = content(1600.0, 1000.0, 393.0 / 852.0);
+        assert_eq!((x, w), (569.0, 461.0));
+        let (sx, sy) =
+            to_source((100.0 + 569.0 + 230.5, 540.0), at, (393.0, 852.0), false).unwrap();
+        assert!(
+            (sx - 196.5).abs() < 0.01 && (sy - 426.0).abs() < 0.01,
+            "{sx},{sy}"
+        );
+        assert_eq!(to_source((150.0, 540.0), at, (393.0, 852.0), false), None);
     }
 }

@@ -51,6 +51,17 @@ impl Value {
         }
     }
 
+    /// Takes a member out, leaving the rest.
+    pub fn take(&mut self, key: &str) -> Option<Value> {
+        match self {
+            Value::Obj(members) => {
+                let at = members.iter().position(|(k, _)| k == key)?;
+                Some(members.remove(at).1)
+            }
+            _ => None,
+        }
+    }
+
     pub fn str(&self) -> Option<&str> {
         match self {
             Value::Str(s) => Some(s),
@@ -425,6 +436,14 @@ impl Reader<'_> {
         self.eat(b'"')?;
         let mut out = Vec::new();
         loop {
+            // A run of plain bytes in one go: Chrome's frames come as
+            // megabytes of base64.
+            let run = self.bytes[self.at..]
+                .iter()
+                .position(|&b| b == b'"' || b == b'\\' || b < 0x20)
+                .unwrap_or(self.bytes.len() - self.at);
+            out.extend_from_slice(&self.bytes[self.at..self.at + run]);
+            self.at += run;
             let Some(byte) = self.peek() else {
                 return Err(self.fail("unterminated string"));
             };

@@ -83,7 +83,13 @@ fn hint(code: &str) -> &'static str {
     match code {
         "NO_VIEWER" => NO_VIEWER_HINT,
         "NO_SOURCE" => "Run `pepper-agent sources` for the names, or `pepper-agent open <file>`.",
-        "NOT_PLAYABLE" => "Playback commands work on media sources (files and video URLs).",
+        "NOT_PLAYABLE" => {
+            "Playback commands work on media sources (files and video URLs); a page takes `pepper-agent web …`."
+        }
+        "ORIGIN_BLOCKED" => {
+            "Only pages on this machine open by default (localhost, 127.0.0.1, ::1, files): open it with \
+             --allow-remote if the user wants a page from the network."
+        }
         "LIMIT_REACHED" => {
             "A viewer shows at most 4 sources: close one (`pepper-agent close <name>`), or ask \
              the user to run another viewer (`pepper-agent view`) and pass --viewer <id>."
