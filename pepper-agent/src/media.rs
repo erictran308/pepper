@@ -60,12 +60,12 @@ pub fn which(name: &str) -> Option<PathBuf> {
         .find(|p| p.is_absolute() && p.is_file())
 }
 
-fn file_arg(path: &Path) -> String {
+pub fn file_arg(path: &Path) -> String {
     format!("file:{}", path.display())
 }
 
 /// Runs a tool and returns its stdout; its stderr, made inert, if it fails.
-fn run(tool: &Path, args: &[String]) -> Result<Vec<u8>> {
+pub fn run(tool: &Path, args: &[String]) -> Result<Vec<u8>> {
     let out = Command::new(tool)
         .args(args)
         .stdin(Stdio::null())
@@ -179,7 +179,7 @@ pub fn hw_decodable(codec: &str) -> bool {
 }
 
 /// The cache folder for a file.
-fn cache_dir(work: &Path, key: &str) -> Result<PathBuf> {
+pub fn cache_dir(work: &Path, key: &str) -> Result<PathBuf> {
     let dir = work.join("cache").join(key);
     crate::files::private_dir(&dir)
         .map_err(|e| Error::new("FAILED", format!("{}: {e}", dir.display())))?;
