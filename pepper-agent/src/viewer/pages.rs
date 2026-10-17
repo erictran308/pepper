@@ -100,6 +100,7 @@ impl WebSource {
         v.set("width", self.device.width);
         v.set("height", self.device.height);
         v.set("focused", focused);
+        v.set("owner", source.owner.as_deref());
         v.set("visible", visible);
         v.set(
             "box",
@@ -172,8 +173,10 @@ impl Viewer {
                 format!("{:?} isn't a source name", text::inert(name, 70)),
             ));
         }
+        let (session, owner) = self.claim(args)?;
         // The same name again: that page goes to the new address.
         if let Some(i) = name.and_then(|n| self.sources.iter().position(|s| s.name == n)) {
+            self.check_owner(i, args)?;
             if let Some(page) = self.sources[i].web.as_ref().and_then(|w| w.page.clone())
                 && page.allow_remote == allow_remote
             {
@@ -265,6 +268,8 @@ impl Viewer {
                 box_px: None,
             }),
             edit: None,
+            session,
+            owner,
             fps: None,
             scrub: super::seekbar::Scrub::default(),
         });
@@ -490,6 +495,9 @@ impl Viewer {
     }
 
     pub(super) fn on_job(&mut self, job: u64, result: Result<Value>) {
+        if self.auto_stopped(job, &result) || self.difference_done(job, &result) {
+            return;
+        }
         if let Some(point) = self.point_jobs.remove(&job) {
             self.captured(point, result);
             return;
@@ -534,7 +542,10 @@ impl Viewer {
     /// The web source a request names, or the focused one if it's a page,
     /// or the only page.
     fn pick_web(&self, args: &Value) -> Result<usize> {
-        let i = if let Some(name) = args.get_str("source") {
+        let own = self.own_source(args, |i| self.sources[i].web.is_some());
+        let i = if let Some(i) = own {
+            i
+        } else if let Some(name) = args.get_str("source") {
             self.sources
                 .iter()
                 .position(|s| s.name == name)
@@ -627,6 +638,13 @@ impl Viewer {
     fn start_web_request(&mut self, req: &Request) -> Result<Started> {
         let args = req.args.clone();
         let i = self.pick_web(&args)?;
+        // Looking is anyone's; driving, the page's owner's.
+        if !matches!(
+            req.cmd.as_str(),
+            "web.shot" | "web.console" | "web.errors" | "web.dom" | "web.a11y"
+        ) {
+            self.check_owner(i, &args)?;
+        }
         let sid = self.sources[i].sid;
         let name = self.sources[i].name.clone();
         let page = self

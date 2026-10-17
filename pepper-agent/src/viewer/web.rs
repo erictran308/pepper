@@ -11,12 +11,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use super::Msg;
 use super::frames::FrameMsg;
+use super::record::RecMsg;
 use crate::cdp::{self, Browser, CALL_WAIT, Conn, Event};
 use crate::error::{Error, Result};
 use crate::json::Value;
@@ -36,10 +37,22 @@ const IDLE_AFTER: Duration = Duration::from_millis(500);
 /// Pictures are at most this many pixels on their long side.
 pub const MAX_SIDE: f64 = 1568.0;
 const JPEG_QUALITY: u32 = 85;
-/// Chrome sends every second frame of an animation: 30 a second. Making
-/// 2880×1800 JPEGs costs it 151% of a core at 60, 85% at 30
-/// (notes/agent.md); a still page sends none.
-const EVERY_NTH_FRAME: u32 = 2;
+/// At most 30 frames a second of an animation. Making 2880×1800 JPEGs costs
+/// Chrome 151% of a core at 60, 85% at 30 (notes/agent.md); a still page
+/// sends none. From Chrome 154 one frame is out at a time and the viewer
+/// acks it no sooner than this after the last ack: Chrome drops what it
+/// captures meanwhile before copying it. (Its `everyNthFrame` drops every
+/// other frame whatever comes after, a still page's only one too; its
+/// `sendLastFrame` copies every frame: 136% of a core at that size.)
+const FRAME_GAP: Duration = Duration::from_micros(33_333);
+/// The first Chrome with `maxFramesInFlight`.
+const ONE_IN_FLIGHT_FROM: u32 = 154;
+/// A page this long without a frame is still: its screencast starts again
+/// for a frame of what it shows (STILL in page_events).
+const STILL_AFTER: Duration = Duration::from_millis(150);
+/// A recording's frames are the page's own size, at most this many pixels
+/// on the long side (the box's may be a quarter of the pane).
+const RECORD_SIDE: f64 = 1920.0;
 
 /// The size a page is shown at: a preset or WxH@DPR.
 #[derive(Clone, Debug, PartialEq)]
@@ -173,6 +186,8 @@ pub struct Host {
     pages: Mutex<HashMap<String, Weak<Page>>>,
     /// Chrome's own user agent, without "Headless".
     user_agent: String,
+    /// Whether its screencasts keep one frame out at a time (FRAME_GAP).
+    one_in_flight: bool,
 }
 
 impl Host {
@@ -188,6 +203,15 @@ impl Host {
             .and_then(|v| v.get_str("userAgent"))
             .unwrap_or("")
             .replace("HeadlessChrome", "Chrome");
+        // "HeadlessChrome/156.0.8078.35", or another Chromium's name.
+        let one_in_flight = version
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get_str("product"))
+            .and_then(|p| p.rsplit('/').next())
+            .and_then(|v| v.split('.').next())
+            .and_then(|major| major.parse::<u32>().ok())
+            .is_some_and(|major| major >= ONE_IN_FLIGHT_FROM);
         if let Err(e) = conn.call(
             "Target.setDiscoverTargets",
             Value::obj().with("discover", true),
@@ -202,6 +226,7 @@ impl Host {
             conn: conn.clone(),
             pages: Mutex::new(HashMap::new()),
             user_agent,
+            one_in_flight,
         });
         let (tx, rx) = mpsc::channel();
         conn.on_browser_events(tx);
@@ -306,10 +331,19 @@ pub struct Page {
     pub target: String,
     pub context: String,
     pub allow_remote: bool,
+    /// Its screencast keeps one frame out at a time (Host's).
+    one_in_flight: bool,
     sid: u64,
     tx: Sender<Msg>,
     state: Mutex<PageState>,
     changed: Condvar,
+    /// The latest frame of its screencast, and where a recording of it
+    /// wants its frames.
+    last: Mutex<Option<Arc<Vec<u8>>>>,
+    recorder: Mutex<Option<Sender<RecMsg>>>,
+    /// When its screencast's last frame was acked, and its size.
+    acked: Mutex<Instant>,
+    cast: Mutex<Option<(u32, u32)>>,
 }
 
 /// What `open` asks for.
@@ -392,6 +426,7 @@ pub fn open(
         target: target.clone(),
         context,
         allow_remote: ask.allow_remote,
+        one_in_flight: host.one_in_flight,
         sid,
         tx,
         state: Mutex::new(PageState {
@@ -416,6 +451,10 @@ pub fn open(
             title_asked: false,
         }),
         changed: Condvar::new(),
+        last: Mutex::new(None),
+        recorder: Mutex::new(None),
+        acked: Mutex::new(Instant::now()),
+        cast: Mutex::new(None),
     });
     lock(&host.pages).insert(target, Arc::downgrade(&page));
     {
@@ -456,10 +495,31 @@ fn frame_data(event: &mut Event) -> Option<Vec<u8>> {
 }
 
 fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>) {
-    for mut event in rx {
+    // STILL: once the page is still after frames, its screencast starts
+    // again, which sends what it shows now. Its last change may have come
+    // while a frame was out, and Chrome sends nothing of it later.
+    let mut still_at: Option<Instant> = None;
+    let mut recast = false;
+    loop {
+        let next = match still_at {
+            Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let mut event = match next {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => {
+                still_at = None;
+                recast = page.recast();
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        };
         let method = event.method.clone();
         match method.as_str() {
             "Page.screencastFrame" => {
+                // The restart's frame is what the page shows; after any
+                // other, one may have been dropped.
+                still_at = (!std::mem::take(&mut recast)).then(|| Instant::now() + STILL_AFTER);
                 let ack = event.params.get_num("sessionId").unwrap_or(0.0);
                 let input = {
                     let mut state = page.state();
@@ -472,17 +532,32 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                 };
                 let done_page = page.clone();
                 let done = Box::new(move |shown: bool| {
+                    if done_page.one_in_flight {
+                        let due = *lock(&done_page.acked) + FRAME_GAP;
+                        std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                    }
                     done_page.conn.send(
                         "Page.screencastFrameAck",
                         Value::obj().with("sessionId", ack),
                         Some(&done_page.session),
                     );
+                    *lock(&done_page.acked) = Instant::now();
                     if shown && let Some(at) = input {
                         done_page.state().input_to_shown_ms = Some(ms(at.elapsed()));
                     }
                 });
                 match frame_data(&mut event) {
                     Some(jpeg) => {
+                        let shared = Arc::new(jpeg.clone());
+                        if let Some(recorder) = page
+                            .recorder
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .as_ref()
+                        {
+                            let _ = recorder.send(RecMsg::Frame(shared.clone()));
+                        }
+                        *page.last.lock().unwrap_or_else(|e| e.into_inner()) = Some(shared);
                         let _ = frames.send(FrameMsg::Frame(jpeg, done));
                     }
                     None => done(false),
@@ -712,6 +787,19 @@ pub struct Files {
 }
 
 impl Page {
+    /// The latest frame of the page's screencast, if it sent one.
+    pub fn last_frame(&self) -> Option<Arc<Vec<u8>>> {
+        self.last.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Sends the page's frames to a recording, or no longer: its screencast
+    /// starts again at the recording's size, or the box's.
+    pub fn record_to(self: &Arc<Self>, recorder: Option<Sender<RecMsg>>) {
+        *self.recorder.lock().unwrap_or_else(|e| e.into_inner()) = recorder;
+        let page = self.clone();
+        std::thread::spawn(move || page.recast());
+    }
+
     pub fn state(&self) -> MutexGuard<'_, PageState> {
         lock(&self.state)
     }
@@ -833,19 +921,40 @@ impl Page {
         Ok(())
     }
 
-    /// Runs the screencast at most `w`×`h` pixels: the box.
-    pub fn screencast(&self, (w, h): (u32, u32)) -> Result<()> {
+    /// Runs the screencast at most `w`×`h` pixels (the box), or while it's
+    /// recorded, at the page's own size.
+    pub fn screencast(&self, px: (u32, u32)) -> Result<()> {
+        *lock(&self.cast) = Some(px);
+        let recording = lock(&self.recorder).is_some();
+        let (w, h) = if recording { self.record_px() } else { px };
         let _ = self.call("Page.stopScreencast", Value::obj());
-        self.call(
-            "Page.startScreencast",
-            Value::obj()
-                .with("format", "jpeg")
-                .with("quality", JPEG_QUALITY)
-                .with("maxWidth", w.max(64))
-                .with("maxHeight", h.max(64))
-                .with("everyNthFrame", EVERY_NTH_FRAME),
-        )
-        .map(|_| ())
+        let mut params = Value::obj()
+            .with("format", "jpeg")
+            .with("quality", JPEG_QUALITY)
+            .with("maxWidth", w.max(64))
+            .with("maxHeight", h.max(64));
+        if self.one_in_flight {
+            params.set("maxFramesInFlight", 1);
+        }
+        self.call("Page.startScreencast", params).map(|_| ())
+    }
+
+    /// The page's size in device pixels, RECORD_SIDE at most.
+    fn record_px(&self) -> (u32, u32) {
+        let device = self.state().device.clone();
+        let (w, h) = (
+            f64::from(device.width) * device.dpr,
+            f64::from(device.height) * device.dpr,
+        );
+        let k = (RECORD_SIDE / w.max(h)).min(1.0);
+        ((w * k).round() as u32, (h * k).round() as u32)
+    }
+
+    /// Starts the screencast again: Chrome then sends a frame of what the
+    /// page shows now. Whether it did.
+    fn recast(&self) -> bool {
+        let size = *lock(&self.cast);
+        size.is_some_and(|px| self.screencast(px).is_ok())
     }
 
     fn check_origin(&self, url: &str) -> Result<()> {

@@ -21,6 +21,7 @@ mod media;
 #[path = "../../pepper-play/src/pepper.rs"]
 mod pepper;
 mod proto;
+mod recordings;
 #[allow(dead_code)]
 #[path = "../../pepper-play/src/surface.rs"]
 mod surface;
@@ -124,10 +125,10 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "open",
-        usage: "open <file|url> [--name NAME] [--play] [--kind media] [--edit PROJECT]",
-        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file.",
+        usage: "open <file|url> [--name NAME] [--play] [--kind media] [--edit PROJECT] [--owner NAME]",
+        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file. --owner labels its box (a session's sources have their owner's name).",
         example: "pepper-agent open raw/take1.mp4 --name take1",
-        values: &["name", "kind", "edit"],
+        values: &["name", "kind", "edit", "owner"],
         flags: &["play"],
         min: 1,
         max: 1,
@@ -144,10 +145,10 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "sources",
-        usage: "sources",
-        about: "The viewer's sources: name, status, time, size, decoder.",
+        usage: "sources [--owner NAME]",
+        about: "The viewer's sources: name, owner, status, time, size, decoder. --owner: only that agent's.",
         example: "pepper-agent sources",
-        values: &[],
+        values: &["owner"],
         flags: &[],
         min: 0,
         max: 0,
@@ -194,23 +195,23 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "events",
-        usage: "events [--wait SECONDS] [--since ID] [--until TYPE,...] [--type TYPE,...] [--source NAME]",
-        about: "What the human did: marks (m), notes (n), done (Enter). --wait waits up to that long for one (3600 at most); --until waits for an event of that type and answers with all since. Pass --since the last_id you got, to get only new ones.",
+        usage: "events [--wait SECONDS] [--since ID] [--until TYPE,...] [--type TYPE,...] [--source NAME] [--owner NAME]",
+        about: "What the human did: marks (m), notes (n), done (Enter). --wait waits up to that long for one (3600 at most); --until waits for an event of that type and answers with all since. Pass --since the last_id you got, to get only new ones. --owner: only events on that agent's sources.",
         example: "pepper-agent events --wait 300 --until done --since 0",
-        values: &["wait", "since", "until", "type", "source"],
+        values: &["wait", "since", "until", "type", "source", "owner"],
         flags: &[],
         min: 0,
         max: 0,
     },
     Spec {
         name: "play",
-        usage: "play [--source NAME]",
-        about: "Plays (from the start again if at the end).",
-        example: "pepper-agent play",
-        values: &["source"],
+        usage: "play [<recording>] [--source NAME] [--name NAME]",
+        about: "Plays (from the start again if at the end). With a file, shows it as a recording and plays it: a demo for the human to approve (y) or reject (x).",
+        example: "pepper-agent play .pepper/recordings/app-20261017093000.mp4",
+        values: &["source", "name"],
         flags: &[],
         min: 0,
-        max: 0,
+        max: 1,
     },
     Spec {
         name: "pause",
@@ -512,6 +513,56 @@ const SPECS: &[Spec] = &[
         min: 1,
         max: usize::MAX,
     },
+    Spec {
+        name: "session new",
+        usage: "session new [--owner NAME]",
+        about: "A session for one agent among several in one viewer: a token to pass with every command (--session, or PEPPER_AGENT_SESSION). The sources it opens are its own, labeled with --owner: others can't drive or close them without --force.",
+        example: "pepper-agent session new --owner agent-2",
+        values: &["owner"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "record start",
+        usage: "record start [<source>] [--max SECONDS]",
+        about: "Starts recording a source: a page as it shows (30 fps), or the stretch of a video that plays. It stops by itself after --max (120 s; 600 at most).",
+        example: "pepper-agent record start app",
+        values: &["max"],
+        flags: &[],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "record stop",
+        usage: "record stop [<source>]",
+        about: "Stops a recording and puts it in .pepper/recordings/: its path, length and a contact sheet to check it by. A video's is cut from the file itself.",
+        example: "pepper-agent record stop app",
+        values: &[],
+        flags: &[],
+        min: 0,
+        max: 1,
+    },
+    Spec {
+        name: "record run",
+        usage: "record run <script.json> [--source NAME] [--max SECONDS]",
+        about: "Records a page while it drives it through a script, then stops: a demo made the same way every time. A script is a list of steps, each an object of one verb: click, hover, type ([selector, text]), press, scroll, goto, reload, back, wait (seconds), wait_for, viewport, say. A step that fails ends it; the recording up to there is kept.",
+        example: "pepper-agent record run demo.json --source app   # demo.json: [{\"click\": \"#start\"}, {\"wait\": 1}, {\"type\": [\"#email\", \"a@b.co\"]}, {\"press\": \"Enter\"}]",
+        values: &["source", "max"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "compare",
+        usage: "compare <a> <b> [--sync] | compare off",
+        about: "Before and after, side by side: two sources by name, or files and pages opened as `before` and `after`. --sync plays, pauses and seeks them together. On two pictures, d shows their difference.",
+        example: "pepper-agent compare edit/v1.mp4 edit/v2.mp4 --sync",
+        values: &[],
+        flags: &["sync"],
+        min: 1,
+        max: 2,
+    },
 ];
 
 const GROUPS: &[(&str, &[&str])] = &[
@@ -560,12 +611,22 @@ const GROUPS: &[(&str, &[&str])] = &[
             "web eval",
         ],
     ),
+    (
+        "Several agents, recordings, before and after",
+        &[
+            "session new",
+            "record start",
+            "record stop",
+            "record run",
+            "compare",
+        ],
+    ),
 ];
 
 fn usage() -> String {
     let mut out = String::from(
         "pepper-agent: lets AI agents use Pepper (video and live web pages inside the terminal). Agents: run `pepper-agent guide` first.\n\n\
-         usage: pepper-agent <command> [arguments] [--human] [--viewer ID]\n",
+         usage: pepper-agent <command> [arguments] [--human] [--viewer ID] [--session TOKEN] [--force]\n",
     );
     for (group, names) in GROUPS {
         out += &format!("\n{group}:\n");
@@ -584,10 +645,12 @@ fn usage() -> String {
     out
 }
 
-/// `pepper-agent web` or `pepper-agent edit`: its commands.
+/// `pepper-agent web`, `edit`, `session` or `record`: its commands.
 fn group_usage(group: &str) -> String {
     let intro = match group {
         "web" => "a page in the viewer, live (a headless Chrome of the viewer's own)",
+        "session" => "one agent's own sources, among several agents in one viewer",
+        "record" => "what a source shows, to a file in .pepper/recordings/",
         _ => "a cut as a JSON project (pepper-agent schema edit): checked, shown, rendered",
     };
     let mut out = format!("pepper-agent {group} <action>: {intro}.\n\n");
@@ -607,7 +670,7 @@ fn group_usage(group: &str) -> String {
 
 fn command_help(spec: &Spec) -> String {
     format!(
-        "usage: pepper-agent {} [--human] [--viewer ID]\n\n{}\n\nExample:\n  {}\n",
+        "usage: pepper-agent {} [--human] [--viewer ID] [--session TOKEN] [--force]\n\n{}\n\nExample:\n  {}\n",
         spec.usage, spec.about, spec.example
     )
 }
@@ -620,6 +683,10 @@ struct Args {
     flags: Vec<String>,
     human: bool,
     viewer: Option<String>,
+    /// The agent's session (`--session`, or PEPPER_AGENT_SESSION), and
+    /// whether to drive another's source anyway.
+    session: Option<String>,
+    force: bool,
     help: bool,
 }
 
@@ -676,7 +743,9 @@ fn parse_args(spec: &Spec, args: &[String]) -> Result<Args> {
         };
         if name == "human" && inline.is_none() {
             out.human = true;
-        } else if name == "viewer" || spec.values.contains(&name) {
+        } else if name == "force" && inline.is_none() {
+            out.force = true;
+        } else if name == "viewer" || name == "session" || spec.values.contains(&name) {
             let value = match inline {
                 Some(v) => v,
                 None if i < args.len() => {
@@ -687,6 +756,8 @@ fn parse_args(spec: &Spec, args: &[String]) -> Result<Args> {
             };
             if name == "viewer" {
                 out.viewer = Some(value);
+            } else if name == "session" {
+                out.session = Some(value);
             } else {
                 out.values.push((name.to_owned(), value));
             }
@@ -698,6 +769,11 @@ fn parse_args(spec: &Spec, args: &[String]) -> Result<Args> {
                 format!("unknown option --{}", text::inert(name, 40)),
             ));
         }
+    }
+    if out.session.is_none() {
+        out.session = std::env::var("PEPPER_AGENT_SESSION")
+            .ok()
+            .filter(|s| !s.is_empty());
     }
     if !out.help && (out.plain.len() < spec.min || out.plain.len() > spec.max) {
         return Err(bad_args(
@@ -733,12 +809,12 @@ fn main() -> ExitCode {
         _ => {}
     }
     let human_anywhere = args.iter().any(|a| a == "--human");
-    // `web <action>` and `edit <action>` are one command.
+    // `web <action>`, `edit <action>`, ... are one command.
     let (name, rest) = match (name.as_str(), args.get(1)) {
-        ("web" | "edit", Some(action)) if !action.starts_with('-') => {
+        ("web" | "edit" | "session" | "record", Some(action)) if !action.starts_with('-') => {
             (format!("{name} {action}"), &args[2..])
         }
-        ("web" | "edit", _) => {
+        ("web" | "edit" | "session" | "record", _) => {
             print!("{}", group_usage(name));
             return ExitCode::SUCCESS;
         }
@@ -932,6 +1008,10 @@ fn run(spec: &Spec, args: &Args) -> Result<Value> {
         }
         "edit timeline" => edit_timeline(args),
         "edit preview" => edit_preview(args),
+        "record stop" => recordings::stop(args, args.plain.first().map(String::as_str)),
+        "record run" => recordings::run(args),
+        "compare" => recordings::compare(args),
+        "play" if !args.plain.is_empty() => recordings::play(args),
         "edit render" => {
             let quality = match args.value("quality") {
                 None | Some("draft") => edit::Quality::Draft,
@@ -1045,9 +1125,7 @@ fn edit_preview(args: &Args) -> Result<Value> {
         .with("name", name)
         .with("play", args.flag("play"))
         .with("edit", edit::Timeline::of(&project).to_json());
-    let run_dir = proto::run_dir()?;
-    let viewer = proto::pick(&run_dir, args.viewer.as_deref())?;
-    let opened = proto::request(&run_dir, &viewer, "open", request, Duration::from_secs(60))?;
+    let (viewer, opened) = recordings::ask(args, "open", request, Duration::from_secs(60))?;
     Ok(Value::obj()
         .with("viewer", viewer.id.as_str())
         .with("source", opened.get("source").cloned().unwrap_or(Value::Null))
@@ -1107,11 +1185,14 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
                 v.set("name", name);
             }
             v.set("play", args.flag("play"));
+            if let Some(owner) = args.value("owner") {
+                v.set("owner", owner);
+            }
         }
         "web open" => {
             v.set("target", web_target(first.unwrap_or(""))?);
             v.set("kind", "web");
-            for key in ["name", "device"] {
+            for key in ["name", "device", "owner"] {
                 if let Some(value) = args.value(key) {
                     v.set(key, value);
                 }
@@ -1193,6 +1274,24 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
             }
         }
         "layout" => v.set("mode", first),
+        "sources" | "session new" => {
+            if let Some(owner) = args.value("owner") {
+                v.set("owner", owner);
+            }
+        }
+        "record start" => {
+            if let Some(name) = first {
+                v.set("source", name);
+            }
+            if let Some(max) = args.value("max") {
+                let max: f64 = max
+                    .parse()
+                    .ok()
+                    .filter(|m: &f64| m.is_finite())
+                    .ok_or_else(|| Error::new("BAD_ARGS", "--max: seconds, 1 to 600"))?;
+                v.set("max", max);
+            }
+        }
         "say" => v.set("text", args.plain.join(" ")),
         "seek" => v.set("to", first),
         "loop" => match (first, args.plain.get(1)) {
@@ -1232,6 +1331,9 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
                         Error::new("BAD_ARGS", "--since: an event id (last_id from before)")
                     })?;
                 v.set("since", since);
+            }
+            if let Some(owner) = args.value("owner") {
+                v.set("owner", owner);
             }
             for (option, key) in [("type", "types"), ("until", "until")] {
                 if let Some(list) = args.value(option) {
@@ -1336,10 +1438,8 @@ fn answer_wait(spec: &Spec, args: &Args) -> Duration {
 
 fn to_viewer(spec: &Spec, args: &Args) -> Result<Value> {
     let request = request_args(spec, args)?;
-    let dir = proto::run_dir()?;
-    let viewer = proto::pick(&dir, args.viewer.as_deref())?;
     let cmd = spec.name.replace(' ', ".");
-    let mut answer = proto::request(&dir, &viewer, &cmd, request, answer_wait(spec, args))?;
+    let (viewer, mut answer) = recordings::ask(args, &cmd, request, answer_wait(spec, args))?;
     let mut words = HashMap::new();
     match spec.name {
         "events" => {
@@ -1421,9 +1521,7 @@ fn open_with_edit(spec: &Spec, args: &Args) -> Result<Value> {
     }
     let project = edit::load(&work_dir()?, args.value("edit").unwrap_or(""))?;
     request.set("edit", edit::Timeline::of(&project).to_json());
-    let dir = proto::run_dir()?;
-    let viewer = proto::pick(&dir, args.viewer.as_deref())?;
-    let opened = proto::request(&dir, &viewer, "open", request, answer_wait(spec, args))?;
+    let (viewer, opened) = recordings::ask(args, "open", request, answer_wait(spec, args))?;
     // What an EDL's preview leaves out is in its render: not said here.
     let mut warnings: Vec<Value> = project
         .warnings
@@ -1524,8 +1622,7 @@ fn snapshot(spec: &Spec, args: &Args) -> Result<Value> {
         "snapshot"
     };
     let dir = proto::run_dir()?;
-    let viewer = proto::pick(&dir, args.viewer.as_deref())?;
-    let shot = proto::request(&dir, &viewer, cmd, request, Duration::from_secs(60))?;
+    let (viewer, shot) = recordings::ask(args, cmd, request, Duration::from_secs(60))?;
     // A page's region is in CSS pixels; its picture, in the device's.
     let dpr = shot
         .get("viewport")
@@ -1685,7 +1782,7 @@ fn status(args: &Args) -> Result<Value> {
                 )
         })
         .collect();
-    let picked = proto::pick(&dir, args.viewer.as_deref());
+    let picked = recordings::pick_viewer(&dir, args);
     let viewer = match &picked {
         Ok(v) => proto::request(&dir, v, "status", Value::obj(), Duration::from_secs(5)).ok(),
         Err(_) => None,
@@ -1790,7 +1887,14 @@ mod tests {
             .map(|s| s.name.replace(' ', "."))
             .filter(|n| {
                 ![
-                    "guide", "view", "probe", "frames", "sheet", "snapshot", "schema",
+                    "guide",
+                    "view",
+                    "probe",
+                    "frames",
+                    "sheet",
+                    "snapshot",
+                    "schema",
+                    "record.run",
                 ]
                 .contains(&n.as_str())
                     && !n.starts_with("edit.")
@@ -1801,6 +1905,7 @@ mod tests {
         }
         assert!(group_usage("web").contains("web wait-for"));
         assert!(group_usage("edit").contains("edit render"));
+        assert!(group_usage("record").contains("record run"));
         for (name, _, schema) in SCHEMAS {
             let schema = json::parse(schema).unwrap_or_else(|e| panic!("schema {name}: {e}"));
             assert!(schema.get_str("$schema").is_some(), "{name}");

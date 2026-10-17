@@ -14,14 +14,17 @@
 //! snapshot, a web command) is kept with its connection and answered when
 //! that comes or its time is up.
 
+mod compare;
 mod frames;
 mod input;
 mod layout;
 mod pages;
 mod player;
 mod pointing;
+mod record;
 mod screen;
 mod seekbar;
+mod sharing;
 mod watch;
 mod web;
 
@@ -161,6 +164,10 @@ struct Source {
     /// An edit's preview: where each clip lands, to say where a time of
     /// it is in the footage.
     edit: Option<edit::Timeline>,
+    /// The session that opened it (only it drives it), and its owner's
+    /// name for the label.
+    session: Option<String>,
+    owner: Option<String>,
 }
 
 impl Source {
@@ -255,6 +262,7 @@ impl Source {
             .with("height", self.size.1)
             .with("hwdec", self.hwdec.as_deref())
             .with("focused", focused)
+            .with("owner", self.owner.as_deref())
             .with("visible", visible);
         v.set("frame", self.frame());
         v.set(
@@ -287,6 +295,7 @@ enum WaitFor {
         since: u64,
         types: Vec<String>,
         source: Option<String>,
+        owner: Option<String>,
         until: Vec<String>,
     },
     /// `open`: the first frame.
@@ -476,6 +485,11 @@ pub fn run(options: Options) -> Result<()> {
         drag: None,
         scrubbing: None,
         range_from: None,
+        sessions: Vec::new(),
+        recordings: Vec::new(),
+        finished: Vec::new(),
+        auto_stops: Vec::new(),
+        compare: None,
         points_dir,
         quit: false,
         dirty: true,
@@ -606,6 +620,15 @@ struct Viewer {
     scrubbing: Option<(u64, f64)>,
     /// A range the human started (`i`): its source and time.
     range_from: Option<(u64, f64)>,
+    /// The sessions this viewer gave: token and owner's name.
+    sessions: Vec<(String, String)>,
+    /// Recordings under way; those that stopped by themselves (their
+    /// --max), for `record stop`; and the jobs finishing those.
+    recordings: Vec<record::Recording>,
+    finished: Vec<(u64, Result<Value>)>,
+    auto_stops: Vec<(u64, u64)>,
+    /// Two sources side by side, before and after.
+    compare: Option<compare::Compare>,
     /// Where points' pictures go: `.pepper/points/` in the project.
     points_dir: PathBuf,
     quit: bool,
@@ -651,6 +674,8 @@ impl Viewer {
             self.expire_waits();
             self.expire_points();
             self.pump_scrubs();
+            self.end_long_recordings();
+            self.sync_drift();
             self.reload_watched();
             if let Some((_, at)) = &self.flash
                 && at.elapsed() >= FLASH
@@ -717,8 +742,14 @@ impl Viewer {
             cols: self.size.cols,
             rows: self.size.rows.saturating_sub(2),
         };
-        let mode = if self.zoom { Mode::Single } else { self.mode };
-        let shown = layout::visible(mode, self.sources.len(), self.focus);
+        // Comparing: the two, side by side (z still zooms one).
+        let (mode, shown) = match (self.compare_pair(), self.zoom) {
+            (Some((a, b)), false) => (Mode::SplitH, vec![a, b]),
+            _ => {
+                let mode = if self.zoom { Mode::Single } else { self.mode };
+                (mode, layout::visible(mode, self.sources.len(), self.focus))
+            }
+        };
         let tiles = layout::tiles(mode, shown.len(), area, self.cell());
         let cell = self.cell();
         self.tiles = shown
@@ -806,7 +837,24 @@ impl Viewer {
             let (row, col) = (at.row.saturating_sub(1).max(tile.row), at.col.max(tile.col));
             let width = tile.cols.saturating_sub(col - tile.col);
             let focused = self.focus == Some(i);
-            let mut label = format!(" {} {}  {}", n + 1, source.name, source.status());
+            let owner = source
+                .owner
+                .as_deref()
+                .map(|o| format!(" ({o})"))
+                .unwrap_or_default();
+            let role = self
+                .compare_role(source.sid)
+                .map(|r| format!(" [{r}]"))
+                .unwrap_or_default();
+            let mut label = format!(
+                " {} {}{owner}{role}  {}",
+                n + 1,
+                source.name,
+                source.status()
+            );
+            if let Some(secs) = self.recording(source.sid) {
+                label += &format!("  ● REC {}", text::short_clock(secs));
+            }
             if let Some(web) = &source.web {
                 label += &web.label();
             } else if let Some(t) = self.held_time(source.sid).or(source.time_pos) {
@@ -854,7 +902,7 @@ impl Viewer {
         if rows >= 2 {
             let say_row = &mut out[rows as usize - 2];
             match &self.say {
-                Some(say) => say_row.put(0, cols, &format!(" agent: {say}"), screen::AGENT),
+                Some(say) => say_row.put(0, cols, &format!(" {say}"), screen::AGENT),
                 None if self.sources.is_empty() => {}
                 None => say_row.put(0, cols, " (the agent hasn't said anything)", screen::DIM),
             }
@@ -1019,6 +1067,7 @@ impl Viewer {
             Key::Char('n') => self.start_note(),
             Key::Char('y') => self.verdict(true),
             Key::Char('x') => self.verdict(false),
+            Key::Char('d') if self.comparing_pictures() => self.toggle_difference(),
             Key::Char('d') => self.ask_delete(),
             Key::Char('<') => self.jump_mark(false),
             Key::Char('>') => self.jump_mark(true),
@@ -1106,6 +1155,9 @@ impl Viewer {
             .with("source", name.as_str())
             .with("kind", source.kind);
         source.origin(&mut event);
+        if let Some(pair) = self.compare_json(source.sid) {
+            event.set("compare", pair);
+        }
         if let Some(t) = source.time_pos.filter(|_| source.web.is_none()) {
             source.at_time(t, &mut event);
         }
@@ -1224,6 +1276,11 @@ impl Viewer {
         let id = self.next_event;
         self.next_event += 1;
         let mut full = Value::obj().with("id", id);
+        // Whose source it's about, when it's someone's.
+        let owner = event
+            .get_str("source")
+            .and_then(|name| self.sources.iter().find(|s| s.name == name))
+            .and_then(|s| s.owner.clone());
         if let Value::Obj(members) = event {
             for (key, value) in members {
                 if key == "type" {
@@ -1231,6 +1288,11 @@ impl Viewer {
                     full.set("at", sys::iso_time(sys::now()));
                 } else {
                     full.set(&key, value);
+                    if key == "source"
+                        && let Some(owner) = &owner
+                    {
+                        full.set("owner", owner.as_str());
+                    }
                 }
             }
         }
@@ -1254,6 +1316,7 @@ impl Viewer {
             types,
             source,
             until,
+            owner,
         } = what
         else {
             return (Vec::new(), false);
@@ -1272,7 +1335,10 @@ impl Viewer {
                 || ((types.is_empty() || types.iter().any(|t| t == kind))
                     && source
                         .as_deref()
-                        .is_none_or(|s| event.get_str("source") == Some(s)));
+                        .is_none_or(|s| event.get_str("source") == Some(s))
+                    && owner
+                        .as_deref()
+                        .is_none_or(|o| event.get_str("owner") == Some(o)));
             if wanted && out.len() < MAX_EVENTS_ANSWERED {
                 out.push(event.clone());
             }
@@ -1442,6 +1508,7 @@ impl Viewer {
                 }
                 self.on_restart(sid);
                 self.seek_done(i);
+                self.sync_seek(sid);
             }
             Some("end-file") if line.get_str("reason") == Some("error") => {
                 let source = &mut self.sources[i];
@@ -1518,6 +1585,10 @@ impl Viewer {
             _ => {}
         }
         self.dirty = true;
+        if name == "pause" {
+            let sid = self.sources[i].sid;
+            self.sync_pause(sid);
+        }
     }
 
     fn on_restart(&mut self, sid: u64) {
@@ -1602,9 +1673,29 @@ impl Viewer {
     fn on_request(&mut self, req: Request) {
         self.note(&format!("request {} {}", req.cmd, req.args.to_line()));
         let args = req.args.clone();
+        // A session this viewer never gave (or gave before it started
+        // again); a new one may still be asked for.
+        if let Some(token) = args.get_str("session")
+            && self.session_owner(token).is_none()
+            && !matches!(req.cmd.as_str(), "session.new" | "status")
+        {
+            return req.answer(Err(sharing::no_session()));
+        }
         let result = match req.cmd.as_str() {
             "status" => Ok(self.status()),
-            "sources" => Ok(Value::obj().with("sources", self.sources_json())),
+            "sources" => {
+                let owner = args.get_str("owner");
+                let list: Vec<Value> = self
+                    .sources_json()
+                    .into_iter()
+                    .filter(|s| owner.is_none_or(|o| s.get_str("owner") == Some(o)))
+                    .collect();
+                Ok(Value::obj().with("sources", list))
+            }
+            "session.new" => self.new_session(&args),
+            "record.start" => self.record_start(&args),
+            "record.stop" => return self.record_stop(req),
+            "compare" => self.set_compare(&args),
             "open" | "web.open" => return self.open(req),
             "close" => self.close(&args),
             "layout" => self.set_layout(&args),
@@ -1710,6 +1801,9 @@ impl Viewer {
                     )
                 });
         }
+        if let Some(i) = self.own_source(args, |_| true) {
+            return Ok(i);
+        }
         self.focused()
             .or((self.sources.len() == 1).then_some(0))
             .ok_or_else(|| Error::new("NO_SOURCE", "no source is open"))
@@ -1731,7 +1825,8 @@ impl Viewer {
         }
     }
 
-    /// The source a request names, ready, and with a timeline.
+    /// The source a request names, ready, and with a timeline; the request's
+    /// to drive.
     fn pick_playable(&self, args: &Value) -> Result<usize> {
         let i = self.pick(args)?;
         if self.sources[i].web.is_some() {
@@ -1741,6 +1836,7 @@ impl Viewer {
             )
             .hint("Drive a page with `pepper-agent web …` (click, scroll, goto); see `pepper-agent guide`."));
         }
+        self.check_owner(i, args)?;
         self.pick_ready(args)
     }
 
@@ -1760,16 +1856,22 @@ impl Viewer {
         if kind == "web" {
             return self.start_web(args);
         }
-        if kind != "media" {
-            return Err(Error::new(
-                "UNSUPPORTED",
-                format!(
-                    "this viewer shows media only, not {:?}",
-                    text::inert(kind, 20)
-                ),
-            ));
-        }
+        // A recording `play` shows is a video like any other, so labelled.
+        let kind: &'static str = match kind {
+            "media" => "media",
+            "recording" => "recording",
+            other => {
+                return Err(Error::new(
+                    "UNSUPPORTED",
+                    format!(
+                        "this viewer shows media only, not {:?}",
+                        text::inert(other, 20)
+                    ),
+                ));
+            }
+        };
         check_target(target)?;
+        let (session, owner) = self.claim(args)?;
         let edit = args
             .get("edit")
             .map(edit::Timeline::from_json)
@@ -1787,6 +1889,7 @@ impl Viewer {
         }
         if let Some(i) = name.and_then(|n| self.sources.iter().position(|s| s.name == n))
             && self.sources[i].player.is_some()
+            && self.check_owner(i, args).map(|_| true)?
         {
             // The same name again: the new target, in the same box.
             let source = &mut self.sources[i];
@@ -1814,6 +1917,7 @@ impl Viewer {
         }
         if let Some(i) = name.and_then(|n| self.sources.iter().position(|s| s.name == n)) {
             // Its player ended: it goes, and a new one comes.
+            self.check_owner(i, args)?;
             self.remove_source(i);
         }
         if self.sources.len() >= MAX_SOURCES {
@@ -1841,7 +1945,7 @@ impl Viewer {
         self.sources.push(Source {
             sid,
             name,
-            kind: "media",
+            kind,
             target: target.to_owned(),
             token,
             player: Some(player),
@@ -1859,6 +1963,8 @@ impl Viewer {
             log: Vec::new(),
             web: None,
             edit,
+            session,
+            owner,
             fps: None,
             scrub: seekbar::Scrub::default(),
         });
@@ -1930,6 +2036,14 @@ impl Viewer {
             Some(f) if f > i => Some(f - 1),
             f => f,
         };
+        if self
+            .compare
+            .as_ref()
+            .is_some_and(|c| c.a == source.sid || c.b == source.sid)
+        {
+            self.compare = None;
+        }
+        self.recordings.retain(|r| r.sid != source.sid);
         if self.sources.len() < 2 {
             self.zoom = false;
         }
@@ -1951,6 +2065,7 @@ impl Viewer {
                     format!("no source is called {:?}", text::inert(name, 64)),
                 )
             })?;
+        self.check_owner(i, args)?;
         self.remove_source(i);
         Ok(Value::obj()
             .with("closed", name)
@@ -1964,6 +2079,7 @@ impl Viewer {
                 "layout: one of auto, single, split-h, split-v, grid",
             )
         })?;
+        self.end_compare();
         self.mode = mode;
         self.zoom = false;
         self.relayout();
@@ -1990,7 +2106,12 @@ impl Viewer {
             .unwrap_or("")
             .replace(['\n', '\r', '\t'], " ");
         let said = text::inert(said.trim(), MAX_SAY);
-        self.say = (!said.is_empty()).then_some(said);
+        // Whose line it is: the session's owner, when there's one.
+        let who = args
+            .get_str("session")
+            .and_then(|s| self.session_owner(s))
+            .unwrap_or("agent");
+        self.say = (!said.is_empty()).then(|| format!("{who}: {said}"));
         self.dirty = true;
         Ok(Value::obj().with("say", self.say.as_deref()))
     }
@@ -2082,6 +2203,7 @@ impl Viewer {
                 types: list("types")?,
                 source: args.get_str("source").map(str::to_owned),
                 until: list("until")?,
+                owner: args.get_str("owner").map(str::to_owned),
             };
             Ok((what, wait))
         })();

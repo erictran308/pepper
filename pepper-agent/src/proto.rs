@@ -69,6 +69,10 @@ pub const COMMANDS: &[&str] = &[
     "web.dom",
     "web.a11y",
     "web.eval",
+    "session.new",
+    "record.start",
+    "record.stop",
+    "compare",
 ];
 
 /// The folder the viewers' sockets and records are in, made if need be:
