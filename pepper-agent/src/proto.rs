@@ -19,7 +19,6 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -81,27 +80,7 @@ pub const COMMANDS: &[&str] = &[
 /// a folder of this user's, not a link, that no one else can open.
 pub fn run_dir() -> Result<PathBuf> {
     let dir = sys::user_temp_dir().join(format!("pepper-agent-{}", sys::uid()));
-    let fail = |what: String| Error::new("FAILED", what);
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) => {
-            if !meta.is_dir() || meta.file_type().is_symlink() {
-                return Err(fail(format!("{} isn't a folder", dir.display())));
-            }
-            if meta.uid() != sys::uid() {
-                return Err(fail(format!("{} isn't yours", dir.display())));
-            }
-            if meta.mode() & 0o077 != 0 {
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-                    .map_err(|e| fail(format!("{}: {e}", dir.display())))?;
-            }
-        }
-        Err(_) => {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(&dir)
-                .map_err(|e| fail(format!("cannot make {}: {e}", dir.display())))?;
-        }
-    }
+    crate::files::own_dir(&dir).map_err(|e| Error::new("FAILED", e.to_string()))?;
     Ok(dir)
 }
 

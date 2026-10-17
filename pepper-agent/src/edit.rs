@@ -1424,9 +1424,8 @@ pub fn render_args(
 /// exists outside `.pepper/` only with --overwrite.
 fn render_path(work: &Path, project: &Project, ask: &RenderAsk) -> Result<PathBuf> {
     let Some(given) = &ask.out else {
-        let dir = work.join("renders");
-        files::private_dir(&dir)
-            .map_err(|e| Error::new("FAILED", format!("{}: {e}", dir.display())))?;
+        let dir =
+            files::sub_dir(work, &["renders"]).map_err(|e| Error::new("FAILED", e.to_string()))?;
         let draft = if ask.quality == Quality::Draft {
             ".draft"
         } else {
@@ -1447,9 +1446,15 @@ fn render_path(work: &Path, project: &Project, ask: &RenderAsk) -> Result<PathBu
             format!("-o {shown}: a .mp4, .m4v or .mov file"),
         ));
     }
-    if !out.parent().is_some_and(Path::is_dir) {
+    // Its folder as it is (no `..`, no links): `.pepper/../x.mp4` is outside.
+    let (Some(folder), Some(name)) = (
+        out.parent().and_then(|p| p.canonicalize().ok()),
+        out.file_name(),
+    ) else {
         return Err(Error::new("NOT_FOUND", format!("no folder for {shown}")));
-    }
+    };
+    let out = folder.join(name);
+    let inside = work.canonicalize().is_ok_and(|w| out.starts_with(w));
     if let Ok(meta) = std::fs::metadata(&out) {
         if meta.is_dir() {
             return Err(Error::new("BAD_ARGS", format!("{shown} is a folder")));
@@ -1464,7 +1469,7 @@ fn render_path(work: &Path, project: &Project, ask: &RenderAsk) -> Result<PathBu
             )
             .hint("Source media is never written over: choose another -o."));
         }
-        if !ask.overwrite && !out.starts_with(work) {
+        if !ask.overwrite && !inside {
             return Err(Error::new("BAD_ARGS", format!("{shown} already exists")).hint(
                 "Choose another -o, or pass --overwrite to replace it (only if the user's fine with that).",
             ));
@@ -1512,6 +1517,7 @@ pub fn render(work: &Path, project: &Project, ask: &RenderAsk) -> Result<Value> 
         }
     }
     let part = out.with_file_name(format!("{prefix}{}", std::process::id()));
+    files::make_way(&part).map_err(|e| Error::new("FAILED", format!("{}: {e}", part.display())))?;
     let args = render_args(project, &part, format, ask.quality, ask.codec);
     let total = project.duration();
     let started = Instant::now();

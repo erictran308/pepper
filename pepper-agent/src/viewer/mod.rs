@@ -415,9 +415,12 @@ pub fn run(options: Options) -> Result<()> {
         None => std::env::current_dir(),
     }
     .map_err(|e| Error::new("FAILED", format!("the project folder: {e}")))?;
+    // Not one a project came with that leads elsewhere.
     let events_file = files::pepper_dir(&project, &[])
         .map(|d| d.join("events.jsonl"))
-        .unwrap_or_else(|_| dir.join(format!("{id}.events.jsonl")));
+        .ok()
+        .filter(|f| files::plain_or_none(f))
+        .unwrap_or_else(|| dir.join(format!("{id}.events.jsonl")));
     let shots = dir.join(format!("{id}-shots"));
     files::private_dir(&shots)
         .map_err(|e| Error::new("FAILED", format!("{}: {e}", shots.display())))?;

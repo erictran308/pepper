@@ -180,20 +180,14 @@ pub fn hw_decodable(codec: &str) -> bool {
 
 /// The cache folder for a file.
 pub fn cache_dir(work: &Path, key: &str) -> Result<PathBuf> {
-    let dir = work.join("cache").join(key);
-    crate::files::private_dir(&dir)
-        .map_err(|e| Error::new("FAILED", format!("{}: {e}", dir.display())))?;
-    Ok(dir)
+    crate::files::sub_dir(work, &["cache", key]).map_err(|e| Error::new("FAILED", e.to_string()))
 }
 
 pub fn probe(work: &Path, file: &Path) -> Result<Probe> {
     let key = fingerprint(file)?;
     let dir = cache_dir(work, &key)?;
     let cached = dir.join("probe.json");
-    let json = match std::fs::read_to_string(&cached)
-        .ok()
-        .and_then(|t| json::parse(&t).ok())
-    {
+    let json = match crate::files::read_plain(&cached).and_then(|t| json::parse(&t).ok()) {
         Some(json) => json,
         None => {
             let json = probe_file(file)?;
@@ -518,8 +512,10 @@ pub fn frames(work: &Path, file: &Path, ask: &FramesAsk) -> Result<Value> {
             ));
             let (ffmpeg, file) = (ffmpeg.clone(), file.to_owned());
             Box::new(move || {
-                if !path.is_file() {
+                if !crate::files::is_plain(&path) {
                     let tmp = path.with_extension("tmp.png");
+                    crate::files::make_way(&tmp)
+                        .map_err(|e| Error::new("FAILED", e.to_string()))?;
                     let mut args = ffmpeg_frame_args(&file, t, size);
                     args.extend(["-update", "1", "-y"].map(String::from));
                     args.push(tmp.display().to_string());
@@ -627,7 +623,7 @@ pub fn sheet(work: &Path, file: &Path, ask: &SheetAsk) -> Result<Value> {
         .with("from", (from * 1000.0).round() / 1000.0)
         .with("to", (to * 1000.0).round() / 1000.0)
         .with("tiles", tiles);
-    if path.is_file() {
+    if crate::files::is_plain(&path) {
         return Ok(answer);
     }
 
@@ -667,6 +663,7 @@ pub fn sheet(work: &Path, file: &Path, ask: &SheetAsk) -> Result<Value> {
 /// Writes an RGB picture as a PNG, through ffmpeg.
 fn encode_png(ffmpeg: &Path, picture: &Picture, path: &Path) -> Result<()> {
     let tmp = path.with_extension("tmp.png");
+    crate::files::make_way(&tmp).map_err(|e| Error::new("FAILED", e.to_string()))?;
     let mut child = Command::new(ffmpeg)
         .args([
             "-nostdin",
@@ -759,6 +756,7 @@ pub fn shrink_png(
     filter += &format!("scale={}:{}:flags=lanczos", size.0, size.1);
     let ffmpeg = tool("ffmpeg")?;
     let tmp = out.with_extension("tmp.png");
+    crate::files::make_way(&tmp).map_err(|e| Error::new("FAILED", e.to_string()))?;
     let args: Vec<String> = ["-nostdin", "-v", "error", "-i"]
         .map(String::from)
         .into_iter()

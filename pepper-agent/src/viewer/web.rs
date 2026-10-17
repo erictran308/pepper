@@ -25,7 +25,11 @@ use crate::{files, media, text};
 
 /// A proxy that answers nothing: everything not bypassed fails to connect.
 const NO_PROXY: &str = "http://127.0.0.1:9";
-const LOCAL_ONLY: &str = "localhost;*.localhost;127.0.0.1;[::1]";
+/// What a page without --allow-remote reaches: this machine. `<-loopback>`
+/// takes away Chrome's own bypass, which would add link-local addresses
+/// (169.254/16, fe80::/10), out on the network; it goes first, as rules are
+/// read last to first.
+const LOCAL_ONLY: &str = "<-loopback>;localhost;*.localhost;127.0.0.0/8;[::1]";
 /// How long a navigation waits for the page's load event.
 const LOAD_WAIT: Duration = Duration::from_secs(30);
 const CONSOLE_KEPT: usize = 500;
@@ -1634,7 +1638,17 @@ impl Page {
                     .with("returnByValue", true),
             )
             .ok()?;
-        result_value(&answer).ok().filter(|v| !v.is_null())
+        // Made again here: the page's own script answered, and could have
+        // made its numbers objects with keys of its choosing.
+        let found = result_value(&answer).ok()?;
+        let number = |key: &str| found.get_num(key).filter(|n| n.is_finite() && *n >= 0.0);
+        Some(
+            Value::obj()
+                .with("file", clip(found.get_str("file")?, 300))
+                .with("line", number("line"))
+                .with("column", number("column"))
+                .with("from", found.get_str("from").map(|s| clip(s, 60))),
+        )
     }
 
     /// For a point the human made: what's there, a picture of the viewport

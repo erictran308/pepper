@@ -39,7 +39,7 @@ fn round3(t: f64) -> f64 {
 }
 
 fn read_json(path: &Path) -> Option<Value> {
-    json::parse(&std::fs::read_to_string(path).ok()?).ok()
+    json::parse(&files::read_plain(path)?).ok()
 }
 
 /// A cached answer, or `make`'s, kept.
@@ -369,7 +369,7 @@ pub fn transcribe(work: &Path, file: &Path, ask: &TranscribeAsk) -> Result<Value
         dir.join(format!("{stem}.json")),
         dir.join(format!("{stem}.srt")),
     );
-    let transcript = match read_json(&json_path).filter(|_| srt_path.is_file()) {
+    let transcript = match read_json(&json_path).filter(|_| files::is_plain(&srt_path)) {
         Some(t) => t,
         None => {
             let duration = probe.duration.unwrap_or(0.0);
@@ -458,6 +458,10 @@ fn run_whisper(
     let wav = dir.join(format!("audio-16k-{id}.wav"));
     let raw = dir.join(format!("whisper-{id}"));
     let raw_json = raw.with_extension("json");
+    for path in [&wav, &raw_json] {
+        files::make_way(path)
+            .map_err(|e| Error::new("FAILED", format!("{}: {e}", path.display())))?;
+    }
     // 16 kHz mono, what whisper reads.
     let mut list = args(&["-nostdin", "-v", "error", "-i"]);
     list.push(media::file_arg(file));
