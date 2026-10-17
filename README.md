@@ -113,6 +113,13 @@ In October 2026 everything Pepper adds, and tuitube's use of it, went through a 
 
 A second review, of the changes after that release, found one more: from a shell, mpv's own status line also printed a video's subtitles, unescaped, when there was no video picture (a sound-only file). A subtitle could change the tab's title or, with Ghostty's default `clipboard-write = allow`, set the clipboard. Fixed: mpv now prints nothing to the terminal, as above.
 
+A review of pepper-agent before its first release found four more, all fixed before its release:
+
+1. A project could come with links in its `.pepper/` folder, and the viewer wrote through them: your marks could be added to any file of yours, a shell's startup file among them.
+2. A camera's password could show in macOS's Now Playing.
+3. `--human` printed the names in a page's own data raw.
+4. A page kept to this machine could still reach link-local addresses on the network.
+
 Found a security problem in what Pepper adds? Please report it privately through [this repository's security advisories](https://github.com/erictran308/pepper/security/advisories/new), not in a public issue ([what's Pepper's](SECURITY.md)). Problems in Ghostty itself belong to [Ghostty](https://github.com/ghostty-org/ghostty/security).
 
 ## Build it yourself
