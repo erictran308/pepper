@@ -65,9 +65,8 @@ pub fn stop(args: &Args, source: Option<&str>) -> Result<Value> {
     }
     let (viewer, done) = ask(args, "record.stop", request, Duration::from_secs(90))?;
     let work = crate::work_dir()?;
-    let dir = work.join("recordings");
-    files::private_dir(&dir)
-        .map_err(|e| Error::new("FAILED", format!("{}: {e}", dir.display())))?;
+    let dir =
+        files::sub_dir(&work, &["recordings"]).map_err(|e| Error::new("FAILED", e.to_string()))?;
     let name = done.get_str("source").unwrap_or("source").to_owned();
     let stamp: String = sys::iso_time(sys::now())
         .chars()
@@ -151,6 +150,7 @@ fn take_raw(raw: &Path, out: &Path) -> Result<()> {
             "the viewer's recording isn't where it should be",
         ));
     }
+    files::make_way(out).map_err(|e| Error::new("FAILED", format!("{}: {e}", out.display())))?;
     if raw.extension().is_some_and(|e| e == "mkv") {
         // mpv answers before it has closed the file: until it stops growing.
         let mut last = None;

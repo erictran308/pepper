@@ -103,6 +103,9 @@ impl Player {
                 "--image-display-duration=inf",
                 // Seeks land on the frame asked for, not a keyframe.
                 "--hr-seek=yes",
+                // Not in Now Playing: its title can be a stream's address,
+                // password and all, and the media keys are the human's own.
+                "--input-media-keys=no",
             ])
             .env_remove("PEPPER_TOKEN")
             .stdin(Stdio::null())
@@ -125,10 +128,12 @@ impl Player {
                 loop {
                     match read_line(&mut reader, MAX_LINE) {
                         Ok(Some(line)) => {
-                            let line = crate::text::redact_urls(&crate::text::inert(
-                                line.trim_end(),
+                            // Redacted whole, then cut: a cut could fall in a
+                            // password and leave it unmarked.
+                            let line = crate::text::inert(
+                                &crate::text::redact_urls(line.trim_end()),
                                 MAX_LOG_LINE,
-                            ));
+                            );
                             if tx.send(Msg::Player(sid, Event::Log(line))).is_err() {
                                 return;
                             }

@@ -948,7 +948,7 @@ fn fail(error: &Error, human_output: bool) -> ExitCode {
             error.code,
             text::inert(&error.message, 2000)
         );
-        eprintln!("hint: {}", error.hint);
+        eprintln!("hint: {}", text::inert(&error.hint, 2000));
     } else {
         eprintln!("{}", error.to_json().to_line());
     }
@@ -962,6 +962,8 @@ fn fail(error: &Error, human_output: bool) -> ExitCode {
 /// A value as indented lines, for people.
 fn human(value: &Value, indent: usize) -> String {
     let pad = " ".repeat(indent);
+    // A page's object can name its keys too (web eval, a point's source).
+    let key = |k: &str| text::inert(k, 200);
     let scalar = |v: &Value| match v {
         Value::Null => "-".to_owned(),
         Value::Str(s) => text::inert(s, 2000),
@@ -970,16 +972,17 @@ fn human(value: &Value, indent: usize) -> String {
     let mut out = String::new();
     match value {
         Value::Obj(members) => {
-            for (key, v) in members {
+            for (name, v) in members {
+                let name = key(name);
                 match v {
                     Value::Obj(m) if !m.is_empty() => {
-                        out += &format!("{pad}{key}:\n{}", human(v, indent + 2))
+                        out += &format!("{pad}{name}:\n{}", human(v, indent + 2))
                     }
                     Value::Arr(items) if !items.is_empty() => {
-                        out += &format!("{pad}{key}:\n{}", human(v, indent + 2))
+                        out += &format!("{pad}{name}:\n{}", human(v, indent + 2))
                     }
-                    Value::Arr(_) => out += &format!("{pad}{key}: (none)\n"),
-                    _ => out += &format!("{pad}{key}: {}\n", scalar(v)),
+                    Value::Arr(_) => out += &format!("{pad}{name}: (none)\n"),
+                    _ => out += &format!("{pad}{name}: {}\n", scalar(v)),
                 }
             }
         }
@@ -1005,11 +1008,8 @@ fn work_dir() -> Result<PathBuf> {
     let here = std::env::current_dir().map_err(|e| Error::new("FAILED", e.to_string()))?;
     match files::pepper_dir(&here, &[]) {
         Ok(dir) => Ok(dir),
-        Err(_) => {
-            let dir = proto::run_dir()?.join("files");
-            files::private_dir(&dir).map_err(|e| Error::new("FAILED", e.to_string()))?;
-            Ok(dir)
-        }
+        Err(_) => files::sub_dir(&proto::run_dir()?, &["files"])
+            .map_err(|e| Error::new("FAILED", e.to_string())),
     }
 }
 
@@ -1240,9 +1240,7 @@ fn edit_preview(args: &Args) -> Result<Value> {
             .filter(|s| viewer::valid_name(s))
             .unwrap_or_else(|| "edit".into()),
     };
-    let dir = work.join("edits");
-    files::private_dir(&dir)
-        .map_err(|e| Error::new("FAILED", format!("{}: {e}", dir.display())))?;
+    let dir = files::sub_dir(&work, &["edits"]).map_err(|e| Error::new("FAILED", e.to_string()))?;
     let edl = dir.join(format!("{}.edl", files::name_part(&name)));
     files::write_private(&edl, edit::edl(&project).as_bytes())
         .map_err(|e| Error::new("FAILED", format!("{}: {e}", edl.display())))?;
@@ -1867,8 +1865,8 @@ fn snapshot(spec: &Spec, args: &Args) -> Result<Value> {
         .filter(char::is_ascii_digit)
         .take(14)
         .collect();
-    let out_dir = work_dir()?.join("snapshots");
-    files::private_dir(&out_dir).map_err(|e| Error::new("FAILED", e.to_string()))?;
+    let out_dir = files::sub_dir(&work_dir()?, &["snapshots"])
+        .map_err(|e| Error::new("FAILED", e.to_string()))?;
     let at = shot
         .get_num("time_pos")
         .map(|t| format!("-{}ms", (t * 1000.0).round() as u64))
