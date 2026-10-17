@@ -140,7 +140,8 @@ pub struct Probe {
     pub fps: Option<f64>,
 }
 
-fn ratio(text: &str) -> Option<f64> {
+/// `30000/1001` or `4:3`, as a number.
+pub fn ratio(text: &str) -> Option<f64> {
     let (a, b) = text.split_once(['/', ':'])?;
     let (a, b): (f64, f64) = (a.parse().ok()?, b.parse().ok()?);
     (a > 0.0 && b > 0.0).then(|| a / b)

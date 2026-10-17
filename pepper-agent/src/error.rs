@@ -8,6 +8,8 @@ pub struct Error {
     pub code: &'static str,
     pub message: String,
     pub hint: String,
+    /// INVALID_PROJECT's: every problem found, each `{"at", "problem"}`.
+    pub problems: Vec<Value>,
 }
 
 pub const NO_VIEWER_HINT: &str =
@@ -20,6 +22,7 @@ impl Error {
             code,
             message: message.into(),
             hint: hint(code).to_owned(),
+            problems: Vec::new(),
         }
     }
 
@@ -29,13 +32,14 @@ impl Error {
     }
 
     pub fn to_json(&self) -> Value {
-        Value::obj().with(
-            "error",
-            Value::obj()
-                .with("code", self.code)
-                .with("message", self.message.as_str())
-                .with("hint", self.hint.as_str()),
-        )
+        let mut error = Value::obj()
+            .with("code", self.code)
+            .with("message", self.message.as_str())
+            .with("hint", self.hint.as_str());
+        if !self.problems.is_empty() {
+            error.set("problems", self.problems.clone());
+        }
+        Value::obj().with("error", error)
     }
 
     /// From the `error` member a viewer answered with.
@@ -54,6 +58,11 @@ impl Error {
                 .get_str("hint")
                 .unwrap_or_else(|| hint(code))
                 .to_owned(),
+            problems: error
+                .get("problems")
+                .and_then(Value::arr)
+                .map(<[Value]>::to_vec)
+                .unwrap_or_default(),
         }
     }
 }
@@ -95,6 +104,10 @@ fn hint(code: &str) -> &'static str {
              the user to run another viewer (`pepper-agent view`) and pass --viewer <id>."
         }
         "MISSING_DEP" => "Install it (the message says how), then run the command again.",
+        "INVALID_PROJECT" => {
+            "Fix every one of `problems` (each says where, like clips[1].out), then run \
+             `pepper-agent edit validate` again. `pepper-agent schema edit` has the format."
+        }
         "UNSUPPORTED" => "Run `pepper-agent guide` for what this version does.",
         "TIMEOUT" => {
             "Nothing yet: run it again to keep waiting, or ask the user with `pepper-agent say`."

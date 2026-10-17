@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/erictran308/pepper/blob/pepper/pepper-agent/schemas/timeline.json",
+  "title": "pepper-agent edit timeline's answer",
+  "description": "Where each clip of a project is, in its file and in the output; with --at, where output times are in the footage. edit preview answers with the same clips.",
+  "type": "object",
+  "required": ["project", "output", "duration", "clips"],
+  "properties": {
+    "project": {"type": "string"},
+    "output": {"$ref": "#/$defs/output"},
+    "duration": {"type": "number", "description": "The output's length, in seconds."},
+    "duration_text": {"type": "string"},
+    "clips": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["clip", "src", "in", "out", "length", "start", "end"],
+        "properties": {
+          "clip": {"type": "integer", "minimum": 0, "description": "Its index in clips."},
+          "name": {"type": "string"},
+          "src": {"type": "string", "description": "Its file, an absolute path."},
+          "in": {"type": "number", "description": "Where it starts in its file."},
+          "out": {"type": "number", "description": "Where it ends in its file."},
+          "length": {"type": "number"},
+          "start": {"type": "number", "description": "Where it starts in the output."},
+          "end": {"type": "number", "description": "Where it ends in the output (the next clip's start)."},
+          "start_text": {"type": "string"},
+          "end_text": {"type": "string"},
+          "audio": {"type": "boolean", "description": "Whether its file has sound."},
+          "fade_in": {"type": "number"},
+          "fade_out": {"type": "number"}
+        }
+      }
+    },
+    "at": {
+      "type": "array",
+      "description": "--at: each output time, in the footage. A cut belongs to the clip after it.",
+      "items": {
+        "type": "object",
+        "required": ["time", "clip", "src", "src_time"],
+        "properties": {
+          "time": {"type": "number"},
+          "time_text": {"type": "string"},
+          "clip": {"type": "integer", "minimum": 0},
+          "clip_name": {"type": "string"},
+          "src": {"type": "string"},
+          "src_time": {"type": "number"},
+          "src_time_text": {"type": "string"},
+          "past_end": {"const": true, "description": "The time is after the output's end: the last clip's last moment is given."}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "output": {
+      "type": "object",
+      "properties": {
+        "width": {"type": "integer"},
+        "height": {"type": "integer"},
+        "fps": {"type": "number"},
+        "fit": {"enum": ["pad", "crop"]}
+      }
+    }
+  }
+}

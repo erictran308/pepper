@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/erictran308/pepper/blob/pepper/pepper-agent/schemas/edit.json",
+  "title": "pepper-agent edit project, version 1",
+  "description": "A cut: clips of files, one after another. `pepper-agent edit validate` checks it and lists every problem; `edit preview` shows it; `edit render` makes it. Anything not here is a problem, so a typo never goes unseen. edit validate, preview and timeline also read video-use's edl.json (github.com/browser-use/video-use) as it is: its ranges are the clips.",
+  "type": "object",
+  "required": ["pepper_edit", "clips"],
+  "additionalProperties": false,
+  "properties": {
+    "pepper_edit": {
+      "const": 1,
+      "description": "The format's version."
+    },
+    "output": {
+      "type": "object",
+      "description": "The render's frame. Left out, or any member left out: the first clip's size (made even), its frame rate, and pad.",
+      "additionalProperties": false,
+      "dependentRequired": {"width": ["height"], "height": ["width"]},
+      "properties": {
+        "width": {"type": "integer", "minimum": 16, "maximum": 8192, "multipleOf": 2},
+        "height": {"type": "integer", "minimum": 16, "maximum": 8192, "multipleOf": 2},
+        "fps": {
+          "description": "Frames a second, 1 to 240: 30, 29.97 or \"30000/1001\" (NTSC's decimal rates are taken as their exact fractions).",
+          "oneOf": [
+            {"type": "number", "minimum": 1, "maximum": 240},
+            {"type": "string", "pattern": "^[0-9]+[/:][0-9]+$"}
+          ]
+        },
+        "fit": {
+          "enum": ["pad", "crop"],
+          "default": "pad",
+          "description": "A clip of another shape: pad shows all of it with black bars; crop fills the frame and cuts its edges."
+        }
+      }
+    },
+    "clips": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 300,
+      "description": "In the order they play.",
+      "items": {"$ref": "#/$defs/clip"}
+    }
+  },
+  "$defs": {
+    "time": {
+      "description": "A time in the file: seconds (83.5) or as written (\"1:23.5\", \"00:01:23.500\").",
+      "oneOf": [
+        {"type": "number", "minimum": 0},
+        {"type": "string", "pattern": "^[0-9]+(:[0-5]?[0-9]){0,2}(\\.[0-9]+)?$"}
+      ]
+    },
+    "clip": {
+      "type": "object",
+      "required": ["src"],
+      "additionalProperties": false,
+      "properties": {
+        "src": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The file it's cut from: a path from the project file's folder, or absolute. It must have a picture. It's only read, never changed."
+        },
+        "in": {"$ref": "#/$defs/time", "description": "Where it starts in the file. Left out: 0."},
+        "out": {
+          "$ref": "#/$defs/time",
+          "description": "Where it ends in the file. Left out: the file's end. After in by a frame of the output at least, and not past the file's end."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "For people; marks on the preview give it as clip_name."
+        },
+        "audio": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The clip's sound. fade_in and fade_out together fit in the clip. A file without sound plays silence.",
+          "properties": {
+            "fade_in": {"type": "number", "minimum": 0, "maximum": 60, "description": "Seconds from silence at its start."},
+            "fade_out": {"type": "number", "minimum": 0, "maximum": 60, "description": "Seconds to silence at its end."}
+          }
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "pepper_edit": 1,
+      "output": {"width": 1920, "height": 1080, "fps": 30},
+      "clips": [
+        {"src": "raw/a.mp4", "in": "00:00:03.2", "out": "00:00:11.0", "name": "intro"},
+        {"src": "raw/b.mp4", "in": 40.0, "out": 52.5, "audio": {"fade_in": 0.2}}
+      ]
+    }
+  ]
+}

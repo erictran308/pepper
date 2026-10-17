@@ -264,6 +264,9 @@ impl Viewer {
                 cast: None,
                 box_px: None,
             }),
+            edit: None,
+            fps: None,
+            scrub: super::seekbar::Scrub::default(),
         });
         self.focus = Some(self.sources.len() - 1);
         self.record_dirty = true;

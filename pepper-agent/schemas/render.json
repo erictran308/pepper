@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/erictran308/pepper/blob/pepper/pepper-agent/schemas/render.json",
+  "title": "pepper-agent edit render's answer",
+  "description": "The rendered file and what to check it with. While it renders, progress comes on stderr as lines of {\"progress\": {\"step\": \"render\", \"done\": seconds, \"of\": seconds}}.",
+  "type": "object",
+  "required": ["path", "project", "quality", "encoder", "output", "expected_duration"],
+  "properties": {
+    "path": {"type": "string", "description": "The file made."},
+    "project": {"type": "string"},
+    "quality": {"enum": ["draft", "final"]},
+    "encoder": {"enum": ["h264_videotoolbox", "hevc_videotoolbox", "libx264", "libx265"]},
+    "output": {
+      "type": "object",
+      "properties": {
+        "width": {"type": "integer"},
+        "height": {"type": "integer"},
+        "fps": {"type": "number"},
+        "fit": {"enum": ["pad", "crop"]}
+      }
+    },
+    "duration": {"type": ["number", "null"], "description": "The file's length, as probed."},
+    "expected_duration": {"type": "number", "description": "The project's length."},
+    "size_bytes": {"type": ["integer", "null"]},
+    "took": {"type": "number", "description": "Seconds it took."},
+    "speed": {"type": "number", "description": "Seconds of video made a second."},
+    "sheet": {"type": ["string", "null"], "description": "A contact sheet of the render (PNG): look at it."},
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {"at": {"type": "string"}, "warning": {"type": "string"}}
+      }
+    }
+  }
+}
