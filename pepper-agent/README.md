@@ -25,13 +25,15 @@ The pane waits for an agent. When the agent opens something, it shows here, with
 | `space`, `,` `.`, `←` `→`, `↑` `↓` | A video: pause, a frame back or on, 5 s, 1 min (mpv's keys) |
 | the bar under a video, the wheel | Click or drag the bar to go anywhere (on a cut, its clips are marked on it); the wheel over a video steps a frame a notch. Paused, the label gives the time to the millisecond and the frame number (on a cut, the clip and the time in its file) |
 | `<`, `>` | A video: to your previous or next mark, note, point or range. Each shows as ◆ on the bar, a range as a span (on a cut that the agent revised, they keep their place in the footage; one on a moment that was cut out goes); paused on one, the bottom row shows what you wrote |
-| `d`, then `d` again | Delete the mark, note, point or range you're paused on (`d` once asks, any other key keeps it); the agent is told |
+| `d`, then `d` again | Delete the mark, note, point or range you're paused on (`d` once asks, any other key keeps it); the agent is told. Comparing two pictures, `d` shows their difference instead |
 | wheel, `↑` `↓`, Page Up/Down, `r` | A page: scroll, reload |
 | `Tab`, `1`–`4` | Focus another source |
 | `z` | Zoom the focused one to the whole pane, and back |
 | `q` | Quit (asks first if anything is open) |
 
 A page is shown as the agent drives it: your clicks point at things rather than click them. On a video, clicks on the picture point too; the bar under it is for seeking.
+
+A label says whose a source is when several agents share the viewer (`app (agent-2)`), `[before]` and `[after]` when an agent asks you to compare two, and `● REC` while one is being recorded. An agent shows you a demo it recorded as a video: `y` approves it.
 
 Several viewers can run, each in its own pane; an agent picks one with `--viewer <id>`. Your marks, points and notes are also kept in `.pepper/events.jsonl` in the folder the viewer started in (`--project DIR` for another), the points' pictures in `.pepper/points/`.
 
@@ -61,6 +63,10 @@ pepper-agent open edit/preview.mp4 --edit edit/edl.json    # with video-use: its
 pepper-agent web open http://localhost:5173 --name app   # your dev server, live
 pepper-agent say "Click anything that looks wrong, Enter when done"
 pepper-agent events --wait 300 --until done --since 0    # points: selector, crop, note
+pepper-agent record run demo.json --source app   # a demo: the page recorded while a script drives it
+pepper-agent play .pepper/recordings/app-….mp4   # shown to the human, for y or x
+pepper-agent compare v1.mp4 v2.mp4 --sync        # before and after, side by side, as one
+pepper-agent session new --owner agent-2         # several agents in one viewer: your own sources
 ```
 
 Every command prints one JSON object; errors are JSON on stderr with a `code` and a `hint` to act on, and a non-zero exit. `--human` prints for people. `pepper-agent <command> --help` has an example.
@@ -79,8 +85,11 @@ Every command prints one JSON object; errors are JSON on stderr with a `code` an
 | `web open`, `goto`, `reload`, `back` | A page, live: a dev server's address or an HTML file, at a device's size (`--device iphone-15`) |
 | `web click`, `type`, `press`, `scroll`, `hover`, `viewport`, `wait-for` | Drive it, in view of the human |
 | `web shot`, `console`, `errors`, `dom`, `a11y`, `eval` | See it: a PNG from the browser, its console, exceptions and failed requests, HTML, accessibility tree, JavaScript |
+| `record start`, `stop`, `run` | Recordings: a page as it shows (30 fps), a video's stretch that played, or a page while a script of steps drives it; `play <file>` shows one for approval |
+| `compare` | Before and after side by side, two videos locked together (`--sync`), two pictures' difference |
+| `session new` | A session for one of several agents in a viewer: what it opens is its own, labelled with its name |
 
-Files it makes go in `.pepper/` in the current folder (`snapshots/`, `cache/`, `points/`, `edits/`, `renders/`), which gets a `.gitignore` of its own. Pictures are at most 1568 px on their long side.
+Files it makes go in `.pepper/` in the current folder (`snapshots/`, `cache/`, `points/`, `edits/`, `renders/`, `recordings/`), which gets a `.gitignore` of its own. Pictures are at most 1568 px on their long side.
 
 ## With video-use
 
@@ -115,6 +124,8 @@ pepper-agent web click …                │ OSC 777;pepper;place (its own tty)
 - An edit project is checked whole before anything uses it: every member it doesn't know, every time out of its file and every missing file is listed at once. `edit preview` writes it as an mpv EDL in `.pepper/edits/` (each file's path length-prefixed, so nothing in a name is read as EDL syntax) and opens that as a source, with the clips' spans: the viewer uses them to say where a time of the cut is in the footage. `edit render` runs ffmpeg (VideoToolbox's encoder for a draft, x264 or x265 for final) into a hidden file next to the output, renamed once done; it never writes over a clip's file or the project, nor over a file outside `.pepper/` without `--overwrite`.
 - Text from outside (file names, tags, mpv's and ffmpeg's messages, a page's title, console and errors, the agent's `say`, the human's notes) is made inert before it's drawn: control and invisible characters are shown escaped, a row is cut to the pane, autowrap is off, and bracketed paste is on so a paste is never taken as keys. JSON output escapes them too.
 - The keys passed to a source are a fixed list (pause, seeks, frame steps, speed, volume, tracks): never mpv's console, screenshots or quit. `i` and `o` (mpv's stats and progress) are the viewer's, for ranges.
+- Recordings: a page's screencast frames go to an ffmpeg the viewer runs, the latest one every 1/30 s (Chrome sends a frame only when the page changes), encoded by VideoToolbox into the viewer's own folder; `record stop` moves the file into `.pepper/recordings/`. A video's recording is the stretch that played, cut from the file itself (a preview's, rendered from its cut), never a capture of the screen. `record run` takes only the verbs it knows, checked before anything runs.
+- Sessions: `session new` gives a random token (after the viewer's id, so a session's commands reach its viewer when a newer one runs); a source opened with it is that session's, and the viewer refuses another's commands that would drive, record or close it unless they say `force`. It keeps agents from stepping on each other by mistake, not out: they're the user's own programs, as the socket's peers are.
 - `said`, on events and answers: the transcript beside the edit or the footage (video-use's `edit/transcripts/<name>.json`: Scribe's word list, by the EDL's name for the source or the file's stem) read for the moment, by `pepper-agent` itself, not the viewer. Phrases break as video-use's `pack_transcripts.py` breaks them (0.5 s of silence, a new speaker); pauses are gaps of 0.15 s or more between words. Its text is made inert like the rest.
 
 It's Rust with no dependencies but the system's (ffmpeg and pepper-play are run, not linked), MIT licensed like the rest of Pepper.
@@ -126,4 +137,4 @@ cargo test                     # unit tests
 tests/integration.py           # the viewer in a pseudo-terminal, driven as an agent and a human
 ```
 
-The integration test runs the real viewer, pepper-play and mpv on generated clips (a hostile file name and tags among them) and Chrome on a local page (a hostile title and console), with a `PEPPER_PORT` no Pepper holds, so nothing shows: it checks the commands, the keys and the mouse, the events, what reaches the terminal, the pages kept to this machine, and the socket's refusals. Seeing the picture needs a test Pepper (`../CLAUDE.md`, Gotchas). `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture` times the web frames' decoding.
+The integration test runs the real viewer, pepper-play and mpv on generated clips (a hostile file name and tags among them) and Chrome on a local page (a hostile title and console), with a `PEPPER_PORT` no Pepper holds, so nothing shows: it checks the commands, the keys and the mouse, the events, what reaches the terminal, the pages kept to this machine, sessions, recordings and comparing, and the socket's refusals. Seeing the picture needs a test Pepper (`../CLAUDE.md`, Gotchas). `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture` times the web frames' decoding.
