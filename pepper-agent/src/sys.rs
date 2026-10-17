@@ -55,6 +55,19 @@ pub fn user_temp_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// Asks a process group to end (SIGTERM).
+pub fn terminate_group(pgid: u32) {
+    const SIGTERM: c_int = 15;
+    if let Ok(pgid) = c_int::try_from(pgid)
+        && pgid > 1
+    {
+        // SAFETY: a plain signal to a group of our own.
+        unsafe {
+            kill(-pgid, SIGTERM);
+        }
+    }
+}
+
 /// Whether a process with this pid runs (one of another user's counts).
 pub fn alive(pid: u32) -> bool {
     const EPERM: i32 = 1;

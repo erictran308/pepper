@@ -8,12 +8,14 @@
 //! the same pictures through files made from the source (`snapshot`,
 //! `frames`, `sheet`), and the human answers with events (`events`).
 
+mod analyze;
 mod cdp;
 mod edit;
 mod error;
 mod files;
 mod font;
 mod json;
+mod mcp;
 mod media;
 // pepper-play's own Mach client and surfaces (MIT, the same repository):
 // the viewer hands Pepper a web page's frames as pepper-play does a video's.
@@ -22,6 +24,7 @@ mod media;
 mod pepper;
 mod proto;
 mod recordings;
+mod skill;
 #[allow(dead_code)]
 #[path = "../../pepper-play/src/surface.rs"]
 mod surface;
@@ -299,6 +302,36 @@ const SPECS: &[Spec] = &[
         about: "One contact sheet of a file (or from..to): evenly spaced frames, each with its time on it, and the list of times. The cheapest way to look at footage. Needs no viewer.",
         example: "pepper-agent sheet raw/take1.mp4 --from 1:00 --to 2:00",
         values: &["from", "to", "cols", "rows", "max"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "scenes",
+        usage: "scenes <file> [--threshold 0.3]",
+        about: "Where a file's picture cuts to another shot, and the scenes between the cuts, each cut with how sure it is (0 to 1); a lower --threshold finds more. Takes about as long as decoding the file, once. Needs no viewer.",
+        example: "pepper-agent scenes raw/take1.mp4",
+        values: &["threshold"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "silences",
+        usage: "silences <file> [--db -35] [--min 0.5]",
+        about: "Where a file is quiet (under --db for --min seconds or more), and the stretches with sound between them: where cuts can go, and what to keep. Needs no viewer.",
+        example: "pepper-agent silences raw/take1.mp4 --min 0.8",
+        values: &["db", "min"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "transcribe",
+        usage: "transcribe <file> [--lang auto] [--model PATH]",
+        about: "What's said in a file: segments, and every word with its time, as JSON, with an .srt beside it; the human's marks on the file then say what was being said. Runs whisper.cpp on this Mac (brew install whisper.cpp, and a model: it says how to get one); nothing is sent anywhere. Needs no viewer.",
+        example: "pepper-agent transcribe raw/take1.mp4 --lang en",
+        values: &["lang", "model"],
         flags: &[],
         min: 1,
         max: 1,
@@ -583,6 +616,26 @@ const SPECS: &[Spec] = &[
         min: 1,
         max: 2,
     },
+    Spec {
+        name: "install-skill",
+        usage: "install-skill [--dir DIR]",
+        about: "Installs this guide as an agent skill (the Agent Skills format) in DIR/pepper/SKILL.md, DIR being ~/.claude/skills or another agent's skills folder, so agents there know Pepper without being told. Running it again updates it; --force replaces another skill of that name.",
+        example: "pepper-agent install-skill --dir ~/.codex/skills",
+        values: &["dir"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
+        name: "mcp",
+        usage: "mcp",
+        about: "Serves every command as an MCP tool over stdio, for agents that take tools rather than a shell. Each call runs the command; pictures come back as images as well as paths. The agent's client starts it, as in the example.",
+        example: "pepper-agent mcp   # started by the agent's client: claude mcp add pepper -- pepper-agent mcp",
+        values: &[],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
 ];
 
 const GROUPS: &[(&str, &[&str])] = &[
@@ -599,7 +652,17 @@ const GROUPS: &[(&str, &[&str])] = &[
         "Playback",
         &["play", "pause", "toggle", "seek", "loop", "where", "review"],
     ),
-    ("Footage, from the file", &["probe", "frames", "sheet"]),
+    (
+        "Footage, from the file",
+        &[
+            "probe",
+            "frames",
+            "sheet",
+            "scenes",
+            "silences",
+            "transcribe",
+        ],
+    ),
     (
         "Editing (a cut as a JSON project)",
         &[
@@ -642,6 +705,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "compare",
         ],
     ),
+    ("Other ways in for agents", &["install-skill", "mcp"]),
 ];
 
 fn usage() -> String {
@@ -1008,6 +1072,30 @@ fn run(spec: &Spec, args: &Args) -> Result<Value> {
             };
             media::sheet(&work_dir()?, &file, &ask)
         }
+        "scenes" => {
+            let file = media::local_file(&args.plain[0])?;
+            let threshold = number_option(args, "threshold")?.unwrap_or(0.3);
+            analyze::scenes(&work_dir()?, &file, threshold)
+        }
+        "silences" => {
+            let file = media::local_file(&args.plain[0])?;
+            let db = number_option(args, "db")?.unwrap_or(-35.0);
+            let min = number_option(args, "min")?.unwrap_or(0.5);
+            analyze::silences(&work_dir()?, &file, db, min)
+        }
+        "transcribe" => {
+            let file = media::local_file(&args.plain[0])?;
+            let ask = analyze::TranscribeAsk {
+                lang: args.value("lang").unwrap_or("auto"),
+                model: args.value("model"),
+            };
+            analyze::transcribe(&work_dir()?, &file, &ask)
+        }
+        "install-skill" => skill::install(args.value("dir"), args.force),
+        "mcp" => {
+            mcp::serve()?;
+            Ok(Value::Null)
+        }
         "snapshot" | "web shot" => {
             let mut shot = snapshot(spec, args)?;
             add_said(&mut shot, &mut HashMap::new());
@@ -1064,6 +1152,20 @@ fn run(spec: &Spec, args: &Args) -> Result<Value> {
 
 fn round3(t: f64) -> f64 {
     (t * 1000.0).round() / 1000.0
+}
+
+/// A number option (`--db -35`, `-35dB` too).
+fn number_option(args: &Args, name: &str) -> Result<Option<f64>> {
+    args.value(name)
+        .map(|v| {
+            v.trim()
+                .trim_end_matches(['d', 'D', 'b', 'B'])
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.is_finite())
+                .ok_or_else(|| Error::new("BAD_ARGS", format!("--{name}: a number")))
+        })
+        .transpose()
 }
 
 /// `schema`: the list, or one.
@@ -1582,8 +1684,8 @@ fn to_viewer(spec: &Spec, args: &Args) -> Result<Value> {
 /// Adds `said` to a time of a file (an event, `where`'s answer, a
 /// snapshot's), and `to_said` to a range's end: what was being said then
 /// and the pauses around it, from a word-level transcript beside the edit
-/// or the footage (video-use's).
-fn add_said(v: &mut Value, cache: &mut HashMap<PathBuf, Option<transcript::Words>>) {
+/// or the footage (video-use's), or one `transcribe` made.
+fn add_said(v: &mut Value, cache: &mut Said) {
     for (prefix, time, out) in [("", "time", "said"), ("to_", "to", "to_said")] {
         if let Some(said) = said_at(v, prefix, time, cache) {
             v.set(out, said);
@@ -1591,12 +1693,10 @@ fn add_said(v: &mut Value, cache: &mut HashMap<PathBuf, Option<transcript::Words
     }
 }
 
-fn said_at(
-    v: &Value,
-    prefix: &str,
-    time: &str,
-    cache: &mut HashMap<PathBuf, Option<transcript::Words>>,
-) -> Option<Value> {
+/// Transcripts already read, by edit project and file.
+type Said = HashMap<(Option<PathBuf>, PathBuf), Option<(PathBuf, transcript::Words)>>;
+
+fn said_at(v: &Value, prefix: &str, time: &str, cache: &mut Said) -> Option<Value> {
     let project = v.get_str("project").map(PathBuf::from);
     let src = v.get_str(&format!("{prefix}src"));
     let src_time = v.get_num(&format!("{prefix}src_time"));
@@ -1614,11 +1714,16 @@ fn said_at(
             (PathBuf::from(file), t)
         }
     };
-    let path = edit::transcript_for(project.as_deref(), &src)?;
-    let words = cache
-        .entry(path.clone())
-        .or_insert_with(|| transcript::Words::load(&path));
-    let mut said = words.as_ref()?.at(t)?;
+    let found = cache
+        .entry((project.clone(), src.clone()))
+        .or_insert_with(|| {
+            let path = edit::transcript_for(project.as_deref(), &src)
+                .or_else(|| analyze::transcript_of(&src))?;
+            let words = transcript::Words::load(&path)?;
+            Some((path, words))
+        });
+    let (path, words) = found.as_ref()?;
+    let mut said = words.at(t)?;
     said.set("transcript", path.display().to_string());
     Some(said)
 }
@@ -1872,6 +1977,20 @@ fn deps() -> Value {
                 "brew install yt-dlp (only for web addresses)",
             ),
         )
+        .with(
+            "whisper",
+            found(
+                media::which("whisper-cli"),
+                "brew install whisper.cpp (only for transcribe)",
+            ),
+        )
+        .with(
+            "whisper_model",
+            found(
+                analyze::model_found(),
+                "pepper-agent transcribe says how to get one (only for transcribe; ask the human first: about 550 MB)",
+            ),
+        )
 }
 
 fn status(args: &Args) -> Result<Value> {
@@ -2008,6 +2127,11 @@ mod tests {
                     "probe",
                     "frames",
                     "sheet",
+                    "scenes",
+                    "silences",
+                    "transcribe",
+                    "install-skill",
+                    "mcp",
                     "snapshot",
                     "schema",
                     "record.run",

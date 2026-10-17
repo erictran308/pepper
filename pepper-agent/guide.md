@@ -29,7 +29,8 @@ pepper-agent status
   can't show anything. Ask the human: *"Open a split in Pepper (Cmd-D) and
   run: pepper-agent view"*. Then run `status` again until `viewer` is there.
 - `in_pepper` false only means your own shell isn't a Pepper tab; a viewer
-  can still run, and `probe`, `frames` and `sheet` work anywhere.
+  can still run, and the commands on files (`probe`, `sheet`, `transcribe`…)
+  work anywhere.
 - `deps` lists what's missing, with the install command (`chrome` for pages).
   `next` says what to do now. If your commands run in a sandbox, it must let
   them connect to the Unix sockets in `socket_dir`.
@@ -63,6 +64,7 @@ The cut is a JSON project you write (`pepper-agent schema edit` has it all):
 
 ```sh
 pepper-agent sheet raw/a.mp4                  # each file: probe, sheet, frames to pick in and out
+pepper-agent transcribe raw/a.mp4             # what's said, each word timed; silences, scenes: where to cut
 pepper-agent edit validate cut.json           # every problem at once, each with where (clips[1].out)
 pepper-agent edit preview cut.json            # the cut in the viewer, nothing rendered
 pepper-agent say "The rough cut: m marks what to change, n says how, y if it's good, Enter when done"
@@ -79,6 +81,15 @@ preview` again (same box), `review` the changed part, and ask again. The
 preview plays each file as it is: the output's size and rate and the fades
 are made by `edit render` (draft by default: quick, into `.pepper/renders/`;
 never over a source). Look at its `sheet`; `open` it to show the human.
+
+Cut on what's said: `transcribe` answers with the segments, and its `json`
+file has every word with its `start` and `end` in the file. Put an `in` or
+`out` in a pause between words, never inside one: `silences` lists the
+pauses (`--min 0.3` for short ones) and `sound`, the stretches to keep.
+`scenes` gives the shot changes. Once a file is transcribed, the human's
+marks on it, and on a cut made of it, say what was said there (`said`).
+`transcribe` runs whisper.cpp on this Mac; if it's `MISSING_DEP`, ask the
+human before installing it or downloading a model (about 550 MB).
 
 ### With video-use (transcript-driven editing)
 
@@ -213,6 +224,8 @@ pepper-agent snapshot cam                     # look at it yourself
 
 - `sheet` first: the cheapest look at a whole file, or `--from`/`--to` a part.
 - `frames --at` for the moments that matter, `--every` for a steady sample.
+- `scenes`, `silences` and `transcribe` for where shots change, where it's
+  quiet, and what's said.
 - Pictures are PNG files, at most 1568 px on the long side: read the path.
   Results are kept in `.pepper/cache/`, so asking again is free.
 
@@ -229,6 +242,8 @@ pepper-agent snapshot cam                     # look at it yourself
 | `events` | `pepper-agent events --wait 300 --until done --since 3` | The human's marks, points, regions, notes, done (below) |
 | `play`, `pause`, `toggle`, `seek <t>`, `loop <a> <b>`, `where`, `review <a> [b]` | `pepper-agent seek 1:23.5` | Playback of a video: `83.5`, `1:23.5`, `+5`, `-2`; `loop off` |
 | `probe`, `frames`, `sheet` | `pepper-agent frames a.mp4 --at 12,1:03` | A file's streams, frames (100 at most), contact sheet |
+| `scenes`, `silences` | `pepper-agent silences a.mp4 --min 0.8` | Where the shots change (`--threshold 0.3`); where it's quiet (`--db -35 --min 0.5`) and the `sound` between |
+| `transcribe` | `pepper-agent transcribe a.mp4 --lang en` | What's said: segments, every word's time (in a JSON file), an .srt; whisper.cpp, nothing sent anywhere |
 | `edit validate`, `edit timeline` | `pepper-agent edit timeline cut.json --at 0:12.5` | Checks a project (all problems at once); where each clip lands, output ↔ file times |
 | `edit preview` | `pepper-agent edit preview cut.json` | The cut in the viewer, nothing rendered; again after a change, in the same box |
 | `edit render` | `pepper-agent edit render cut.json --quality final -o cut.mp4` | Draft (VideoToolbox, the default) or final (x264; `--codec hevc`); progress on stderr |
@@ -252,11 +267,27 @@ pepper-agent snapshot cam                     # look at it yourself
 | `watch <file>` | `pepper-agent watch out/plot.png` | A file shown again each time it's rendered again |
 | `pipe new` | `pepper-agent pipe new --format bgra --size 640x360 --fps 30` | A FIFO whose frames show as a program writes them (y4m, mjpeg, bgra) |
 | `open <stream>` | `pepper-agent open rtsp://cam/s --credentials-env CAM` | A live stream that reconnects; its password from the environment, never shown |
+| `install-skill`, `mcp` | `pepper-agent install-skill` | This guide as a skill; every command as an MCP tool (below) |
 
 Commands act on the focused source unless given `--source NAME` (or a name,
 for `snapshot` and `where`); `web` ones on the focused or only page; in a
 session, on your only source of the kind. With several viewers, add
 `--viewer <id>`.
+
+## As a skill, or as MCP tools
+
+The human sets these up once, for agents that aren't told to run `guide`:
+
+- `pepper-agent install-skill` puts this guide in
+  `~/.claude/skills/pepper/SKILL.md` (`--dir` another agent's skills folder);
+  an agent loads it when a task is about video, a web UI or streams.
+- `pepper-agent mcp` serves every command as an MCP tool, for agents that
+  take tools rather than a shell: `claude mcp add pepper -- pepper-agent mcp`,
+  or `{"mcpServers": {"pepper": {"command": "pepper-agent", "args": ["mcp"]}}}`
+  in a client's config. `web open` is the tool `web_open`; its arguments are
+  named as in the usage (`file`, `name`, `play`), with `viewer` and `session`
+  as arguments too. The answer is the command's JSON, and the pictures it
+  names come back as images as well.
 
 ## Events
 
@@ -317,10 +348,10 @@ returns all before it too; `--type point,note`, `--source NAME` and
 | `TIMEOUT` | Nothing yet: wait again, or `say` something to the human |
 | `BAD_TIME`, `BAD_ARGS` | See the hint's example, or `<command> --help` |
 | `INVALID_PROJECT` | Fix each of `problems` (`at` says where, like `clips[1].out`), then `edit validate` |
-| `MISSING_DEP` | Install what the message names (`brew install ffmpeg`, `brew install mpv`, Chrome) |
+| `MISSING_DEP` | Install what the message names (`brew install ffmpeg`, `brew install mpv`, Chrome); ask the human first for whisper.cpp's model |
 | `NOT_PLAYABLE` | That has no timeline (a page) or no picture |
 | `NOT_OWNER` | Another agent's source: use your own (`sources --owner <you>`); `--force` only if the user asks |
-| `UNSUPPORTED`, `FAILED` | Not in this version (streams, devices come later); read the message |
+| `UNSUPPORTED`, `FAILED` | Not in this version (devices come later); read the message |
 
 ## Rules
 
