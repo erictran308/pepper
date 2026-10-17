@@ -225,7 +225,7 @@ fn capped((w, h): (u32, u32)) -> (u32, u32) {
 }
 
 /// A JPEG's width and height, from its frame header.
-fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+pub(super) fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
     if !jpeg.starts_with(&[0xff, 0xd8]) {
         return None;
     }

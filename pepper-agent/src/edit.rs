@@ -123,6 +123,33 @@ impl Project {
         self.clips.iter().map(Clip::length).sum()
     }
 
+    /// The part of the cut from `from` to `to` (the output's times), as a
+    /// project of its own: what a recording of its preview played.
+    pub fn slice(&self, from: f64, to: f64) -> Project {
+        let mut at = 0.0;
+        let mut clips = Vec::new();
+        for clip in &self.clips {
+            let (start, end) = (at, at + clip.length());
+            at = end;
+            let (a, b) = (from.max(start), to.min(end));
+            if b - a > 1e-6 {
+                let mut part = clip.clone();
+                part.start = clip.start + (a - start);
+                part.end = clip.start + (b - start);
+                part.fade_in = if a > start { 0.0 } else { clip.fade_in };
+                part.fade_out = if b < end { 0.0 } else { clip.fade_out };
+                clips.push(part);
+            }
+        }
+        Project {
+            path: self.path.clone(),
+            format: Format::Pepper,
+            output: self.output.clone(),
+            clips,
+            warnings: Vec::new(),
+        }
+    }
+
     /// A name for what's made of it: its file's stem.
     pub fn stem(&self) -> String {
         let stem = self
@@ -334,6 +361,49 @@ fn source_key(project: &Path, src: &Path) -> Option<String> {
         // A name is a file name, never a path.
         let plain = !name.is_empty() && !name.contains(['/', '\0']) && !name.starts_with('.');
         (plain && full == src).then(|| name.clone())
+    })
+}
+
+/// A file from `from` to `to`, as a project of one clip at the file's own
+/// size and rate: what a recording of the file played.
+pub fn excerpt(work: &Path, file: &Path, from: f64, to: f64) -> Result<Project> {
+    let probe = media::probe(work, file)?;
+    let facts = Facts::of(&probe);
+    let (w, h) = facts
+        .display
+        .ok_or_else(|| Error::new("NOT_PLAYABLE", "it has no picture (sound only)"))?;
+    let (fps, fps_text) = snap(
+        facts
+            .fps
+            .filter(|f| (1.0..=240.0).contains(f))
+            .unwrap_or(30.0),
+    );
+    let end = facts.duration.map_or(to, |d| to.min(d));
+    if end - from < 0.04 {
+        return Err(Error::new("FAILED", "nothing of it was played"));
+    }
+    Ok(Project {
+        path: file.to_owned(),
+        format: Format::Pepper,
+        output: Output {
+            width: even(w),
+            height: even(h),
+            fps,
+            fps_text,
+            fit: Fit::Pad,
+        },
+        clips: vec![Clip {
+            src: file.to_owned(),
+            name: None,
+            start: from.max(0.0),
+            end,
+            fade_in: 0.0,
+            fade_out: 0.0,
+            audio: facts.audio,
+            key: None,
+            quote: None,
+        }],
+        warnings: Vec::new(),
     })
 }
 
@@ -1804,6 +1874,13 @@ mod tests {
         let t = Timeline::of(&p);
         assert_eq!(t.srcs, ["/m/a.mp4", "/m/b.mp4"]);
         assert_eq!(t.cuts[2].at, 7.0);
+        // A part of the cut, as a project: 2.5 to 8 is the end of clip 0,
+        // all of clip 1, the start of clip 2.
+        let part = p.slice(2.5, 8.0);
+        let spans: Vec<(f64, f64)> = part.clips.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(spans, [(4.5, 5.0), (5.0, 9.0), (1.5, 2.5)]);
+        assert_eq!(part.duration(), 5.5);
+        assert!(p.slice(20.0, 30.0).clips.is_empty());
         assert_eq!(t.locate(0.0), Some((0, 2.0)));
         assert_eq!(t.locate(2.5), Some((0, 4.5)));
         // A cut belongs to the clip after it.

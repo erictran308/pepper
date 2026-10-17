@@ -123,6 +123,66 @@ never the user's, no cookies or logins of theirs. It reaches only this
 machine (localhost, 127.0.0.1, ::1, files) unless opened with
 `--allow-remote`, which only the user should ask for.
 
+## Showing a demo for approval (recordings)
+
+```sh
+pepper-agent record run demo.json --source app   # records the page while it runs the steps
+pepper-agent sheet <its path>                    # look at it yourself first
+pepper-agent play <its path>                     # shows it to the human, playing
+pepper-agent say "The sign-up demo: y if it's right; x, then n to say what's wrong"
+pepper-agent events --wait 300 --until approve,reject --since <last_id>
+```
+
+A script is a list of steps, each an object of one verb:
+
+```json
+[{"click": "#signup"}, {"type": ["#email", "ada@example.com"]}, {"press": "Enter"},
+ {"wait_for": ".welcome"}, {"wait": 1}, {"say": "signed in"}]
+```
+
+The verbs: `click` and `hover` (a selector or `x,y`), `type` (`[selector,
+text]`), `press`, `scroll`, `goto`, `reload`, `back`, `wait` (seconds),
+`wait_for`, `viewport`, `say`. The answer has the recording (`path`,
+`duration`, `sheet`), each step's answer and `completed`; a step that fails
+ends the run with `failed` (which step, its error), and the recording up to
+it is kept: it may show the bug. Or by hand: `record start app`, drive it (or
+let the human), `record stop app`. A page records at 30 fps as it shows (a
+still page is a still picture). A video's recording is the stretch that
+played between start and stop (`review a b`, or `play`), cut from the file;
+a preview's is rendered from its cut. Recordings go in `.pepper/recordings/`;
+one stops by itself after `--max` (120 s, 600 at most).
+
+## Before and after
+
+```sh
+pepper-agent compare edit/v1.mp4 edit/v2.mp4 --sync   # side by side, labelled, playing as one
+pepper-agent say "Left is before, right is after: y if after is better, x if not"
+pepper-agent events --wait 300 --until approve,reject --since <last_id>
+```
+
+`compare` takes two sources by name, or files and pages it opens as `before`
+and `after`. With `--sync`, two videos play, pause and seek together: the
+focused one leads. On two pictures, `d` shows their difference in the after
+one's place (black where they're the same). The human's `y` or `x` has
+`compare`, both names. `compare off` ends it.
+
+## Several agents in one viewer
+
+```sh
+pepper-agent session new --owner agent-2      # {"session": "<token>", "owner": "agent-2", …}
+pepper-agent web open localhost:5174 --name agent-2-app --session <token>
+pepper-agent web click '#save' --session <token>
+```
+
+When other agents share the viewer (the user runs several, or you start
+subagents: each takes its own), take a session and pass `--session <token>`
+with every command (or set `PEPPER_AGENT_SESSION`, if your shell keeps it
+between calls). What you open is then yours: labelled with your name, and
+other agents can't drive, record or close it (`NOT_OWNER`) unless the user
+asks them to (`--force`). Without `--source`, your commands go to your only
+source of the kind. `sources --owner` and `events --owner` give yours only;
+`layout grid` shows four at once. A session lasts as long as its viewer, and your commands go to that viewer even when the human starts another.
+
 ## Looking yourself (no viewer needed for files)
 
 - `sheet` first: the cheapest look at a whole file, or `--from`/`--to` a part.
@@ -158,15 +218,22 @@ machine (localhost, 127.0.0.1, ::1, files) unless opened with
 | `web console`, `web errors` | `pepper-agent web errors --since 4` | The console; exceptions, failed requests, HTTP 400+; `last_id` for `--since` |
 | `web dom <sel>`, `web a11y` | `pepper-agent web dom 'main .card'` | HTML of what a selector finds; the accessibility tree |
 | `web eval <js>` | `pepper-agent web eval 'document.title'` | Runs JavaScript in the page (pages on this machine only) |
+| `record start`, `record stop` | `pepper-agent record stop app` | Records a source (a page as it shows, a video's stretch that played) into `.pepper/recordings/`, with a sheet |
+| `record run <script>` | `pepper-agent record run demo.json --source app` | Records a page while it runs a script of steps |
+| `play <recording>` | `pepper-agent play .pepper/recordings/app-….mp4` | Shows a recording, playing, for the human's `y` or `x` |
+| `compare <a> <b>` | `pepper-agent compare v1.mp4 v2.mp4 --sync` | Before and after side by side; `compare off` |
+| `session new` | `pepper-agent session new --owner agent-2` | Your own sources among other agents'; pass `--session` with every command |
 
 Commands act on the focused source unless given `--source NAME` (or a name,
-for `snapshot` and `where`); `web` ones on the focused or only page. With
-several viewers, add `--viewer <id>`.
+for `snapshot` and `where`); `web` ones on the focused or only page; in a
+session, on your only source of the kind. With several viewers, add
+`--viewer <id>`.
 
 ## Events
 
 What the human does in the viewer, oldest first. Every event has `id`, `type`
-and `at` (when, UTC), and `source` and `kind` when it's about one.
+and `at` (when, UTC), and `source` and `kind` when it's about one (`owner`
+too, a session's).
 
 ```json
 {"id": 4, "type": "mark", "source": "a", "kind": "media", "file": "/p/a.mp4", "time": 12.48, "time_text": "0:12.480"}
@@ -178,13 +245,16 @@ and `at` (when, UTC), and `source` and `kind` when it's about one.
 {"id": 10, "type": "approve", "source": "cut", "kind": "media", "project": "/p/cut.json", "time": 20.0}
 {"id": 11, "type": "delete", "source": "cut", "deletes": [9], "deleted": {"type": "range", "time": 20.1, "to": 23.5, "note": "cut this"}}
 {"id": 12, "type": "done"}
+{"id": 13, "type": "reject", "source": "after", "kind": "media", "file": "/p/edit/v2.mp4", "compare": {"before": "before", "after": "after"}, "time": 4.2}
+{"id": 14, "type": "approve", "source": "app-20261017093000", "kind": "recording", "owner": "agent-2", "file": "/p/.pepper/recordings/app-20261017093000.mp4", "time": 6.1}
 ```
 
 A `delete` is the human taking a mark back: forget it (later answers leave it
 out). `x`, `y` (and `w`, `h`) are in the source's own units: a video's pixels, a
 page's CSS pixels. `events` options: `--wait SECONDS` (up to 3600) waits for
 one; `--until done` waits for that type (or any of a list, `done,reject`) and
-returns all before it too; `--type point,note` and `--source NAME` filter;
+returns all before it too; `--type point,note`, `--source NAME` and
+`--owner NAME` (a session's sources) filter;
 `--since ID` skips what you've seen. The answer has `events`, `last_id` and
 `events_file`
 (`.pepper/events.jsonl` in the viewer's project).
@@ -201,7 +271,7 @@ returns all before it too; `--type point,note` and `--source NAME` filter;
 | `space`, `,` `.`, `←` `→` | A video: pause, a frame back or on, 5 s (`↑` `↓`: 1 min) |
 | the bar, the wheel | A video: click or drag the bar under it to go there; the wheel steps a frame a notch; paused, the label gives the frame |
 | `<`, `>` | A video: to their previous or next mark, note, point or range (◆ on the bar); paused on one, what they wrote shows |
-| `d`, `d` | Delete the mark they're paused on (asks once): you get a `delete` event |
+| `d`, `d` | Delete the mark they're paused on (asks once): you get a `delete` event. Comparing two pictures, `d` shows their difference |
 | wheel, `↑` `↓`, `r` | A page: scroll; reload |
 | `Tab`, `1`–`4`, `z`, `q` | Focus another source; zoom one to the whole pane; quit the viewer |
 
@@ -220,6 +290,7 @@ returns all before it too; `--type point,note` and `--source NAME` filter;
 | `INVALID_PROJECT` | Fix each of `problems` (`at` says where, like `clips[1].out`), then `edit validate` |
 | `MISSING_DEP` | Install what the message names (`brew install ffmpeg`, `brew install mpv`, Chrome) |
 | `NOT_PLAYABLE` | That has no timeline (a page) or no picture |
+| `NOT_OWNER` | Another agent's source: use your own (`sources --owner <you>`); `--force` only if the user asks |
 | `UNSUPPORTED`, `FAILED` | Not in this version (streams, devices come later); read the message |
 
 ## Rules
@@ -235,3 +306,4 @@ returns all before it too; `--type point,note` and `--source NAME` filter;
 - Prefer showing (`open`, `review`, `edit preview`, a live page) to rendering
   new files; render `--quality final` once the human approves.
 - Ask before deleting anything. Don't put passwords in commands; they're logged.
+- Sharing a viewer, keep to your own sources; `--force` only when the user asks.
