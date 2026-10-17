@@ -2,7 +2,7 @@
 
 Lets AI coding agents (Claude Code, Codex, Gemini CLI, Aider, your own) use Pepper. The human runs a **viewer** in a Pepper pane; the agent, from its own shell, opens video, a cut it's editing or the web app it's building in it, steers it, and reads back what the human marked, pointed at and wrote. The agent sees the same pictures as files made from the source (a frame of the file, a screenshot from the browser, never a capture of the screen).
 
-It comes inside Pepper (`Pepper.app/Contents/MacOS/pepper-agent`), on every Pepper shell's `PATH`. It needs ffmpeg (`brew install ffmpeg`), mpv's library to play (`brew install mpv`, as pepper-play does), and for pages a Chrome or Chromium (Google Chrome, Chromium, Edge, Brave, Playwright's, or `PEPPER_CHROME`).
+It comes inside Pepper (`Pepper.app/Contents/MacOS/pepper-agent`), on every Pepper shell's `PATH`. It needs ffmpeg (`brew install ffmpeg`), mpv's library to play (`brew install mpv`, as pepper-play does), and for pages a Chrome or Chromium (Google Chrome, Chromium, Edge, Brave, Playwright's, or `PEPPER_CHROME`). `transcribe` needs whisper.cpp (`brew install whisper.cpp`) and a model in `~/.cache/pepper-agent/whisper/` (it says which to download).
 
 ## For the human
 
@@ -43,6 +43,15 @@ So that an agent knows about all this in your own projects, put this line in its
 If `pepper-agent` is on the PATH and the task involves video, a web UI, a mobile app, visual output or streams, run `pepper-agent guide` first.
 ```
 
+Or set it up once for an agent, either way:
+
+```sh
+pepper-agent install-skill                    # the guide as a skill: ~/.claude/skills/pepper/SKILL.md (--dir for another agent's)
+claude mcp add pepper -- pepper-agent mcp     # every command as an MCP tool, for agents that take tools
+```
+
+The skill is [skills/pepper/SKILL.md](skills/pepper/SKILL.md) in the [Agent Skills](https://agentskills.io) format: the guide, with a description that tells an agent when to load it. Other MCP clients take `{"mcpServers": {"pepper": {"command": "pepper-agent", "args": ["mcp"]}}}`.
+
 ## For agents
 
 Run `pepper-agent guide`: everything is there ([guide.md](guide.md)). In short:
@@ -54,6 +63,8 @@ pepper-agent open video.mp4            # shows it in the viewer, paused
 pepper-agent say "Press m at anything to change, Enter when done"
 pepper-agent events --wait 300 --until done --since 0
 pepper-agent frames video.mp4 --at 12.48   # look at what was marked
+pepper-agent transcribe raw/a.mp4      # what's said, every word timed (whisper.cpp, on this Mac)
+pepper-agent silences raw/a.mp4        # where it's quiet: where cuts go; scenes: where shots change
 
 pepper-agent edit validate cut.json    # a cut as a JSON project: every problem at once
 pepper-agent edit preview cut.json     # the cut in the viewer, nothing rendered
@@ -84,6 +95,7 @@ Every command prints one JSON object; errors are JSON on stderr with a `code` an
 | `events` | The human's marks, points, notes, approvals and done; long-polls |
 | `play`, `pause`, `toggle`, `seek`, `loop`, `where`, `review` | Playback |
 | `probe`, `frames`, `sheet` | A file's streams, frames and contact sheet, without a viewer |
+| `scenes`, `silences`, `transcribe` | Where a file's shots change, where it's quiet (and the sound between), what's said (segments, every word's time, an .srt) |
 | `edit validate`, `preview`, `timeline`, `render` | A cut as a JSON project: checked (all problems at once), shown in the viewer with nothing rendered, mapped between the cut's time and the files', rendered with ffmpeg (a quick draft on the graphics chip, or final) |
 | `web open`, `goto`, `reload`, `back` | A page, live: a dev server's address or an HTML file, at a device's size (`--device iphone-15`) |
 | `web click`, `type`, `press`, `scroll`, `hover`, `viewport`, `wait-for` | Drive it, in view of the human |
@@ -94,6 +106,7 @@ Every command prints one JSON object; errors are JSON on stderr with a `code` an
 | `watch` | A file shown again each time it's rendered again (a plot, a render, a GIF), once it stops changing |
 | `pipe new` | A FIFO whose frames show live as a program writes them: y4m, MJPEG or raw BGRA |
 | `open <stream>` | rtsp, rtmp, srt, udp or HLS, live, reconnecting by itself; `--credentials-env` for its password |
+| `install-skill`, `mcp` | The guide as an agent skill; every command as an MCP tool over stdio |
 
 Files it makes go in `.pepper/` in the current folder (`snapshots/`, `cache/`, `points/`, `edits/`, `renders/`, `recordings/`), which gets a `.gitignore` of its own. Pictures are at most 1568 px on their long side.
 
@@ -176,9 +189,12 @@ pepper-agent web click …                │ OSC 777;pepper;place (its own tty)
 - Pipes: the FIFO is made in the viewer's own folder (0700), only the user's (0600), and goes with its source. mpv reads it through libavformat (`ffmpeg://file:`), as a stream that can't seek: mpv's own file reading probes a FIFO as if it could and stalls. Frames show as they come (`untimed`, mpv's `low-latency` profile). At the writer's end the player loads it again, which waits for the next writer; on close, a writer that opens and closes it lets a player still waiting go.
 - Streams: mpv's `low-latency` profile (but HLS, whose segments are seconds long), reading the streams' setup so a recording can have it, and a network timeout of 10 s. One that ends or fails is tried again after 1 s, then 2, 4, 8, 10. A recording is mpv's `stream-record`: the packets as they came, from the next keyframe, then copied into an MP4.
 - Passwords: an address's user and password are taken out (`***`) of everything shown or written: answers, labels, events, the viewer's record and its log, mpv's and ffmpeg's messages (taken out as they're read). `--credentials-env` reads them from the environment, percent-encoded into the address, which the viewer gives pepper-play over its IPC, never on a command line.
-- `said`, on events and answers: the transcript beside the edit or the footage (video-use's `edit/transcripts/<name>.json`: Scribe's word list, by the EDL's name for the source or the file's stem) read for the moment, by `pepper-agent` itself, not the viewer. Phrases break as video-use's `pack_transcripts.py` breaks them (0.5 s of silence, a new speaker); pauses are gaps of 0.15 s or more between words. Its text is made inert like the rest.
+- `scenes` and `silences` are ffmpeg's `select` scene score (on a 320-pixel copy, decoded by VideoToolbox) and `silencedetect`, printed as metadata and read here, cached like the rest. `transcribe` runs whisper.cpp's `whisper-cli` on the file's sound (16 kHz, in the cache folder, deleted after): nothing leaves the Mac. Its token times are rough (the word before a long pause can land after it), so a word ends where whisper's alignment (`-dtw`, the model's alignment heads) puts it, and starts where the one before ended, or where a pause between them ends (ffmpeg's `silencedetect`, 0.12 s); words aligned to one time share it by their length. The transcript is kept as JSON (segments, and words in Scribe's shape) and an `.srt` beside it.
+- `said`, on events and answers: the transcript beside the edit or the footage (video-use's `edit/transcripts/<name>.json`: Scribe's word list, by the EDL's name for the source or the file's stem), or else the one `transcribe` made of the file, read for the moment, by `pepper-agent` itself, not the viewer. Phrases break as video-use's `pack_transcripts.py` breaks them (0.5 s of silence, a new speaker); pauses are gaps of 0.15 s or more between words. Its text is made inert like the rest.
 
-It's Rust with no dependencies but the system's (ffmpeg and pepper-play are run, not linked), MIT licensed like the rest of Pepper.
+- `mcp`: JSON-RPC on stdin and stdout, one message a line. Each tool is a command (`web open` is `web_open`), its arguments named from the usage line; a call runs `pepper-agent` itself with them as a command line (options as `--name=value`, then `--` and the plain arguments, so none is taken for an option) and answers with what it printed, plus the PNGs its answer names (`path`, `crop`, `sheet`: 8 at most, 5 MB each) as images. It holds no state of its own: a session's token is an argument, since one server may serve several subagents. Calls run side by side, each in a process group of its own; one the client cancels is stopped (SIGTERM to the group, so its ffmpeg too) and not answered, and all are stopped when the client goes. `view`, `mcp` and `install-skill` aren't tools.
+
+It's Rust with no dependencies but the system's (ffmpeg, whisper.cpp and pepper-play are run, not linked), MIT licensed like the rest of Pepper.
 
 ## Testing
 
@@ -187,4 +203,4 @@ cargo test                     # unit tests
 tests/integration.py           # the viewer in a pseudo-terminal, driven as an agent and a human
 ```
 
-The integration test runs the real viewer, pepper-play and mpv on generated clips (a hostile file name and tags among them) and Chrome on a local page (a hostile title and console), with a `PEPPER_PORT` no Pepper holds, so nothing shows: it checks the commands, the keys and the mouse, the events, what reaches the terminal, the pages kept to this machine, sessions, recordings and comparing, watched files, pipes, an RTSP stream behind a password (`tests/rtsp_server.py`, a test camera in Python's standard library that relays ffmpeg's RTP over RTSP's TCP mode) with the password nowhere it shouldn't be, and the socket's refusals. `--only live` (or `edit`, `web`, `sharing`) runs one group after the basics. Seeing the picture needs a test Pepper (`../CLAUDE.md`, Gotchas). `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture` times the web frames' decoding.
+The integration test runs the real viewer, pepper-play and mpv on generated clips (a hostile file name and tags among them) and Chrome on a local page (a hostile title and console), with a `PEPPER_PORT` no Pepper holds, so nothing shows: it checks the commands, the keys and the mouse, the events, what reaches the terminal, the pages kept to this machine, sessions, recordings and comparing, watched files, pipes, an RTSP stream behind a password (`tests/rtsp_server.py`, a test camera in Python's standard library that relays ffmpeg's RTP over RTSP's TCP mode) with the password nowhere it shouldn't be, scenes, silences and a transcript of speech made with macOS's `say` (skipped without whisper.cpp and a model), the skill, the MCP server as a client drives it, and the socket's refusals. `--only live` (or `edit`, `web`, `sharing`, `extras`) runs one group after the basics. Seeing the picture needs a test Pepper (`../CLAUDE.md`, Gotchas). `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture` times the web frames' decoding.
