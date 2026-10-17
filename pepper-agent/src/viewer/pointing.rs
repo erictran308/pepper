@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 
 use super::input::Mouse;
 use super::layout;
-use super::{Prompt, Viewer, pause_for_note, round3};
+use super::{Prompt, Viewer, pause_for_note};
 use crate::error::{Error, Result};
 use crate::json::Value;
-use crate::{files, media, text};
+use crate::{files, media};
 
 /// Further than this (pixels of the pane, 5 points on a Retina display)
 /// between press and release is a drag: less is a hand that moved as it
@@ -78,12 +78,20 @@ impl Viewer {
         }
         let p = (m.x as f64, m.y as f64);
         if m.wheel != 0 {
-            if let Some((i, at)) = self.hit(p)
-                && self.sources[i].web.is_some()
-                && let Some(size) = self.source_size(i)
-            {
-                let point = layout::to_source(p, at, size, true);
-                self.web_key_scroll(m.wheel as f64 * 120.0, point.map(|pt| (i, pt)));
+            // A page scrolls; a video steps a frame a notch.
+            match self.hit(p) {
+                Some((i, at)) if self.sources[i].web.is_some() => {
+                    if let Some(size) = self.source_size(i) {
+                        let point = layout::to_source(p, at, size, true);
+                        self.web_key_scroll(m.wheel as f64 * 120.0, point.map(|pt| (i, pt)));
+                    }
+                }
+                Some((i, _)) => self.wheel_step(i, m.wheel as i32),
+                None => {
+                    if let Some((i, _)) = self.bar_at(p, None) {
+                        self.wheel_step(i, m.wheel as i32);
+                    }
+                }
             }
             return;
         }
@@ -91,15 +99,24 @@ impl Viewer {
             return;
         }
         if m.release {
+            if self.bar_release(p) {
+                return;
+            }
             if let Some(drag) = self.drag.take() {
                 self.pointed(drag, p);
             }
             return;
         }
         if m.motion {
+            if self.bar_drag(p) {
+                return;
+            }
             if let Some(drag) = &mut self.drag {
                 drag.now = p;
             }
+            return;
+        }
+        if self.bar_press(p) {
             return;
         }
         if let Some((i, _)) = self.hit(p) {
@@ -175,11 +192,7 @@ impl Viewer {
             .with("type", if region.is_some() { "region" } else { "point" })
             .with("source", name.as_str())
             .with("kind", source.kind);
-        if source.web.is_some() {
-            event.set("url", source.shown_target());
-        } else {
-            event.set("file", source.shown_target());
-        }
+        source.origin(&mut event);
         event.set("x", x);
         event.set("y", y);
         if let Some([_, _, w, h]) = region {
@@ -220,8 +233,7 @@ impl Viewer {
             pending.event.set("width", size.0);
             pending.event.set("height", size.1);
             if let Some(t) = source.time_pos {
-                pending.event.set("time", round3(t));
-                pending.event.set("time_text", text::clock(t));
+                source.at_time(t, &mut pending.event);
             }
             // The part around it, in the video's pixels.
             let near = match region {
@@ -257,6 +269,7 @@ impl Viewer {
             time,
             resume,
             point: Some(id),
+            range: None,
         });
         self.dirty = true;
     }

@@ -21,10 +21,11 @@ mod pages;
 mod player;
 mod pointing;
 mod screen;
+mod seekbar;
 mod watch;
 mod web;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -39,7 +40,7 @@ use std::time::{Duration, Instant};
 use crate::error::{Error, Result};
 use crate::json::Value;
 use crate::text::{self, Time};
-use crate::{files, pepper, proto, sys};
+use crate::{edit, files, pepper, proto, sys};
 use input::{Input, Key};
 use layout::{Cells, Mode};
 use player::Player;
@@ -72,7 +73,7 @@ const LOOK_EVERY: Duration = Duration::from_millis(250);
 
 /// Event types, as `events --type` takes them.
 pub const EVENT_TYPES: &[&str] = &[
-    "mark", "note", "done", "point", "region", "approve", "reject",
+    "mark", "note", "done", "point", "region", "range", "approve", "reject", "delete",
 ];
 
 /// What the reading and working threads hand the viewer.
@@ -153,6 +154,13 @@ struct Source {
     placed: Option<Cells>,
     log: Vec<String>,
     web: Option<pages::WebSource>,
+    /// The file's frame rate, for its frame numbers.
+    fps: Option<f64>,
+    /// The human's seeks with the mouse, one at a time.
+    scrub: seekbar::Scrub,
+    /// An edit's preview: where each clip lands, to say where a time of
+    /// it is in the footage.
+    edit: Option<edit::Timeline>,
 }
 
 impl Source {
@@ -193,6 +201,43 @@ impl Source {
         }
     }
 
+    /// The number of the frame it shows (from 0): its time and its file's
+    /// rate. Not for an edit's preview, whose clips' rates may differ: its
+    /// clip and the time in that file say where it is.
+    fn frame(&self) -> Option<u64> {
+        match (self.time_pos, self.fps) {
+            (Some(t), Some(fps)) if self.edit.is_none() => Some((t.max(0.0) * fps).round() as u64),
+            _ => None,
+        }
+    }
+
+    /// What it shows, in an event or an answer: a page's `url`, an edit's
+    /// `project`, or a `file`.
+    fn origin(&self, into: &mut Value) {
+        match &self.edit {
+            _ if self.web.is_some() => into.set("url", self.shown_target()),
+            Some(edit) => {
+                into.set("project", edit.project.as_str());
+                // A render opened with its cut: the file too (a preview's
+                // EDL is pepper-agent's own, of no use to the agent).
+                if !self.target.ends_with(".edl") {
+                    into.set("file", self.shown_target());
+                }
+            }
+            None => into.set("file", self.shown_target()),
+        }
+    }
+
+    /// A time of it, in an event or an answer: `time`, and for an edit's
+    /// preview the clip, its file and the time in that file.
+    fn at_time(&self, t: f64, into: &mut Value) {
+        into.set("time", round3(t));
+        into.set("time_text", text::clock(t));
+        if let Some(edit) = &self.edit {
+            edit.describe(t, into);
+        }
+    }
+
     fn to_json(&self, focused: bool, visible: bool) -> Value {
         if let Some(web) = &self.web {
             return web.to_json(self, focused, visible);
@@ -211,8 +256,20 @@ impl Source {
             .with("hwdec", self.hwdec.as_deref())
             .with("focused", focused)
             .with("visible", visible);
+        v.set("frame", self.frame());
+        v.set(
+            "box",
+            self.placed
+                .map(|c| vec![c.col as u32, c.row as u32, c.cols as u32, c.rows as u32]),
+        );
         if let Some((a, b)) = self.loop_ab {
             v.set("loop", vec![round3(a), round3(b)]);
+        }
+        if let Some(edit) = &self.edit {
+            v.set("project", edit.project.as_str());
+            if let Some((clip, _)) = self.time_pos.and_then(|t| edit.locate(t)) {
+                v.set("clip", clip);
+            }
         }
         if let Some(error) = self.error() {
             v.set("error", error);
@@ -264,6 +321,8 @@ struct Prompt {
     resume: bool,
     /// The note is for a point or region the human just made.
     point: Option<u64>,
+    /// The note is for a range (`i`, `o`): its event, sent with the note.
+    range: Option<Value>,
 }
 
 /// The terminal's mode before the viewer, to put back even after a panic.
@@ -404,6 +463,8 @@ pub fn run(options: Options) -> Result<()> {
         say: None,
         prompt: None,
         confirm_quit: false,
+        confirm_delete: None,
+        deleted: HashSet::new(),
         flash: None,
         shot_count: 0,
         pepper,
@@ -413,6 +474,8 @@ pub fn run(options: Options) -> Result<()> {
         points: Vec::new(),
         next_point: 1,
         drag: None,
+        scrubbing: None,
+        range_from: None,
         points_dir,
         quit: false,
         dirty: true,
@@ -522,6 +585,10 @@ struct Viewer {
     say: Option<String>,
     prompt: Option<Prompt>,
     confirm_quit: bool,
+    /// A mark the human asked to delete (`d`), until they say again.
+    confirm_delete: Option<u64>,
+    /// The events of the marks the human deleted.
+    deleted: HashSet<u64>,
     flash: Option<(String, Instant)>,
     shot_count: u64,
     /// Pepper's port, for what the viewer draws itself.
@@ -535,6 +602,10 @@ struct Viewer {
     points: Vec<pointing::Pending>,
     next_point: u64,
     drag: Option<pointing::Drag>,
+    /// The source whose seek bar the human holds, and the time there.
+    scrubbing: Option<(u64, f64)>,
+    /// A range the human started (`i`): its source and time.
+    range_from: Option<(u64, f64)>,
     /// Where points' pictures go: `.pepper/points/` in the project.
     points_dir: PathBuf,
     quit: bool,
@@ -579,6 +650,7 @@ impl Viewer {
             }
             self.expire_waits();
             self.expire_points();
+            self.pump_scrubs();
             self.reload_watched();
             if let Some((_, at)) = &self.flash
                 && at.elapsed() >= FLASH
@@ -653,11 +725,13 @@ impl Viewer {
             .iter()
             .zip(tiles)
             .map(|(&i, tile)| {
+                // A video's seek bar takes the row under its box.
+                let bar = u16::from(self.sources[i].web.is_none());
                 let room = Cells {
                     col: tile.col,
                     row: tile.row + 1,
                     cols: tile.cols,
-                    rows: tile.rows.saturating_sub(1),
+                    rows: tile.rows.saturating_sub(1 + bar),
                 };
                 (i, tile, layout::fit(room, cell, self.sources[i].aspect()))
             })
@@ -735,10 +809,35 @@ impl Viewer {
             let mut label = format!(" {} {}  {}", n + 1, source.name, source.status());
             if let Some(web) = &source.web {
                 label += &web.label();
-            } else if let Some(t) = source.time_pos {
-                label += &format!("  {}", text::short_clock(t));
+            } else if let Some(t) = self.held_time(source.sid).or(source.time_pos) {
+                // Paused, or while the human seeks: to the frame.
+                let held = self.held_time(source.sid).is_some();
+                let exact = source.paused || held;
+                label += &format!(
+                    "  {}",
+                    if exact {
+                        text::clock(t)
+                    } else {
+                        text::short_clock(t)
+                    }
+                );
                 if let Some(d) = source.duration {
                     label += &format!(" / {}", text::short_clock(d));
+                }
+                if exact
+                    && !held
+                    && let Some(f) = source.frame()
+                {
+                    label += &format!("  frame {f}");
+                }
+                if let Some(edit) = &source.edit {
+                    match edit.locate(t) {
+                        _ if exact => label += &format!("  {}", edit.say(t).unwrap_or_default()),
+                        Some((k, _)) => {
+                            label += &format!("  clip {} of {}", k + 1, edit.cuts.len())
+                        }
+                        None => {}
+                    }
                 }
             }
             if let Some(error) = source.error() {
@@ -760,15 +859,29 @@ impl Viewer {
                 None => say_row.put(0, cols, " (the agent hasn't said anything)", screen::DIM),
             }
         }
-        let drag = self.drag_text();
+        self.draw_bars(&mut out);
+        let drag = self
+            .scrub_text()
+            .or_else(|| self.drag_text())
+            .or_else(|| self.range_text());
+        let on_mark = self.on_mark_text();
+        let deleting = self.delete_text();
         let keys_row = &mut out[rows as usize - 1];
         if let Some(prompt) = &self.prompt {
-            let (what, hint) = match prompt
+            let range = prompt.range.as_ref().map(|r| {
+                format!(
+                    "the range {}–{}",
+                    r.get_str("time_text").unwrap_or(""),
+                    r.get_str("to_text").unwrap_or("")
+                )
+            });
+            let point = prompt
                 .point
                 .and_then(|id| self.points.iter().find(|p| p.id == id))
-            {
+                .map(|p| p.what().to_owned());
+            let (what, hint) = match range.or(point) {
                 Some(point) => (
-                    format!(" note on {}", point.what()),
+                    format!(" note on {point}"),
                     "  (Enter sends, Esc sends it without a note)",
                 ),
                 None => (
@@ -799,10 +912,14 @@ impl Viewer {
                 ),
                 screen::BOLD,
             );
+        } else if let Some(deleting) = deleting {
+            keys_row.put(0, cols, &format!(" {deleting}"), screen::BOLD);
         } else if let Some(drag) = drag {
             keys_row.put(0, cols, &format!(" {drag}"), screen::BOLD);
         } else if let Some((flash, _)) = &self.flash {
             keys_row.put(0, cols, &format!(" {flash}"), screen::BOLD);
+        } else if let Some(here) = on_mark {
+            keys_row.put(0, cols, &format!(" {here}"), screen::BOLD);
         } else if self.sources.is_empty() {
             keys_row.put(0, cols, " q quits", screen::DIM);
         } else if self
@@ -812,14 +929,14 @@ impl Viewer {
             keys_row.put(
                 0,
                 cols,
-                " click to point · drag a region · n note · Enter done · wheel scrolls · r reload · Tab focus · z zoom · q quit",
+                " click to point · drag a region · n note · y/x approve/reject · Enter done · wheel scrolls · r reload · Tab focus · z zoom · q quit",
                 screen::DIM,
             );
         } else {
             keys_row.put(
                 0,
                 cols,
-                " m mark · click to point · drag a region · n note · Enter done · space pause · ←→ seek · Tab focus · z zoom · q quit",
+                " m mark · n note · i o range · Enter done · space pause · , . or wheel: a frame · < > marks · the bar seeks · ←→ 5 s · click or drag to point · y/x approve/reject · Tab focus · z zoom · q quit",
                 screen::DIM,
             );
         }
@@ -847,6 +964,13 @@ impl Viewer {
         }
         if self.prompt.is_some() {
             self.on_prompt_key(key);
+            return;
+        }
+        if let Some(id) = self.confirm_delete.take() {
+            // A second d deletes; any other key keeps the mark.
+            if key == Key::Char('d') {
+                self.delete_mark(id);
+            }
             return;
         }
         if self.confirm_quit {
@@ -893,6 +1017,17 @@ impl Viewer {
             }
             Key::Char('m') => self.mark(),
             Key::Char('n') => self.start_note(),
+            Key::Char('y') => self.verdict(true),
+            Key::Char('x') => self.verdict(false),
+            Key::Char('d') => self.ask_delete(),
+            Key::Char('<') => self.jump_mark(false),
+            Key::Char('>') => self.jump_mark(true),
+            Key::Char('i') => self.range_in(),
+            Key::Char('o') => self.range_out(),
+            Key::Esc if self.range_from.is_some() => {
+                self.range_from = None;
+                self.flash("Range dropped.");
+            }
             Key::Char('r') if self.focused_web().is_some() => self.web_key_reload(),
             Key::Up | Key::Down | Key::PageUp | Key::PageDown if self.focused_web().is_some() => {
                 let by = match key {
@@ -933,13 +1068,18 @@ impl Viewer {
             return;
         };
         let name = source.name.clone();
-        let event = Value::obj()
+        let mut event = Value::obj()
             .with("type", "mark")
             .with("source", name.as_str())
-            .with("kind", source.kind)
-            .with("file", source.shown_target())
-            .with("time", round3(t))
-            .with("time_text", text::clock(t));
+            .with("kind", source.kind);
+        source.origin(&mut event);
+        source.at_time(t, &mut event);
+        let clip = source
+            .edit
+            .as_ref()
+            .and_then(|e| e.say(t))
+            .map(|s| format!(", {s}"))
+            .unwrap_or_default();
         self.add_event(event);
         let n = self
             .events
@@ -947,9 +1087,34 @@ impl Viewer {
             .filter(|e| e.get_str("type") == Some("mark"))
             .count();
         self.flash(format!(
-            "Marked {name} at {} (mark {n}). Enter when you're done.",
+            "Marked {name} at {} (mark {n}{clip}). Enter when you're done.",
             text::clock(t)
         ));
+    }
+
+    /// `y` or `x`: the human approves or rejects what the focused source
+    /// shows.
+    fn verdict(&mut self, approve: bool) {
+        let Some(i) = self.focused() else {
+            self.flash("Nothing to approve: no source is open.");
+            return;
+        };
+        let source = &self.sources[i];
+        let name = source.name.clone();
+        let mut event = Value::obj()
+            .with("type", if approve { "approve" } else { "reject" })
+            .with("source", name.as_str())
+            .with("kind", source.kind);
+        source.origin(&mut event);
+        if let Some(t) = source.time_pos.filter(|_| source.web.is_none()) {
+            source.at_time(t, &mut event);
+        }
+        self.add_event(event);
+        self.flash(if approve {
+            format!("Approved {name}. Enter when you're done.")
+        } else {
+            format!("Rejected {name}: n says why. Enter when you're done.")
+        });
     }
 
     fn start_note(&mut self) {
@@ -959,6 +1124,7 @@ impl Viewer {
             time: None,
             resume: false,
             point: None,
+            range: None,
         };
         if let Some(i) = self.focused() {
             let source = &mut self.sources[i];
@@ -988,6 +1154,18 @@ impl Viewer {
                 prompt.text.pop();
             }
             Key::Ctrl('u') => prompt.text.clear(),
+            Key::Enter | Key::Esc | Key::Ctrl('c') if prompt.range.is_some() => {
+                let prompt = self.prompt.take().unwrap_or_else(|| unreachable!());
+                let text = prompt.text.trim().to_owned();
+                if let Some(mut event) = prompt.range {
+                    if key == Key::Enter && !text.is_empty() {
+                        event.set("note", text);
+                    }
+                    self.add_event(event);
+                    self.flash("Sent the range. More, or Enter when you're done.");
+                }
+                self.end_note(prompt.sid, prompt.resume);
+            }
             Key::Enter | Key::Esc | Key::Ctrl('c') if prompt.point.is_some() => {
                 let prompt = self.prompt.take().unwrap_or_else(|| unreachable!());
                 let text = prompt.text.trim().to_owned();
@@ -1005,14 +1183,9 @@ impl Viewer {
                     if let Some(source) = prompt.sid.and_then(|sid| self.source(sid)) {
                         event.set("source", source.name.as_str());
                         event.set("kind", source.kind);
-                        if source.web.is_some() {
-                            event.set("url", source.shown_target());
-                        } else {
-                            event.set("file", source.shown_target());
-                        }
+                        source.origin(&mut event);
                         if let Some(t) = prompt.time {
-                            event.set("time", round3(t));
-                            event.set("time_text", text::clock(t));
+                            source.at_time(t, &mut event);
                         }
                     }
                     self.add_event(event);
@@ -1088,7 +1261,9 @@ impl Viewer {
         let mut out = Vec::new();
         let mut reached = false;
         for event in &self.events {
-            if event.get_num("id").unwrap_or(0.0) as u64 <= *since {
+            let id = event.get_num("id").unwrap_or(0.0) as u64;
+            // A mark the human deleted: the delete event says so.
+            if id <= *since || self.deleted.contains(&id) {
                 continue;
             }
             let kind = event.get_str("type").unwrap_or("");
@@ -1266,6 +1441,7 @@ impl Viewer {
                     self.dirty = true;
                 }
                 self.on_restart(sid);
+                self.seek_done(i);
             }
             Some("end-file") if line.get_str("reason") == Some("error") => {
                 let source = &mut self.sources[i];
@@ -1338,6 +1514,7 @@ impl Viewer {
                 self.relayout();
             }
             "hwdec-current" => source.hwdec = data.str().map(|s| text::inert(s, 40)),
+            "container-fps" => source.fps = data.num().filter(|f| f.is_finite() && *f > 0.0),
             _ => {}
         }
         self.dirty = true;
@@ -1593,6 +1770,10 @@ impl Viewer {
             ));
         }
         check_target(target)?;
+        let edit = args
+            .get("edit")
+            .map(edit::Timeline::from_json)
+            .transpose()?;
         let play = args.get_bool("play").unwrap_or(false);
         let name = args.get_str("name");
         if let Some(name) = name
@@ -1617,6 +1798,8 @@ impl Viewer {
             source.review_to = None;
             source.loop_ab = None;
             source.log.clear();
+            source.edit = edit;
+            source.scrub = seekbar::Scrub::default();
             if let Some(player) = &mut source.player {
                 player.set("ab-loop-a", "no");
                 player.set("ab-loop-b", "no");
@@ -1675,6 +1858,9 @@ impl Viewer {
             placed: None,
             log: Vec::new(),
             web: None,
+            edit,
+            fps: None,
+            scrub: seekbar::Scrub::default(),
         });
         self.focus = Some(self.sources.len() - 1);
         self.record_dirty = true;
@@ -1828,15 +2014,18 @@ impl Viewer {
                 .shots
                 .join(format!("{}-{}.png", self.sources[i].sid, self.shot_count));
             let source = &mut self.sources[i];
-            let result = Value::obj()
+            let mut result = Value::obj()
                 .with("raw", path.display().to_string())
                 .with("source", source.name.as_str())
-                .with("kind", source.kind)
-                .with("file", source.shown_target())
-                .with("time_pos", source.time_pos.map(round3))
-                .with("time_text", source.time_pos.map(text::clock))
-                .with("duration", source.duration.map(round3))
-                .with("paused", source.paused);
+                .with("kind", source.kind);
+            source.origin(&mut result);
+            result.set("time_pos", source.time_pos.map(round3));
+            result.set("time_text", source.time_pos.map(text::clock));
+            result.set("duration", source.duration.map(round3));
+            result.set("paused", source.paused);
+            if let (Some(edit), Some(t)) = (&source.edit, source.time_pos) {
+                edit.describe(t, &mut result);
+            }
             let path = path.display().to_string();
             let request = source
                 .player
@@ -2062,13 +2251,17 @@ impl Viewer {
         }
         let mut v = Value::obj()
             .with("source", s.name.as_str())
-            .with("kind", s.kind)
-            .with("file", s.shown_target())
-            .with("status", s.status())
-            .with("time_pos", s.time_pos.map(round3))
-            .with("time_text", s.time_pos.map(text::clock))
-            .with("duration", s.duration.map(round3))
-            .with("paused", s.paused);
+            .with("kind", s.kind);
+        s.origin(&mut v);
+        v.set("status", s.status());
+        v.set("time_pos", s.time_pos.map(round3));
+        v.set("time_text", s.time_pos.map(text::clock));
+        v.set("duration", s.duration.map(round3));
+        v.set("paused", s.paused);
+        v.set("frame", s.frame());
+        if let (Some(edit), Some(t)) = (&s.edit, s.time_pos) {
+            edit.describe(t, &mut v);
+        }
         if let Some((a, b)) = s.loop_ab {
             v.set("loop", vec![round3(a), round3(b)]);
         }
@@ -2203,8 +2396,6 @@ fn mpv_key(key: &Key) -> Option<&'static str> {
         Key::Char('J') => "J",
         Key::Char('v') => "v",
         Key::Char('#') => "SHARP",
-        Key::Char('o') => "o",
-        Key::Char('i') => "i",
         _ => return None,
     })
 }

@@ -38,6 +38,7 @@ pub const OBSERVED: &[&str] = &[
     "dheight",
     "hwdec-current",
     "idle-active",
+    "container-fps",
 ];
 
 /// What a player's threads tell the viewer.

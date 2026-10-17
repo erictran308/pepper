@@ -9,6 +9,7 @@
 //! `frames`, `sheet`), and the human answers with events (`events`).
 
 mod cdp;
+mod edit;
 mod error;
 mod files;
 mod font;
@@ -25,8 +26,10 @@ mod proto;
 mod surface;
 mod sys;
 mod text;
+mod transcript;
 mod viewer;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -35,6 +38,35 @@ use error::{Error, Result};
 use json::Value;
 
 const GUIDE: &str = include_str!("../guide.md");
+
+/// `schema <name>`: each one's name, what it describes, and the schema.
+const SCHEMAS: &[(&str, &str, &str)] = &[
+    (
+        "edit",
+        "An edit project (pepper_edit 1), as edit validate, preview, timeline and render read it.",
+        include_str!("../schemas/edit.json"),
+    ),
+    (
+        "event",
+        "One of the human's events, as `events` answers with them and .pepper/events.jsonl keeps them.",
+        include_str!("../schemas/event.json"),
+    ),
+    (
+        "error",
+        "An error, as every command writes it on stderr.",
+        include_str!("../schemas/error.json"),
+    ),
+    (
+        "timeline",
+        "edit timeline's answer.",
+        include_str!("../schemas/timeline.json"),
+    ),
+    (
+        "render",
+        "edit render's answer.",
+        include_str!("../schemas/render.json"),
+    ),
+];
 
 struct Spec {
     name: &'static str,
@@ -61,6 +93,16 @@ const SPECS: &[Spec] = &[
         max: 0,
     },
     Spec {
+        name: "schema",
+        usage: "schema [edit|event|error|timeline|render]",
+        about: "JSON Schemas: the edit project (edit), the human's events (event), errors, and edit timeline's and edit render's answers. With no name, the list.",
+        example: "pepper-agent schema edit",
+        values: &[],
+        flags: &[],
+        min: 0,
+        max: 1,
+    },
+    Spec {
         name: "status",
         usage: "status",
         about: "Whether this shell is in Pepper, the viewers that run and what they show, what's installed, and what to do next.",
@@ -82,10 +124,10 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "open",
-        usage: "open <file|url> [--name NAME] [--play] [--kind media]",
-        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box.",
+        usage: "open <file|url> [--name NAME] [--play] [--kind media] [--edit PROJECT]",
+        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file.",
         example: "pepper-agent open raw/take1.mp4 --name take1",
-        values: &["name", "kind"],
+        values: &["name", "kind", "edit"],
         flags: &["play"],
         min: 1,
         max: 1,
@@ -257,6 +299,46 @@ const SPECS: &[Spec] = &[
         example: "pepper-agent sheet raw/take1.mp4 --from 1:00 --to 2:00",
         values: &["from", "to", "cols", "rows", "max"],
         flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "edit validate",
+        usage: "edit validate <project.json>",
+        about: "Checks an edit project, or video-use's edl.json as it is: every problem at once (INVALID_PROJECT, each saying where, like clips[1].out or ranges[1].end), or its output, length, clips and warnings. Needs no viewer.",
+        example: "pepper-agent edit validate cut.json",
+        values: &[],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "edit preview",
+        usage: "edit preview <project.json> [--name NAME] [--play]",
+        about: "Shows the cut (an edit project, or video-use's edl.json) in the viewer with nothing rendered (an mpv EDL of the clips), paused on its first frame unless --play. Marks, notes and points on it give the output's time and the clip, its file and the time in it. The output's size, fps and the fades show only in a render. Opening it again (after a change) shows the new cut in the same box.",
+        example: "pepper-agent edit preview cut.json",
+        values: &["name"],
+        flags: &["play"],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "edit timeline",
+        usage: "edit timeline <project.json> [--at T1,T2,...]",
+        about: "Where each clip is (an edit project's, or video-use's ranges): its span in its file and in the output. --at says which clip, file and file time each output time is, and what was said there if a transcript is beside it. Needs no viewer.",
+        example: "pepper-agent edit timeline cut.json --at 0:12.5,40",
+        values: &["at"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "edit render",
+        usage: "edit render <project.json> [-o OUT.mp4] [--quality draft|final] [--codec h264|hevc] [--overwrite]",
+        about: "Renders the cut with ffmpeg: draft (the default: quick, on the graphics chip) or final (x264 or x265, for the result). Into .pepper/renders/ unless -o, never over a clip's file. Progress as JSON lines on stderr; answers with the file, its length and a contact sheet of it. Needs no viewer.",
+        example: "pepper-agent edit render cut.json --quality final -o cut.mp4",
+        values: &["output", "quality", "codec"],
+        flags: &["overwrite"],
         min: 1,
         max: 1,
     },
@@ -433,7 +515,7 @@ const SPECS: &[Spec] = &[
 ];
 
 const GROUPS: &[(&str, &[&str])] = &[
-    ("Start here", &["guide", "status"]),
+    ("Start here", &["guide", "status", "schema"]),
     ("The viewer (the human runs it)", &["view"]),
     (
         "Sources",
@@ -447,6 +529,15 @@ const GROUPS: &[(&str, &[&str])] = &[
         &["play", "pause", "toggle", "seek", "loop", "where", "review"],
     ),
     ("Footage, from the file", &["probe", "frames", "sheet"]),
+    (
+        "Editing (a cut as a JSON project)",
+        &[
+            "edit validate",
+            "edit preview",
+            "edit timeline",
+            "edit render",
+        ],
+    ),
     (
         "Web preview (a page of your dev server, live)",
         &[
@@ -493,19 +584,24 @@ fn usage() -> String {
     out
 }
 
-/// `pepper-agent web`: its commands.
-fn web_usage() -> String {
-    let mut out = String::from(
-        "pepper-agent web <action>: a page in the viewer, live (a headless Chrome of the viewer's own).\n\n",
-    );
-    for spec in SPECS.iter().filter(|s| s.name.starts_with("web ")) {
+/// `pepper-agent web` or `pepper-agent edit`: its commands.
+fn group_usage(group: &str) -> String {
+    let intro = match group {
+        "web" => "a page in the viewer, live (a headless Chrome of the viewer's own)",
+        _ => "a cut as a JSON project (pepper-agent schema edit): checked, shown, rendered",
+    };
+    let mut out = format!("pepper-agent {group} <action>: {intro}.\n\n");
+    let prefix = format!("{group} ");
+    for spec in SPECS.iter().filter(|s| s.name.starts_with(&prefix)) {
         out += &format!(
             "  {:<13} {}\n",
             spec.name,
             spec.about.split(". ").next().unwrap_or("")
         );
     }
-    out += "\n`pepper-agent web <action> --help` has an example; `pepper-agent guide` has the workflow.\n";
+    out += &format!(
+        "\n`pepper-agent {group} <action> --help` has an example; `pepper-agent guide` has the workflow.\n"
+    );
     out
 }
 
@@ -562,7 +658,13 @@ fn parse_args(spec: &Spec, args: &[String]) -> Result<Args> {
             out.help = true;
             continue;
         }
-        let Some(option) = arg.strip_prefix("--") else {
+        // -o is --output.
+        let option = if arg == "-o" {
+            Some("output")
+        } else {
+            arg.strip_prefix("--")
+        };
+        let Some(option) = option else {
             return Err(bad_args(
                 spec,
                 format!("unknown option {}", text::inert(arg, 40)),
@@ -631,11 +733,13 @@ fn main() -> ExitCode {
         _ => {}
     }
     let human_anywhere = args.iter().any(|a| a == "--human");
-    // `web <action>` is one command.
+    // `web <action>` and `edit <action>` are one command.
     let (name, rest) = match (name.as_str(), args.get(1)) {
-        ("web", Some(action)) if !action.starts_with('-') => (format!("web {action}"), &args[2..]),
-        ("web", _) => {
-            print!("{}", web_usage());
+        ("web" | "edit", Some(action)) if !action.starts_with('-') => {
+            (format!("{name} {action}"), &args[2..])
+        }
+        ("web" | "edit", _) => {
+            print!("{}", group_usage(name));
             return ExitCode::SUCCESS;
         }
         _ => (name.clone(), &args[1..]),
@@ -804,9 +908,159 @@ fn run(spec: &Spec, args: &Args) -> Result<Value> {
             };
             media::sheet(&work_dir()?, &file, &ask)
         }
-        "snapshot" | "web shot" => snapshot(spec, args),
+        "snapshot" | "web shot" => {
+            let mut shot = snapshot(spec, args)?;
+            add_said(&mut shot, &mut HashMap::new());
+            Ok(shot)
+        }
+        "open" if args.value("edit").is_some() => open_with_edit(spec, args),
+        "schema" => schema(args),
+        "edit validate" => {
+            let project = edit::load(&work_dir()?, &args.plain[0])?;
+            Ok(Value::obj()
+                .with("project", project.path.display().to_string())
+                .with("valid", true)
+                .with("output", project.output.to_json())
+                .with("clips", project.clips.len())
+                .with("duration", round3(project.duration()))
+                .with("duration_text", text::clock(project.duration()))
+                .with("warnings", project.warnings.clone())
+                .with(
+                    "next",
+                    "Show it to the human: pepper-agent edit preview <project>. Where each clip lands: edit timeline.",
+                ))
+        }
+        "edit timeline" => edit_timeline(args),
+        "edit preview" => edit_preview(args),
+        "edit render" => {
+            let quality = match args.value("quality") {
+                None | Some("draft") => edit::Quality::Draft,
+                Some("final") => edit::Quality::Final,
+                Some(_) => return Err(bad_args(spec, "--quality: draft or final".into())),
+            };
+            let codec = match args.value("codec") {
+                None | Some("h264") => edit::Codec::H264,
+                Some("hevc" | "h265") => edit::Codec::Hevc,
+                Some(_) => return Err(bad_args(spec, "--codec: h264 or hevc".into())),
+            };
+            let work = work_dir()?;
+            let project = edit::load(&work, &args.plain[0])?;
+            let ask = edit::RenderAsk {
+                out: args.value("output").map(str::to_owned),
+                quality,
+                codec,
+                overwrite: args.flag("overwrite"),
+            };
+            edit::render(&work, &project, &ask)
+        }
         _ => to_viewer(spec, args),
     }
+}
+
+fn round3(t: f64) -> f64 {
+    (t * 1000.0).round() / 1000.0
+}
+
+/// `schema`: the list, or one.
+fn schema(args: &Args) -> Result<Value> {
+    let Some(name) = args.plain.first() else {
+        let list: Vec<Value> = SCHEMAS
+            .iter()
+            .map(|(name, about, _)| Value::obj().with("name", *name).with("about", *about))
+            .collect();
+        return Ok(Value::obj().with("schemas", list));
+    };
+    let (_, _, schema) = SCHEMAS.iter().find(|(n, _, _)| n == name).ok_or_else(|| {
+        Error::new(
+            "BAD_ARGS",
+            format!(
+                "no schema {}: edit, event, error, timeline or render",
+                text::inert(name, 40)
+            ),
+        )
+    })?;
+    json::parse(schema).map_err(|e| Error::new("FAILED", format!("the schema: {e}")))
+}
+
+fn edit_timeline(args: &Args) -> Result<Value> {
+    let times = match args.value("at") {
+        Some(list) => list
+            .split(',')
+            .map(|t| text::parse_at(t).map_err(|e| Error::new("BAD_TIME", e)))
+            .collect::<Result<Vec<f64>>>()?,
+        None => Vec::new(),
+    };
+    let project = edit::load(&work_dir()?, &args.plain[0])?;
+    let duration = project.duration();
+    let mut answer = Value::obj()
+        .with("project", project.path.display().to_string())
+        .with("output", project.output.to_json())
+        .with("duration", round3(duration))
+        .with("duration_text", text::clock(duration))
+        .with("clips", edit::table(&project));
+    if !times.is_empty() {
+        let timeline = edit::Timeline::of(&project);
+        let mut words = HashMap::new();
+        let at: Vec<Value> = times
+            .iter()
+            .map(|&t| {
+                let mut v = Value::obj()
+                    .with("time", round3(t))
+                    .with("time_text", text::clock(t));
+                timeline.describe(t, &mut v);
+                add_said(&mut v, &mut words);
+                v.take("project");
+                if t > duration {
+                    v.set("past_end", true);
+                }
+                v
+            })
+            .collect();
+        answer.set("at", at);
+    }
+    Ok(answer)
+}
+
+/// `edit preview`: the cut as an EDL in `.pepper/edits/`, opened in the
+/// viewer with its timeline, so the human's marks say where they are in the
+/// footage.
+fn edit_preview(args: &Args) -> Result<Value> {
+    let work = work_dir()?;
+    let project = edit::load(&work, &args.plain[0])?;
+    let name = match args.value("name") {
+        Some(name) => name.to_owned(),
+        None => Some(project.stem())
+            .filter(|s| viewer::valid_name(s))
+            .unwrap_or_else(|| "edit".into()),
+    };
+    let dir = work.join("edits");
+    files::private_dir(&dir)
+        .map_err(|e| Error::new("FAILED", format!("{}: {e}", dir.display())))?;
+    let edl = dir.join(format!("{}.edl", files::name_part(&name)));
+    files::write_private(&edl, edit::edl(&project).as_bytes())
+        .map_err(|e| Error::new("FAILED", format!("{}: {e}", edl.display())))?;
+    let request = Value::obj()
+        .with("target", edl.display().to_string())
+        .with("kind", "media")
+        .with("name", name)
+        .with("play", args.flag("play"))
+        .with("edit", edit::Timeline::of(&project).to_json());
+    let run_dir = proto::run_dir()?;
+    let viewer = proto::pick(&run_dir, args.viewer.as_deref())?;
+    let opened = proto::request(&run_dir, &viewer, "open", request, Duration::from_secs(60))?;
+    Ok(Value::obj()
+        .with("viewer", viewer.id.as_str())
+        .with("source", opened.get("source").cloned().unwrap_or(Value::Null))
+        .with("project", project.path.display().to_string())
+        .with("edl", edl.display().to_string())
+        .with("duration", round3(project.duration()))
+        .with("duration_text", text::clock(project.duration()))
+        .with("clips", edit::table(&project))
+        .with("warnings", project.warnings.clone())
+        .with(
+            "note",
+            "The preview plays each clip as its file is (size, rate, sound); the output's size and fps and the fades are made by edit render. Times you give seek, loop and review are the output's.",
+        ))
 }
 
 fn time_option(args: &Args, name: &str) -> Result<Option<f64>> {
@@ -1086,10 +1340,147 @@ fn to_viewer(spec: &Spec, args: &Args) -> Result<Value> {
     let viewer = proto::pick(&dir, args.viewer.as_deref())?;
     let cmd = spec.name.replace(' ', ".");
     let mut answer = proto::request(&dir, &viewer, &cmd, request, answer_wait(spec, args))?;
+    let mut words = HashMap::new();
+    match spec.name {
+        "events" => {
+            if let Some(Value::Arr(events)) = answer.get("events").cloned() {
+                let events: Vec<Value> = events
+                    .into_iter()
+                    .map(|mut e| {
+                        add_said(&mut e, &mut words);
+                        e
+                    })
+                    .collect();
+                answer.set("events", events);
+            }
+        }
+        "where" => add_said(&mut answer, &mut words),
+        _ => {}
+    }
     if let Value::Obj(members) = &mut answer {
         members.insert(0, ("viewer".into(), Value::from(viewer.id.as_str())));
     }
     Ok(answer)
+}
+
+/// Adds `said` to a time of a file (an event, `where`'s answer, a
+/// snapshot's), and `to_said` to a range's end: what was being said then
+/// and the pauses around it, from a word-level transcript beside the edit
+/// or the footage (video-use's).
+fn add_said(v: &mut Value, cache: &mut HashMap<PathBuf, Option<transcript::Words>>) {
+    for (prefix, time, out) in [("", "time", "said"), ("to_", "to", "to_said")] {
+        if let Some(said) = said_at(v, prefix, time, cache) {
+            v.set(out, said);
+        }
+    }
+}
+
+fn said_at(
+    v: &Value,
+    prefix: &str,
+    time: &str,
+    cache: &mut HashMap<PathBuf, Option<transcript::Words>>,
+) -> Option<Value> {
+    let project = v.get_str("project").map(PathBuf::from);
+    let src = v.get_str(&format!("{prefix}src"));
+    let src_time = v.get_num(&format!("{prefix}src_time"));
+    let (src, t) = match (src, src_time) {
+        (Some(src), Some(t)) => (PathBuf::from(src), t),
+        _ => {
+            let file = v.get_str("file").filter(|f| f.starts_with('/'))?;
+            let t = v
+                .get_num(time)
+                .or_else(|| (prefix.is_empty()).then(|| v.get_num("time_pos")).flatten())?;
+            // A render shown with its cut is placed by the cut, not the file.
+            if project.is_some() {
+                return None;
+            }
+            (PathBuf::from(file), t)
+        }
+    };
+    let path = edit::transcript_for(project.as_deref(), &src)?;
+    let words = cache
+        .entry(path.clone())
+        .or_insert_with(|| transcript::Words::load(&path));
+    let mut said = words.as_ref()?.at(t)?;
+    said.set("transcript", path.display().to_string());
+    Some(said)
+}
+
+/// `open <render> --edit <project>`: a render of a cut (video-use's
+/// `render.py` output, or `edit render`'s) shown with the cut's timeline,
+/// so the human's marks on the real thing give the clip and the time in its
+/// file.
+fn open_with_edit(spec: &Spec, args: &Args) -> Result<Value> {
+    let mut request = request_args(spec, args)?;
+    if request.get_str("kind") != Some("media") {
+        return Err(bad_args(
+            spec,
+            "--edit goes with a video file (a render of the cut)".into(),
+        ));
+    }
+    let project = edit::load(&work_dir()?, args.value("edit").unwrap_or(""))?;
+    request.set("edit", edit::Timeline::of(&project).to_json());
+    let dir = proto::run_dir()?;
+    let viewer = proto::pick(&dir, args.viewer.as_deref())?;
+    let opened = proto::request(&dir, &viewer, "open", request, answer_wait(spec, args))?;
+    // What an EDL's preview leaves out is in its render: not said here.
+    let mut warnings: Vec<Value> = project
+        .warnings
+        .iter()
+        .filter(|w| w.get_str("at") != Some("preview"))
+        .cloned()
+        .collect();
+    let cut = project.duration();
+    if let Some(d) = opened.get("source").and_then(|s| s.get_num("duration"))
+        && (d - cut).abs() > 0.1
+    {
+        warnings.push(
+            Value::obj().with("at", "").with(
+                "warning",
+                format!(
+                    "the file is {}, the cut {}: is it this cut's render? Marks after a difference land off",
+                    text::clock(d),
+                    text::clock(cut)
+                ),
+            ),
+        );
+    }
+    Ok(Value::obj()
+        .with("viewer", viewer.id.as_str())
+        .with(
+            "source",
+            opened.get("source").cloned().unwrap_or(Value::Null),
+        )
+        .with("project", project.path.display().to_string())
+        .with("duration", round3(cut))
+        .with("clips", edit::table(&project))
+        .with("warnings", warnings))
+}
+
+/// video-use (github.com/browser-use/video-use), the editing skill
+/// pepper-agent shows the work of, if it's where agents keep skills (or at
+/// VIDEO_USE_DIR).
+fn video_use() -> Value {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let found = std::env::var_os("VIDEO_USE_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .chain(home.into_iter().flat_map(|h| {
+            [".claude/skills", ".codex/skills", ".agents/skills"]
+                .map(|d| h.join(d).join("video-use"))
+        }))
+        .find(|d| d.join("SKILL.md").is_file() && d.join("helpers").join("render.py").is_file());
+    match found {
+        Some(dir) => Value::obj()
+            .with("installed", true)
+            .with("path", dir.display().to_string())
+            .with("how", "It transcribes, cuts (edit/edl.json) and renders; Pepper shows its EDL (edit preview edit/edl.json) and renders (open edit/preview.mp4 --edit edit/edl.json) to the human, and hands back their marks with the range, the time in the source and what was said. See the guide."),
+        None => Value::obj().with("installed", false).with(
+            "install",
+            "optional, for transcript-driven editing: github.com/browser-use/video-use (a skill for coding agents)",
+        ),
+    }
 }
 
 /// `snapshot`, and `web shot`: the viewer writes the picture in its own
@@ -1203,6 +1594,12 @@ fn snapshot(spec: &Spec, args: &Args) -> Result<Value> {
         "time_text",
         "duration",
         "paused",
+        "project",
+        "clip",
+        "clip_name",
+        "src",
+        "src_time",
+        "src_time_text",
     ] {
         if let Some(v) = shot.get(key) {
             answer.set(key, v.clone());
@@ -1346,6 +1743,7 @@ fn status(args: &Args) -> Result<Value> {
         .with("socket_dir", dir.display().to_string())
         .with("hwdec", hwdec)
         .with("deps", deps)
+        .with("video_use", video_use())
         .with("next", next))
 }
 
@@ -1391,13 +1789,22 @@ mod tests {
             .iter()
             .map(|s| s.name.replace(' ', "."))
             .filter(|n| {
-                !["guide", "view", "probe", "frames", "sheet", "snapshot"].contains(&n.as_str())
+                ![
+                    "guide", "view", "probe", "frames", "sheet", "snapshot", "schema",
+                ]
+                .contains(&n.as_str())
+                    && !n.starts_with("edit.")
             })
             .collect();
         for name in viewer_side {
             assert!(proto::COMMANDS.contains(&name.as_str()), "{name}");
         }
-        assert!(web_usage().contains("web wait-for"));
+        assert!(group_usage("web").contains("web wait-for"));
+        assert!(group_usage("edit").contains("edit render"));
+        for (name, _, schema) in SCHEMAS {
+            let schema = json::parse(schema).unwrap_or_else(|e| panic!("schema {name}: {e}"));
+            assert!(schema.get_str("$schema").is_some(), "{name}");
+        }
     }
 
     #[test]
@@ -1419,6 +1826,14 @@ mod tests {
         assert!(a.human);
         let a = parse_args(spec("open"), &strings(&["--", "--odd.mp4"])).unwrap();
         assert_eq!(a.plain, ["--odd.mp4"]);
+        let a = parse_args(spec("edit render"), &strings(&["cut.json", "-o", "x.mp4"])).unwrap();
+        assert_eq!(a.value("output"), Some("x.mp4"));
+        assert_eq!(
+            parse_args(spec("open"), &strings(&["a", "-o", "x"]))
+                .unwrap_err()
+                .code,
+            "BAD_ARGS"
+        );
         let code =
             |name: &str, args: &[&str]| parse_args(spec(name), &strings(args)).unwrap_err().code;
         assert_eq!(code("open", &[]), "BAD_ARGS");

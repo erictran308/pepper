@@ -2,8 +2,8 @@
 
 Pepper is a terminal (Ghostty, with video added) that shows video and live
 pages inside its panes. `pepper-agent` lets you, an agent, show the human a
-video or the web app you're building, steer what they see, and hear back
-what they point at.
+video, a cut you're editing or the web app you're building, steer what they
+see, and hear back what they point at.
 
 **You can't see Pepper's screen**, and nothing here lets you: frames never
 come back through the terminal. So:
@@ -12,7 +12,7 @@ come back through the terminal. So:
 - you see the same pictures as files made from the source: `snapshot` and
   `web shot` (what a source shows now), `frames` and `sheet` (from a file);
 - the human answers with **events**: marks, points and regions (clicks and
-  drags, with what's there), notes, done;
+  drags, with what's there), notes, approve or reject, done;
 - you steer the viewer with commands, and tell the human what to do with `say`.
 
 Every command prints one JSON object on stdout. Errors are JSON on stderr,
@@ -50,6 +50,55 @@ timeout, 10 at most): give it one, or wait less and run it again. Nothing is
 lost between calls. A mark has `time` and `time_text`; look at it with
 `frames video.mp4 --at <time>`, or `seek <time>` then `snapshot`. To ask
 about one part: `review 0:12 0:18` plays it, then `say` the question.
+
+## Editing a video with the human
+
+The cut is a JSON project you write (`pepper-agent schema edit` has it all):
+
+```json
+{"pepper_edit": 1, "output": {"width": 1920, "height": 1080, "fps": 30},
+ "clips": [{"src": "raw/a.mp4", "in": "0:03.2", "out": "0:11", "name": "intro"},
+           {"src": "raw/b.mp4", "in": 40, "out": 52.5, "audio": {"fade_in": 0.2, "fade_out": 0.5}}]}
+```
+
+```sh
+pepper-agent sheet raw/a.mp4                  # each file: probe, sheet, frames to pick in and out
+pepper-agent edit validate cut.json           # every problem at once, each with where (clips[1].out)
+pepper-agent edit preview cut.json            # the cut in the viewer, nothing rendered
+pepper-agent say "The rough cut: m marks what to change, n says how, y if it's good, Enter when done"
+pepper-agent events --wait 300 --until done --since 0
+pepper-agent edit render cut.json --quality final -o cut.mp4   # only once they approve (y)
+```
+
+`src` is from the project's folder; `in` and `out` default to the file's start
+and end; `output` to the first clip's size and rate (`fit`: `pad` or `crop`).
+On a preview, an event's `time` is the cut's; `clip` (its index in `clips`),
+`src` and `src_time` say where that is in the footage, so change that clip:
+its `in` or `out` to the `src_time`, or drop it. Then `edit validate`, `edit
+preview` again (same box), `review` the changed part, and ask again. The
+preview plays each file as it is: the output's size and rate and the fades
+are made by `edit render` (draft by default: quick, into `.pepper/renders/`;
+never over a source). Look at its `sheet`; `open` it to show the human.
+
+### With video-use (transcript-driven editing)
+
+If `status` says `video_use.installed`, its skill edits (Scribe transcripts,
+`edit/edl.json`, `helpers/render.py`): Pepper is where the human sees it and
+points. Don't convert its EDL; every edit command reads it as it is.
+
+```sh
+pepper-agent edit preview edit/edl.json                  # its cut, before any render
+python <video_use.path>/helpers/render.py edit/edl.json -o edit/preview.mp4 --preview
+pepper-agent open edit/preview.mp4 --edit edit/edl.json  # the render: grade, subtitles, overlays
+pepper-agent events --wait 300 --until done --since 0
+```
+
+Show the human its preview this way, not by asking them to open a file. Their
+marks on either name the range (`clip`, its `beat` as `clip_name`, its time
+in the source) and, from `edit/transcripts/`, `said`: the phrase, the word,
+and `pause_before`/`pause_after`, the silences to put a new cut edge in
+(never inside a word). A range (`i`…`o`) gives both ends (`to_src_time`,
+`to_said`). Change those ranges in edl.json, render again with render.py.
 
 ## Building a web UI with the human
 
@@ -94,6 +143,10 @@ machine (localhost, 127.0.0.1, ::1, files) unless opened with
 | `events` | `pepper-agent events --wait 300 --until done --since 3` | The human's marks, points, regions, notes, done (below) |
 | `play`, `pause`, `toggle`, `seek <t>`, `loop <a> <b>`, `where`, `review <a> [b]` | `pepper-agent seek 1:23.5` | Playback of a video: `83.5`, `1:23.5`, `+5`, `-2`; `loop off` |
 | `probe`, `frames`, `sheet` | `pepper-agent frames a.mp4 --at 12,1:03` | A file's streams, frames (100 at most), contact sheet |
+| `edit validate`, `edit timeline` | `pepper-agent edit timeline cut.json --at 0:12.5` | Checks a project (all problems at once); where each clip lands, output ↔ file times |
+| `edit preview` | `pepper-agent edit preview cut.json` | The cut in the viewer, nothing rendered; again after a change, in the same box |
+| `edit render` | `pepper-agent edit render cut.json --quality final -o cut.mp4` | Draft (VideoToolbox, the default) or final (x264; `--codec hevc`); progress on stderr |
+| `schema [name]` | `pepper-agent schema event` | JSON Schemas: `edit` (the project), `event`, `error`, `timeline`, `render` |
 | `web open <url>` | `pepper-agent web open localhost:3000 --device iphone-15` | A page, live; `--device` desktop-1440, desktop-1920, laptop-1280, ipad, iphone-15, pixel-8 or `WxH@DPR`; `--dark`; `--watch DIR` reloads on changes |
 | `web goto`, `reload`, `back` | `pepper-agent web goto localhost:3000/cart` | Navigates and waits for the load |
 | `web click`, `hover <sel\|x,y>` | `pepper-agent web click 'button[type=submit]'` | As a mouse would, in view of the human; x,y in CSS pixels |
@@ -120,14 +173,20 @@ and `at` (when, UTC), and `source` and `kind` when it's about one.
 {"id": 5, "type": "note", "text": "the logo jumps here", "source": "a", "time": 15.2, "time_text": "0:15.200"}
 {"id": 6, "type": "point", "source": "app", "kind": "web", "url": "http://localhost:5173/", "x": 412, "y": 233, "viewport": {"width": 1440, "height": 900, "dpr": 2}, "element": {"selector": "div.card.promo", "tag": "div", "role": "generic", "text": "Spring sale", "rect": {"x": 389, "y": 210, "width": 320, "height": 96}, "styles": {"margin": "24px 24px 24px 41px"}, "parent": {"selector": "main", "rect": {}}, "source": {"file": "/src/Promo.tsx", "line": 12}}, "snapshot": "/p/.pepper/points/app-…-full.png", "crop": "/p/.pepper/points/app-…-crop.png", "note": "align with the header"}
 {"id": 7, "type": "region", "source": "a", "kind": "media", "x": 100, "y": 50, "w": 320, "h": 180, "time": 15.2, "snapshot": "…", "crop": "…"}
-{"id": 8, "type": "done"}
+{"id": 8, "type": "mark", "source": "cut", "kind": "media", "project": "/p/cut.json", "time": 14.2, "time_text": "0:14.200", "clip": 1, "src": "/p/raw/b.mp4", "src_time": 46.2, "src_time_text": "0:46.200", "said": {"phrase": "we fixed this", "word": {"text": "fixed", "start": 46.1, "end": 46.4}, "pause_before": [45.3, 45.9], "pause_after": [46.6, 47.2]}}
+{"id": 9, "type": "range", "source": "cut", "time": 20.1, "to": 23.5, "length": 3.4, "clip": 2, "src_time": 3.1, "to_clip": 2, "to_src_time": 6.5, "note": "cut this"}
+{"id": 10, "type": "approve", "source": "cut", "kind": "media", "project": "/p/cut.json", "time": 20.0}
+{"id": 11, "type": "delete", "source": "cut", "deletes": [9], "deleted": {"type": "range", "time": 20.1, "to": 23.5, "note": "cut this"}}
+{"id": 12, "type": "done"}
 ```
 
-`x`, `y` (and `w`, `h`) are in the source's own units: a video's pixels, a
+A `delete` is the human taking a mark back: forget it (later answers leave it
+out). `x`, `y` (and `w`, `h`) are in the source's own units: a video's pixels, a
 page's CSS pixels. `events` options: `--wait SECONDS` (up to 3600) waits for
-one; `--until done` waits for that type and returns all before it too;
-`--type point,note` and `--source NAME` filter; `--since ID` skips what
-you've seen. The answer has `events`, `last_id` and `events_file`
+one; `--until done` waits for that type (or any of a list, `done,reject`) and
+returns all before it too; `--type point,note` and `--source NAME` filter;
+`--since ID` skips what you've seen. The answer has `events`, `last_id` and
+`events_file`
 (`.pepper/events.jsonl` in the viewer's project).
 
 ## Keys to tell the human
@@ -136,8 +195,13 @@ you've seen. The answer has `events`, `last_id` and `events_file`
 |---|---|
 | click, drag | Point at something, or mark a region; a note prompt opens (Enter sends, Esc sends it without) |
 | `m`, `n` | Mark this moment of a video; write a note (a video pauses while they type) |
+| `i`, `o` | A range of a video: `i` at its start, `o` at its end, then a note ("cut this") |
 | `Enter` | Done: tells you they've finished (`--until done`) |
-| `space`, `←` `→` | A video: pause, seek 5 s (`↑` `↓`: 1 min; `,` `.`: a frame) |
+| `y`, `x` | Approve or reject what's shown (a cut, a render); after `x`, `n` says why |
+| `space`, `,` `.`, `←` `→` | A video: pause, a frame back or on, 5 s (`↑` `↓`: 1 min) |
+| the bar, the wheel | A video: click or drag the bar under it to go there; the wheel steps a frame a notch; paused, the label gives the frame |
+| `<`, `>` | A video: to their previous or next mark, note, point or range (◆ on the bar); paused on one, what they wrote shows |
+| `d`, `d` | Delete the mark they're paused on (asks once): you get a `delete` event |
 | wheel, `↑` `↓`, `r` | A page: scroll; reload |
 | `Tab`, `1`–`4`, `z`, `q` | Focus another source; zoom one to the whole pane; quit the viewer |
 
@@ -153,6 +217,7 @@ you've seen. The answer has `events`, `last_id` and `events_file`
 | `LIMIT_REACHED` | Close a source, or ask for a second viewer and use `--viewer` |
 | `TIMEOUT` | Nothing yet: wait again, or `say` something to the human |
 | `BAD_TIME`, `BAD_ARGS` | See the hint's example, or `<command> --help` |
+| `INVALID_PROJECT` | Fix each of `problems` (`at` says where, like `clips[1].out`), then `edit validate` |
 | `MISSING_DEP` | Install what the message names (`brew install ffmpeg`, `brew install mpv`, Chrome) |
 | `NOT_PLAYABLE` | That has no timeline (a page) or no picture |
 | `UNSUPPORTED`, `FAILED` | Not in this version (streams, devices come later); read the message |
@@ -167,5 +232,6 @@ you've seen. The answer has `events`, `last_id` and `events_file`
   where the human says.
 - Snapshots, crops and frames are the human's: don't upload them anywhere
   without asking. Don't open remote pages with `--allow-remote` unless asked.
-- Prefer showing (`open`, `review`, a live page) to rendering new files.
+- Prefer showing (`open`, `review`, `edit preview`, a live page) to rendering
+  new files; render `--quality final` once the human approves.
 - Ask before deleting anything. Don't put passwords in commands; they're logged.
