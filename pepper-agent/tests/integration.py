@@ -7,9 +7,10 @@ nowhere: everything but the picture on screen is real (pepper-play, mpv, the
 socket, the keys, what the viewer writes to its terminal, snapshots). The
 picture is checked by hand in a test Pepper (README's "Trying it").
 
-Usage: tests/integration.py [--agent PATH] [--play PATH]
+Usage: tests/integration.py [--agent PATH] [--play PATH] [--only GROUP,...]
   --agent  pepper-agent to test (default: target/debug/pepper-agent, built)
   --play   pepper-play to use (default: $PEPPER_PLAY, or Pepper.app's)
+  --only   after the basics, only these groups: edit, web, sharing, live
 Needs ffmpeg, and mpv's library (brew install mpv).
 """
 
@@ -27,6 +28,10 @@ import tempfile
 import termios
 import threading
 import time
+import stat
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from rtsp_server import RtspServer  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CRATE = os.path.dirname(HERE)
@@ -714,6 +719,149 @@ def sharing_checks(cli, viewer, work, project, clip):
     for name in ("before", "after"):
         cli("close", name)
 
+def mean_rgb(path):
+    """A picture's mean colour, (r, g, b)."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", "scale=1:1:flags=area,format=rgb24",
+                          "-f", "rawvideo", "-"], capture_output=True).stdout
+    return tuple(raw[:3]) if len(raw) >= 3 else (0, 0, 0)
+
+
+def colour(path, rgb):
+    """Write a 320x240 picture of one colour."""
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=0x%02x%02x%02x:s=320x240" % rgb,
+                    "-frames:v", "1", path], check=True)
+
+
+def until(what, timeout=8):
+    """Waits for `what()` to be true; its last value."""
+    end = time.time() + timeout
+    value = what()
+    while not value and time.time() < end:
+        time.sleep(0.2)
+        value = what()
+    return value
+
+
+def live_checks(cli, viewer, work, env, run_dir):
+    """Watched files, pipes and streams."""
+    for source in cli("sources").get("sources", []):
+        cli("close", source["name"], "--force")
+    near = lambda a, b: all(abs(x - y) < 40 for x, y in zip(a, b))
+
+    # A watched picture, rendered again in place and by a rename.
+    plot = os.path.join(work, "plot.png")
+    colour(plot, (220, 20, 20))
+    w = cli("watch", plot, "--name", "plot").get("source", {})
+    check("watch shows a picture", w.get("kind") == "watch" and w.get("reloads") == 0, w)
+    check("as it is", near(mean_rgb(cli("snapshot", "plot").get("path", "")), (220, 20, 20)))
+    colour(plot, (20, 20, 220))
+    again = until(lambda: cli("where", "plot").get("reloads") == 1)
+    check("a render in place is shown again", again and near(mean_rgb(cli("snapshot", "plot").get("path", "")), (20, 20, 220)))
+    tmp = os.path.join(work, "plot.tmp.png")
+    colour(tmp, (20, 200, 20))
+    os.replace(tmp, plot)
+    again = until(lambda: cli("where", "plot").get("reloads") == 2)
+    check("and one written aside and renamed", again and near(mean_rgb(cli("snapshot", "plot").get("path", "")), (20, 200, 20)))
+    check("the human is told", viewer.wait_for(b"plot was rendered again"))
+    time.sleep(1)
+    check("a file that doesn't change isn't shown again", cli("where", "plot").get("reloads") == 2)
+    clip3 = os.path.join(work, "loop.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25", "-t", "1.5",
+                    "-pix_fmt", "yuv420p", clip3], check=True)
+    cli("watch", clip3, "--name", "loop")
+    time.sleep(2.5)
+    lp = cli("where", "loop")
+    check("a watched video loops", lp.get("status") == "playing" and (lp.get("time_pos") or 9) < 1.5, lp)
+    cli("close", "loop")
+    cli("close", "plot")
+
+    # A pipe: y4m from ffmpeg, twice; raw BGRA from Python.
+    p = cli("pipe", "new", "--name", "sim")
+    fifo = p.get("pipe", "")
+    st = os.stat(fifo) if os.path.exists(fifo) else None
+    check("pipe new makes a FIFO only the user opens", st is not None and stat.S_ISFIFO(st.st_mode)
+          and oct(st.st_mode & 0o777) == "0o600" and fifo.startswith(run_dir), (fifo, st))
+    check("it waits for a writer", p.get("source", {}).get("status") == "waiting" and "ffmpeg" in p.get("try", ""), p)
+    writer = lambda size, secs: subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-re", "-f", "lavfi", "-i", f"testsrc2=size={size}:rate=25", "-t", str(secs),
+         "-f", "yuv4mpegpipe", "-y", fifo], stdin=subprocess.DEVNULL)
+    first = writer("320x240", 3)
+    live = until(lambda: cli("where", "sim").get("status") == "playing")
+    where = cli("where", "sim")
+    check("a writer's frames show", live and where.get("writers") == 1 and where.get("width") == 320, where)
+    shot = cli("snapshot", "sim")
+    check("a snapshot of a pipe", shot.get("width") == 320 and os.path.isfile(shot.get("path", "")), shot)
+    norec = cli("record", "start", "sim", ok=False)
+    check("a pipe can't be recorded yet: UNSUPPORTED", norec.get("error", {}).get("code") == "UNSUPPORTED", norec)
+    first.wait()
+    check("when it closes, the pipe waits for the next",
+          until(lambda: cli("where", "sim").get("status") == "waiting"))
+    second = writer("160x120", 1)
+    check("the next writer shows", until(lambda: cli("where", "sim").get("width") == 160)
+          and cli("where", "sim").get("writers") == 2)
+    second.wait()
+    raw = cli("pipe", "new", "--format", "bgra", "--size", "64x48", "--fps", "10", "--name", "raw")
+    with open(raw.get("pipe", "/nonexistent"), "wb") as f:
+        for _ in range(15):
+            f.write(bytes([30, 200, 30, 255]) * 64 * 48)
+            f.flush()
+            time.sleep(0.1)
+        until(lambda: cli("where", "raw").get("status") == "playing")
+        check("raw BGRA frames show", near(mean_rgb(cli("snapshot", "raw").get("path", "")), (30, 200, 30)))
+    bad = cli("pipe", "new", "--format", "bgra", ok=False)
+    check("raw frames need a size", bad.get("error", {}).get("code") == "BAD_ARGS", bad)
+    t0 = time.time()
+    cli("close", "raw")
+    cli("close", "sim")
+    check("a waiting pipe closes at once, and its FIFO goes",
+          time.time() - t0 < 3 and not os.path.exists(fifo), time.time() - t0)
+
+    # A stream behind a password: from the environment, never shown.
+    server = RtspServer(user="cam", password="s3cret-Pw")
+    env["PEPPER_AGENT_TEST_CAM"] = "cam:s3cret-Pw"
+    o = cli("open", server.address, "--credentials-env", "PEPPER_AGENT_TEST_CAM", "--name", "cam")
+    src = o.get("source", {})
+    check("open rtsp:// is a stream, playing", src.get("kind") == "stream" and src.get("status") == "playing", o)
+    check("its address is shown without the password", src.get("target") == server.address.replace("rtsp://", "rtsp://***@"), src)
+    check("the password reached the camera", server.auth_seen and server.auth_seen[-1] == "cam:s3cret-Pw", server.auth_seen)
+    shot = cli("snapshot", "cam")
+    check("a snapshot of a stream", shot.get("width") == 640, shot)
+    since = cli("events").get("last_id", 0)
+    cli("focus", "cam")
+    viewer.keys(b"m")
+    ev = cli("events", "--since", str(since))
+    server.drop()
+    check("a stream that drops is tried again", until(lambda: cli("where", "cam").get("status") == "reconnecting", 5))
+    back = until(lambda: cli("where", "cam").get("status") == "playing", 15)
+    check("and comes back", back and cli("where", "cam").get("reconnects", 0) >= 1 and server.clients >= 2,
+          (cli("where", "cam"), server.clients))
+    cli("record", "start", "cam")
+    time.sleep(3)
+    rec = cli("record", "stop", "cam", timeout=120)
+    # From the next keyframe (one a second here) on.
+    check("a stream's recording, its packets as they came", os.path.isfile(rec.get("path", ""))
+          and 1.8 < (rec.get("duration") or 0) < 3.5, rec)
+    env["PEPPER_AGENT_TEST_CAM"] = "cam:wrong-Pw"
+    wrong = cli("open", server.address, "--credentials-env", "PEPPER_AGENT_TEST_CAM", "--name", "cam2", ok=False)
+    check("wrong credentials: LOAD_FAILED, tried again", wrong.get("error", {}).get("code") == "LOAD_FAILED"
+          and "tried again" in wrong.get("error", {}).get("hint", ""), wrong)
+    plain = cli("open", server.address.replace("rtsp://", "rtsp://cam:s3cret-Pw@"), "--name", "cam3")
+    check("a password in the address works too", plain.get("source", {}).get("status") == "playing", plain)
+    said = [json.dumps(x) for x in (o, ev, wrong, plain, cli("sources"), cli("status"), cli("where", "cam"), rec, shot)]
+    files = [os.path.join(run_dir, f"{viewer.pid}.json"), os.path.join(run_dir, f"{viewer.pid}.log"),
+             os.path.join(viewer.cwd, ".pepper", "events.jsonl")]
+    said += [open(f, errors="replace").read() for f in files if os.path.exists(f)]
+    procs = subprocess.run(["ps", "-A", "-o", "args="], capture_output=True, text=True).stdout
+    leaks = [s[:200] for s in said if "s3cret" in s or "wrong-Pw" in s]
+    check("the password is in no answer, event, record or log", not leaks and len(said) == 12, leaks)
+    check("nor on the screen", b"s3cret" not in viewer.screen() and b"wrong-Pw" not in viewer.screen())
+    check("nor in any command line", "s3cret" not in procs and "wrong-Pw" not in procs)
+    for name in ("cam", "cam2", "cam3"):
+        cli("close", name)
+    server.close()
+    env.pop("PEPPER_AGENT_TEST_CAM", None)
+
+
 
 def web_checks(cli, viewer, work, run_dir):
     if not cli("status").get("deps", {}).get("chrome", {}).get("ok"):
@@ -835,6 +983,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent")
     ap.add_argument("--play")
+    ap.add_argument("--only", default="edit,web,sharing,live")
     a = ap.parse_args()
     agent = a.agent
     if not agent:
@@ -973,9 +1122,15 @@ def main():
     check("the socket is the user's only", oct(os.stat(sock_path).st_mode & 0o777) == "0o600")
     check("its folder too", oct(os.stat(os.path.dirname(sock_path)).st_mode & 0o777) == "0o700")
 
-    edit_checks(cli, viewer, work, project, clip, hostile)
-    web_checks(cli, viewer, work, os.path.dirname(sock_path))
-    sharing_checks(cli, viewer, work, project, clip)
+    only = a.only.split(",")
+    if "edit" in only:
+        edit_checks(cli, viewer, work, project, clip, hostile)
+    if "web" in only:
+        web_checks(cli, viewer, work, os.path.dirname(sock_path))
+    if "sharing" in only:
+        sharing_checks(cli, viewer, work, project, clip)
+    if "live" in only:
+        live_checks(cli, viewer, work, env, os.path.dirname(sock_path))
 
     def raw(payload):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
