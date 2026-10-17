@@ -216,6 +216,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Whether or not we have custom shaders.
         has_custom_shaders: bool = false,
 
+        /// pepper: the textures our custom shaders draw through, if we have
+        /// any: one set for the whole swap chain, not one per frame.
+        custom_shader_state: ?CustomShaderState = null,
+
         /// Our shader pipelines.
         shaders: Shaders,
 
@@ -332,13 +336,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// See property of same name on Renderer for explanation.
             bg_image_buffer_modified: usize = 0,
 
-            /// Custom shader state, this is null if we have no custom shaders.
-            custom_shader_state: ?CustomShaderState = null,
+            /// The custom shaders' uniforms, this is null if we have no
+            /// custom shaders. pepper: only these are per frame; the
+            /// textures are the renderer's `custom_shader_state`.
+            custom_shader_uniforms: ?CustomShaderUniforms = null,
 
             const UniformBuffer = Buffer(shaderpkg.Uniforms);
             const CellBgBuffer = Buffer(shaderpkg.CellBg);
             const CellTextBuffer = Buffer(shaderpkg.CellText);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
+            const CustomShaderUniforms = Buffer(shadertoy.Uniforms);
 
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
                 // Uniform buffer contains exactly 1 uniform struct. The
@@ -382,12 +389,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 });
                 errdefer color.deinit();
 
-                var custom_shader_state =
+                var custom_shader_uniforms =
                     if (custom_shaders)
-                        try CustomShaderState.init(api)
+                        try CustomShaderUniforms.init(api.uniformBufferOptions(), 1)
                     else
                         null;
-                errdefer if (custom_shader_state) |*state| state.deinit();
+                errdefer if (custom_shader_uniforms) |*buffer| buffer.deinit();
 
                 // Initialize the target. Just as with the other resources,
                 // start it off as small as we can since it'll be resized.
@@ -401,7 +408,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .grayscale = grayscale,
                     .color = color,
                     .target = target,
-                    .custom_shader_state = custom_shader_state,
+                    .custom_shader_uniforms = custom_shader_uniforms,
                 };
             }
 
@@ -413,7 +420,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.grayscale.deinit();
                 self.color.deinit();
                 self.bg_image_buffer.deinit();
-                if (self.custom_shader_state) |*state| state.deinit();
+                if (self.custom_shader_uniforms) |*uniforms| uniforms.deinit();
             }
 
             pub fn resize(
@@ -422,9 +429,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 width: usize,
                 height: usize,
             ) !void {
-                if (self.custom_shader_state) |*state| {
-                    try state.resize(api, width, height);
-                }
                 const target = try api.initTarget(width, height);
                 self.target.deinit();
                 self.target = target;
@@ -432,12 +436,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
 
         /// State relevant to our custom shaders if we have any.
+        ///
+        /// pepper: one for the whole swap chain. Upstream keeps a front and
+        /// a back texture the size of the screen in every frame, hidden tabs
+        /// included: six 70 MB textures per split on a 6K screen with triple
+        /// buffering. Frames can share them because they reach the GPU in
+        /// order on one queue: Metal tracks these textures' hazards across
+        /// command buffers, and a frame still in flight keeps the textures
+        /// it used alive when we replace them (its command buffer retains
+        /// them), as OpenGL defers deleting a texture still in use.
         const CustomShaderState = struct {
-            /// When we have a custom shader state, we maintain a front
-            /// and back texture which we use as a swap chain to render
-            /// between when multiple custom shaders are defined.
-            front_texture: Texture,
+            /// The terminal is drawn here, and the first shader reads it.
             back_texture: Texture,
+
+            /// Where each shader but the last draws, for the next one to
+            /// read. pepper: made only when there is more than one shader;
+            /// a single shader reads `back_texture` and draws straight to
+            /// the frame's target.
+            front_texture: ?Texture,
 
             /// Shadertoy uses a sampler for accessing the various channel
             /// textures. In Metal, we need to explicitly create these since
@@ -452,81 +468,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             /// need to "swap" it).
             sampler: Sampler,
 
-            uniforms: UniformBuffer,
+            /// What the textures were made for: the screen's size and the
+            /// target config (the pixel format follows the blending mode).
+            width: usize,
+            height: usize,
+            target_config_modified: usize,
 
-            const UniformBuffer = Buffer(shadertoy.Uniforms);
-
-            /// Swap the front and back textures.
-            pub fn swap(self: *CustomShaderState) void {
-                std.mem.swap(Texture, &self.front_texture, &self.back_texture);
-            }
-
-            pub fn init(api: GraphicsAPI) !CustomShaderState {
-                // Create a GPU buffer to hold our uniforms.
-                var uniforms = try UniformBuffer.init(api.uniformBufferOptions(), 1);
-                errdefer uniforms.deinit();
-
-                // Initialize the front and back textures at 1x1 px, this
-                // is slightly wasteful but it's only done once so whatever.
-                const front_texture = try Texture.init(
-                    api.textureOptions(),
-                    1,
-                    1,
-                    null,
-                );
-                errdefer front_texture.deinit();
+            pub fn init(
+                api: GraphicsAPI,
+                width: usize,
+                height: usize,
+                chained: bool,
+                target_config_modified: usize,
+            ) !CustomShaderState {
                 const back_texture = try Texture.init(
                     api.textureOptions(),
-                    1,
-                    1,
+                    @intCast(width),
+                    @intCast(height),
                     null,
                 );
                 errdefer back_texture.deinit();
+                const front_texture: ?Texture = if (chained) try Texture.init(
+                    api.textureOptions(),
+                    @intCast(width),
+                    @intCast(height),
+                    null,
+                ) else null;
+                errdefer if (front_texture) |texture| texture.deinit();
 
                 const sampler = try Sampler.init(api.samplerOptions());
                 errdefer sampler.deinit();
 
                 return .{
-                    .front_texture = front_texture,
                     .back_texture = back_texture,
+                    .front_texture = front_texture,
                     .sampler = sampler,
-                    .uniforms = uniforms,
+                    .width = width,
+                    .height = height,
+                    .target_config_modified = target_config_modified,
                 };
             }
 
             pub fn deinit(self: *CustomShaderState) void {
-                self.front_texture.deinit();
                 self.back_texture.deinit();
+                if (self.front_texture) |texture| texture.deinit();
                 self.sampler.deinit();
-                self.uniforms.deinit();
-            }
-
-            pub fn resize(
-                self: *CustomShaderState,
-                api: GraphicsAPI,
-                width: usize,
-                height: usize,
-            ) !void {
-                const front_texture = try Texture.init(
-                    api.textureOptions(),
-                    @intCast(width),
-                    @intCast(height),
-                    null,
-                );
-                errdefer front_texture.deinit();
-                const back_texture = try Texture.init(
-                    api.textureOptions(),
-                    @intCast(width),
-                    @intCast(height),
-                    null,
-                );
-                errdefer back_texture.deinit();
-
-                self.front_texture.deinit();
-                self.back_texture.deinit();
-
-                self.front_texture = front_texture;
-                self.back_texture = back_texture;
             }
         };
 
@@ -803,6 +789,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
             self.swap_chain.deinit();
+            if (self.custom_shader_state) |*state| state.deinit();
 
             if (DisplayLink != void) {
                 if (self.display_link) |display_link| {
@@ -858,6 +845,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             self.shaders = shaders;
             self.has_custom_shaders = has_custom_shaders;
+        }
+
+        /// pepper: makes the custom shaders' textures fit the screen, the
+        /// target config and the number of shaders, or frees them when
+        /// there are no custom shaders. The old ones go first, so a resize
+        /// never holds two sets. Called with the draw mutex held.
+        fn syncCustomShaderState(self: *Self) !void {
+            const wanted = self.has_custom_shaders and
+                self.shaders.post_pipelines.len > 0;
+            const chained = self.shaders.post_pipelines.len > 1;
+            if (self.custom_shader_state) |*state| {
+                if (wanted and
+                    state.width == self.size.screen.width and
+                    state.height == self.size.screen.height and
+                    (state.front_texture != null) == chained and
+                    state.target_config_modified == self.target_config_modified)
+                    return;
+                state.deinit();
+                self.custom_shader_state = null;
+            }
+            if (!wanted) return;
+            self.custom_shader_state = try .init(
+                self.api,
+                self.size.screen.width,
+                self.size.screen.height,
+                chained,
+                self.target_config_modified,
+            );
         }
 
         /// This is called early right after surface creation.
@@ -981,6 +996,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // can't be double-freed or used in draw calls.
             self.swap_chain.deinit();
             self.shaders.deinit(self.alloc);
+
+            // pepper: the custom shaders' textures belong to the display
+            // too. The next draw makes them again.
+            if (self.custom_shader_state) |*state| state.deinit();
+            self.custom_shader_state = null;
         }
 
         fn displayLinkCallback(
@@ -1505,20 +1525,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             assert(!self.shaders.defunct);
 
             // If we have custom shaders, make sure we have the
-            // custom shader state in our frame state, otherwise
-            // if we have a state but don't need it we remove it.
+            // custom shader uniforms in our frame state, otherwise
+            // if we have them but don't need them we remove them.
             if (self.has_custom_shaders) {
-                if (frame.custom_shader_state == null) {
-                    frame.custom_shader_state = try .init(self.api);
-                    try frame.custom_shader_state.?.resize(
-                        self.api,
-                        surface_size.width,
-                        surface_size.height,
+                if (frame.custom_shader_uniforms == null) {
+                    frame.custom_shader_uniforms = try .init(
+                        self.api.uniformBufferOptions(),
+                        1,
                     );
                 }
-            } else if (frame.custom_shader_state) |*state| {
-                state.deinit();
-                frame.custom_shader_state = null;
+            } else if (frame.custom_shader_uniforms) |*uniforms| {
+                uniforms.deinit();
+                frame.custom_shader_uniforms = null;
             }
 
             // If our stored size doesn't match the
@@ -1545,6 +1563,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 );
                 frame.target_config_modified = self.target_config_modified;
             }
+
+            // pepper: the custom shaders' textures are shared by every frame,
+            // so they're checked here rather than in `frame.resize`.
+            try self.syncCustomShaderState();
 
             // Upload images to the GPU as necessary.
             _ = self.images.upload(self.alloc, &self.api);
@@ -1591,7 +1613,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             {
                 var pass = frame_ctx.renderPass(&.{.{
-                    .target = if (frame.custom_shader_state) |state|
+                    .target = if (self.custom_shader_state) |state|
                         .{ .texture = state.back_texture }
                     else
                         .{ .target = frame.target },
@@ -1690,26 +1712,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // If we have custom shaders, then we render them.
-            if (frame.custom_shader_state) |*state| {
+            if (self.custom_shader_state) |state| {
                 // Sync our uniforms.
-                try state.uniforms.sync(&.{self.custom_shader_uniforms});
+                const uniforms = &frame.custom_shader_uniforms.?;
+                try uniforms.sync(&.{self.custom_shader_uniforms});
 
+                // pepper: each shader reads `source` and draws to `spare`,
+                // then they trade places; the last draws to the frame's
+                // target. Swapped here rather than in the shared state, so
+                // every frame finds the terminal in `back_texture`.
+                var source = state.back_texture;
+                var spare = state.front_texture;
                 for (self.shaders.post_pipelines, 0..) |pipeline, i| {
-                    defer state.swap();
+                    const last = i == self.shaders.post_pipelines.len - 1;
+                    defer if (!last) std.mem.swap(Texture, &source, &spare.?);
 
                     var pass = frame_ctx.renderPass(&.{.{
-                        .target = if (i < self.shaders.post_pipelines.len - 1)
-                            .{ .texture = state.front_texture }
+                        .target = if (last)
+                            .{ .target = frame.target }
                         else
-                            .{ .target = frame.target },
+                            .{ .texture = spare.? },
                         .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
                     }});
                     defer pass.complete();
 
                     pass.step(.{
                         .pipeline = pipeline,
-                        .uniforms = state.uniforms.buffer,
-                        .textures = &.{state.back_texture},
+                        .uniforms = uniforms.buffer,
+                        .textures = &.{source},
                         .samplers = &.{state.sampler},
                         .draw = .{
                             .type = .triangle,
