@@ -10,7 +10,8 @@ picture is checked by hand in a test Pepper (README's "Trying it").
 Usage: tests/integration.py [--agent PATH] [--play PATH] [--only GROUP,...]
   --agent  pepper-agent to test (default: target/debug/pepper-agent, built)
   --play   pepper-play to use (default: $PEPPER_PLAY, or Pepper.app's)
-  --only   after the basics, only these groups: edit, web, sharing, live, extras
+  --only   after the basics, only these groups: edit, web, sharing, live, extras,
+           links
 Needs ffmpeg, and mpv's library (brew install mpv); transcribe's checks,
 whisper.cpp and a model (they're skipped without).
 """
@@ -134,6 +135,8 @@ PAGE = """<!doctype html><html><head><title>Shop &#x1b;]2;pwned&#x07; admin</tit
 console.log("from the page \x1b]52;c;cHduZWQ=\x07");
 setTimeout(() => { throw new Error("boom"); }, 50);
 fetch("https://example.com/x").catch(() => {});
+fetch("http://169.254.77.77/x").catch(() => {});
+document.querySelector(".card.bad").__svelte_meta = {loc: {file: "src/Card.svelte", line: {"\\u001b]52;c;cHduZWQ=\\u0007": 1}, column: 4}};
 setTimeout(() => { const d = document.createElement("p"); d.id = "late"; d.textContent = "late"; document.body.append(d); }, 500);
 </script></body></html>"""
 
@@ -295,6 +298,8 @@ def edit_checks(cli, viewer, work, project, clip, hostile):
     check("a render is frame-exact at its cuts", frame_numbers(made) == want, frame_numbers(made))
     again = cli("edit", "render", exact, "-o", made, ok=False)
     check("a file that exists isn't replaced without --overwrite", again.get("error", {}).get("code") == "BAD_ARGS", again)
+    sneaky = cli("edit", "render", exact, "-o", os.path.join(os.path.realpath(project), ".pepper", "..", "exact.mp4"), ok=False)
+    check("nor through .pepper/..", sneaky.get("error", {}).get("code") == "BAD_ARGS", sneaky)
     final = cli("edit", "render", exact, "-o", made, "--overwrite", "--quality", "final")
     check("--overwrite --quality final", final.get("encoder") == "libx264" and frame_numbers(made) == want, final)
     over = cli("edit", "render", exact, "-o", frames, "--overwrite", ok=False)
@@ -903,6 +908,9 @@ def web_checks(cli, viewer, work, run_dir):
     check("web errors has the exception", any("boom" in e.get("text", "") for e in errors), errors)
     check("and the remote request that was stopped",
           any(e.get("kind") == "network" and "example.com" in e.get("url", "") for e in errors), errors)
+    check("a link-local address is off this machine too",
+          any("169.254.77.77" in e.get("url", "") and "PROXY" in e.get("text", "") for e in errors),
+          [e for e in errors if "169.254" in e.get("url", "")])
     check("and the 404", any(e.get("status") == 404 for e in errors), kinds)
 
     clicked = cli("web", "click", "#b")
@@ -942,6 +950,15 @@ def web_checks(cli, viewer, work, run_dir):
     check("with a selector that finds it", "second" in element.get("selector", ""), element)
     check("and its styles", "41px" in element.get("styles", {}).get("margin", ""), element)
     check("and pictures of it", os.path.isfile(point.get("snapshot", "")) and os.path.isfile(point.get("crop", "")), point)
+    check("where the page says it's made, as numbers or nothing",
+          element.get("source") == {"file": "src/Card.svelte", "line": None, "column": 4, "from": "svelte"}, element.get("source"))
+    human = subprocess.run([viewer.agent, "events", "--since", str(since), "--human", "--viewer", str(viewer.pid)],
+                           capture_output=True, cwd=viewer.cwd, env=viewer.env)
+    check("events --human keeps the page's text inert", b"Card.svelte" in human.stdout and b"\x1b" not in human.stdout,
+          human.stdout[:300])
+    keyed = subprocess.run([viewer.agent, "web", "eval", '({"\\u001b]2;pwned\\u0007": 1})', "--human", "--viewer", str(viewer.pid)],
+                           capture_output=True, cwd=viewer.cwd, env=viewer.env)
+    check("so does web eval --human, keys and all", b"pwned" in keyed.stdout and b"\x1b" not in keyed.stdout, keyed.stdout[:200])
     since = point.get("id", since)
     a = press_at(viewer, app["box"], app["viewport"], (20, 10))
     b = press_at(viewer, app["box"], app["viewport"], (400, 200))
@@ -1165,11 +1182,65 @@ def extras_checks(cli, viewer, agent, work, project, env, hostile, sound):
     cli("close", "talk")
 
 
+def links_checks(agent, env, work, clip):
+    """A project that came with links in its .pepper/: nothing is written
+    through them."""
+    linked = os.path.join(work, "linked")
+    outside = os.path.join(work, "outside")
+    os.makedirs(os.path.join(linked, ".pepper"))
+    os.makedirs(outside)
+    os.symlink(os.path.join(outside, "events.txt"), os.path.join(linked, ".pepper", "events.jsonl"))
+    os.symlink(outside, os.path.join(linked, ".pepper", "snapshots"))
+    viewer = Viewer(agent, env, linked)
+    check("a viewer starts in a project with links in .pepper/", viewer.wait_for(b"waiting for an agent"))
+
+    def cli(*args, ok=True):
+        r = subprocess.run([agent, *args, "--viewer", str(viewer.pid)], capture_output=True,
+                           text=True, cwd=linked, env=env, timeout=60)
+        if ok and r.returncode != 0:
+            check(f"pepper-agent {' '.join(args)}", False, r.stderr.strip())
+            return {}
+        if not ok:
+            return json.loads(r.stderr.strip().splitlines()[-1]) if r.stderr.strip() else {}
+        return json.loads(r.stdout)
+
+    cli("open", clip, "--name", "clip")
+    since = cli("events").get("last_id", 0)
+    viewer.keys(b"m")
+    got = cli("events", "--since", str(since), "--wait", "5")
+    check("a mark still comes", [e.get("type") for e in got.get("events", [])] == ["mark"], got)
+    check("but not through .pepper/events.jsonl, a link",
+          not os.path.exists(os.path.join(outside, "events.txt")) and not got.get("events_file", linked).startswith(linked),
+          got.get("events_file"))
+    shot = cli("snapshot", ok=False)
+    check("a .pepper/snapshots that's a link is refused",
+          shot.get("error", {}).get("code") == "FAILED" and "link" in shot.get("error", {}).get("message", ""), shot)
+    check("and nothing is written where the links lead", os.listdir(outside) == [], os.listdir(outside))
+
+    # A cached frame, and the name it's made under, as links: replaced, not followed.
+    frame = (cli("frames", clip, "--at", "1").get("frames") or [{}])[0].get("path", "")
+    kept = os.path.join(outside, "kept.png")
+    with open(kept, "w") as f:
+        f.write("keep")
+    os.remove(frame)
+    os.symlink(kept, frame)
+    os.symlink(os.path.join(outside, "made.png"), frame[:-len(".png")] + ".tmp.png")
+    again = (cli("frames", clip, "--at", "1").get("frames") or [{}])[0].get("path", "")
+    with open(again, "rb") as f:
+        head = f.read(4)
+    check("a cached frame that's a link is made again, as a file",
+          again == frame and not os.path.islink(frame) and head == b"\x89PNG", (frame, head))
+    with open(kept) as f:
+        check("and what the links led to is left alone",
+              f.read() == "keep" and not os.path.exists(os.path.join(outside, "made.png")), os.listdir(outside))
+    check("that viewer quits", viewer.end())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent")
     ap.add_argument("--play")
-    ap.add_argument("--only", default="edit,web,sharing,live,extras")
+    ap.add_argument("--only", default="edit,web,sharing,live,extras,links")
     a = ap.parse_args()
     agent = a.agent
     if not agent:
@@ -1213,6 +1284,10 @@ def main():
     check("open gives the length", abs((src.get("duration") or 0) - 12) < 0.2, src)
     check("the viewer places the box", viewer.wait_for(b"\x1b]777;pepper;place;"))
     check("the label shows the source", viewer.wait_for(b"clip  paused"))
+    plays = subprocess.run(["pgrep", "-P", str(viewer.pid)], capture_output=True, text=True).stdout.split()
+    lines = [subprocess.run(["ps", "-o", "command=", "-p", p], capture_output=True, text=True).stdout for p in plays]
+    lines = [line for line in lines if "pepper-play" in line]
+    check("its player stays out of Now Playing", lines and all("--input-media-keys=no" in line for line in lines), lines)
     check("hardware decoding", src.get("hwdec") == "videotoolbox" or cli("where").get("status") == "paused",
           src.get("hwdec"))
 
@@ -1319,6 +1394,8 @@ def main():
         live_checks(cli, viewer, work, env, os.path.dirname(sock_path))
     if "extras" in only:
         extras_checks(cli, viewer, agent, work, project, env, hostile, sound)
+    if "links" in only:
+        links_checks(agent, env, work, clip)
 
     def raw(payload):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
