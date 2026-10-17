@@ -10,8 +10,9 @@ picture is checked by hand in a test Pepper (README's "Trying it").
 Usage: tests/integration.py [--agent PATH] [--play PATH] [--only GROUP,...]
   --agent  pepper-agent to test (default: target/debug/pepper-agent, built)
   --play   pepper-play to use (default: $PEPPER_PLAY, or Pepper.app's)
-  --only   after the basics, only these groups: edit, web, sharing, live
-Needs ffmpeg, and mpv's library (brew install mpv).
+  --only   after the basics, only these groups: edit, web, sharing, live, extras
+Needs ffmpeg, and mpv's library (brew install mpv); transcribe's checks,
+whisper.cpp and a model (they're skipped without).
 """
 
 import argparse
@@ -979,11 +980,196 @@ def web_checks(cli, viewer, work, run_dir):
     server.shutdown()
 
 
+def talk_clip(dir):
+    """Three shots (cuts at 3 s and 5 s) and a voice: two sentences, 1.5 s
+    of quiet between them. None if macOS's `say` can't speak."""
+    speech = os.path.join(dir, "speech.aiff")
+    said = subprocess.run(["say", "-o", speech, "Hello there. This is a test of the transcription. "
+                           "[[slnc 1500]] After a pause, we fixed the bug, and the demo works."])
+    if said.returncode != 0 or not os.path.isfile(speech):
+        return None
+    talk = os.path.join(dir, "talk.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:d=3",
+                    "-f", "lavfi", "-i", "color=c=red:s=640x360:d=2", "-f", "lavfi", "-i", "smptebars=s=640x360:d=4",
+                    "-i", speech, "-filter_complex", "[0][1][2]concat=n=3:v=1:a=0,format=yuv420p[v]",
+                    "-map", "[v]", "-map", "3:a", "-c:v", "libx264", "-g", "30", "-c:a", "aac", "-t", "9", talk],
+                   check=True)
+    return talk
+
+
+class Mcp:
+    """`pepper-agent mcp`, as an agent's client runs it."""
+
+    def __init__(self, agent, env, cwd):
+        self.p = subprocess.Popen([agent, "mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  text=True, env=env, cwd=cwd)
+        self.lines = []
+        threading.Thread(target=self._read, daemon=True).start()
+        self.next_id = 0
+
+    def _read(self):
+        for line in self.p.stdout:
+            self.lines.append(json.loads(line))
+
+    def send(self, message):
+        self.p.stdin.write(json.dumps({"jsonrpc": "2.0", **message}) + "\n")
+        self.p.stdin.flush()
+
+    def ask(self, method, params=None, wait=True):
+        self.next_id += 1
+        self.send({"id": self.next_id, "method": method, "params": params or {}})
+        return self.answer(self.next_id) if wait else self.next_id
+
+    def answer(self, id, timeout=60):
+        end = time.time() + timeout
+        while time.time() < end:
+            for m in self.lines:
+                if m.get("id") == id:
+                    return m
+            time.sleep(0.05)
+        return {}
+
+    def call(self, tool, **arguments):
+        return self.ask("tools/call", {"name": tool, "arguments": arguments}).get("result", {})
+
+    def end(self):
+        self.p.stdin.close()
+        return self.p.wait(timeout=10)
+
+
+def extras_checks(cli, viewer, agent, work, project, env, hostile, sound):
+    """Scenes, silences, transcripts, the skill and the MCP server."""
+    for source in cli("sources").get("sources", []):
+        cli("close", source["name"], "--force")
+    # A folder of its own: the edit checks leave a video-use transcript
+    # called talk beside the media, and that one would be found first.
+    own = os.path.join(work, "extras")
+    os.makedirs(own)
+    talk = talk_clip(own)
+    check("a talk clip is made (macOS's say)", talk is not None)
+    if talk is None:
+        return
+
+    sc = cli("scenes", talk)
+    starts = [s.get("start") for s in sc.get("scenes", [])]
+    check("scenes finds the two cuts", sc.get("cuts") == 2 and len(starts) == 3
+          and abs(starts[1] - 3) < 0.05 and abs(starts[2] - 5) < 0.05, sc)
+    check("each scene runs to the next", sc.get("scenes", [{}])[-1].get("end") == sc.get("duration"), sc)
+    check("and says how to look at them", "frames <file> --at 0,3,5" in sc.get("next", ""), sc.get("next"))
+    t0 = time.time()
+    check("scenes is kept", cli("scenes", talk) == sc and time.time() - t0 < 1)
+    check("a threshold is 0 to 1", cli("scenes", talk, "--threshold", "1.5", ok=False)
+          .get("error", {}).get("code") == "BAD_ARGS")
+    check("no scenes in sound", cli("scenes", sound, ok=False).get("error", {}).get("code") == "NOT_PLAYABLE")
+
+    si = cli("silences", talk, "--min", "1", "--db", "-35dB")
+    quiet = si.get("silences", [])
+    check("silences finds the pause", len(quiet) == 1 and abs(quiet[0]["start"] - 2.7) < 0.15
+          and abs(quiet[0]["end"] - 4.4) < 0.15, si)
+    check("and the sound around it", [round(s["start"]) for s in si.get("sound", [])] == [0, 4], si.get("sound"))
+    check("a level is under 0 dB", cli("silences", talk, "--db", "5", ok=False)
+          .get("error", {}).get("code") == "BAD_ARGS")
+    check("no silences without sound", cli("silences", hostile, ok=False)
+          .get("error", {}).get("code") == "NOT_PLAYABLE")
+
+    missing = cli("transcribe", talk, "--model", os.path.join(work, "no-model.bin"), ok=False)
+    check("a missing model is NOT_FOUND", missing.get("error", {}).get("code") == "NOT_FOUND", missing)
+    bare = subprocess.run([agent, "transcribe", talk], capture_output=True, text=True, cwd=project,
+                          env={**env, "HOME": work, "PEPPER_WHISPER_MODEL": ""})
+    no_model = json.loads(bare.stderr.strip().splitlines()[-1]).get("error", {}) if bare.stderr.strip() else {}
+    check("no model at all: MISSING_DEP, with how to get one",
+          no_model.get("code") == "MISSING_DEP" and "curl" in no_model.get("hint", ""), no_model)
+    has_whisper = shutil.which("whisper-cli") or os.path.isfile("/opt/homebrew/bin/whisper-cli")
+    models = os.path.expanduser("~/.cache/pepper-agent/whisper")
+    has_model = os.environ.get("PEPPER_WHISPER_MODEL") or (
+        os.path.isdir(models) and any(n.startswith("ggml-") and n.endswith(".bin") and "silero" not in n
+                                      for n in os.listdir(models)))
+    if not (has_whisper and has_model):
+        print("  (skipped: transcribe needs whisper.cpp and a model)")
+    else:
+        tr = cli("transcribe", talk, "--lang", "en", timeout=300)
+        text = " ".join(s.get("text", "") for s in tr.get("segments", []))
+        check("transcribe hears what's said", "transcription" in text.lower() and "pause" in text.lower(), tr)
+        check("in English", tr.get("language") == "en", tr.get("language"))
+        words = json.load(open(tr.get("json", "/nonexistent"))).get("words", []) if tr.get("json") else []
+        check("with every word's time", len(words) >= 12 and all(w["end"] >= w["start"] for w in words), words[:3])
+        in_pause = [w for w in words if w["start"] > 2.8 and w["end"] < 4.3]
+        check("no word in the pause", not in_pause, in_pause)
+        last = next((w for w in words if "transcription" in w["text"].lower()), {})
+        check("the word before it ends before it", 1.5 < last.get("end", 0) < 2.85, last)
+        srt = open(tr.get("srt", "/nonexistent")).read() if tr.get("srt") else ""
+        check("and an .srt", srt.startswith("1\n00:00:0") and " --> " in srt, srt[:80])
+        t0 = time.time()
+        check("transcribe is kept", cli("transcribe", talk, "--lang", "en") == tr and time.time() - t0 < 1)
+        # A mark on the file now says what was being said.
+        cli("open", talk, "--name", "talk")
+        since = cli("events").get("last_id", 0)
+        cli("seek", "5.0", "--source", "talk")
+        viewer.keys(b"m")
+        ev = cli("events", "--since", str(since), "--wait", "5")
+        said = (ev.get("events") or [{}])[-1].get("said", {})
+        check("a mark says what was said there", "pause" in said.get("phrase", "").lower()
+              and said.get("transcript") == tr.get("json"), said)
+        cli("close", "talk")
+
+    skills = os.path.join(own, "skills")
+    inst = cli("install-skill", "--dir", skills)
+    installed = os.path.join(skills, "pepper", "SKILL.md")
+    repo_skill = open(os.path.join(CRATE, "skills", "pepper", "SKILL.md")).read()
+    check("install-skill writes the skill", inst.get("changed") is True and os.path.isfile(installed)
+          and open(installed).read() == repo_skill, inst)
+    check("which starts with its name", repo_skill.startswith("---\nname: pepper\n"))
+    check("again: nothing to do", cli("install-skill", "--dir", skills).get("changed") is False)
+    with open(installed, "w") as f:
+        f.write("---\nname: someone-else\ndescription: x\n---\n")
+    check("another skill is left alone", cli("install-skill", "--dir", skills, ok=False)
+          .get("error", {}).get("code") == "BAD_ARGS")
+
+    mcp = Mcp(agent, env, project)
+    init = mcp.ask("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                  "clientInfo": {"name": "integration", "version": "1"}}).get("result", {})
+    check("mcp: initialize", init.get("protocolVersion") == "2025-06-18"
+          and "tools" in init.get("capabilities", {}) and "guide" in init.get("instructions", ""), init)
+    mcp.send({"method": "notifications/initialized"})
+    tools = {t["name"]: t for t in mcp.ask("tools/list").get("result", {}).get("tools", [])}
+    check("mcp: every command is a tool", {"guide", "open", "web_shot", "pipe_new", "transcribe", "edit_render"}
+          <= set(tools) and "view" not in tools and "mcp" not in tools, sorted(tools))
+    check("mcp: a tool's arguments are named", set(tools.get("open", {}).get("inputSchema", {})
+          .get("properties", {})) >= {"file", "name", "play", "session", "viewer"})
+    st = mcp.call("status", viewer=str(viewer.pid))
+    check("mcp: a call answers with the command's JSON", st.get("isError") is False
+          and json.loads(st["content"][0]["text"]).get("viewer", {}).get("id") == str(viewer.pid), st)
+    cli("open", talk, "--name", "talk")
+    shot = mcp.call("snapshot", name="talk", viewer=str(viewer.pid))
+    images = [c for c in shot.get("content", []) if c.get("type") == "image"]
+    import base64
+    check("mcp: a snapshot comes back as an image too", len(images) == 1 and images[0].get("mimeType") == "image/png"
+          and base64.b64decode(images[0].get("data", ""))[:4] == b"\x89PNG", [c.get("type") for c in shot.get("content", [])])
+    bad = mcp.call("seek", time="1:99", viewer=str(viewer.pid))
+    check("mcp: an error is the command's", bad.get("isError") is True and '"BAD_TIME"' in bad["content"][0]["text"], bad)
+    odd = mcp.call("probe", bogus=1)
+    check("mcp: an unknown argument is BAD_ARGS", odd.get("isError") is True and "BAD_ARGS" in odd["content"][0]["text"], odd)
+    check("mcp: an unknown method", mcp.ask("resources/list").get("error", {}).get("code") == -32601)
+    last = cli("events").get("last_id", 0)
+    waiting = mcp.ask("tools/call", {"name": "events", "arguments": {
+        "wait": 30, "since": last, "viewer": str(viewer.pid)}}, wait=False)
+    check("mcp: answers while a call waits", mcp.ask("ping", {}).get("result") == {})
+    time.sleep(0.5)
+    mcp.send({"method": "notifications/cancelled", "params": {"requestId": waiting}})
+    after = mcp.call("where", name="talk", viewer=str(viewer.pid))
+    check("mcp: a cancelled call is stopped, and not answered", after.get("isError") is False
+          and not mcp.answer(waiting, timeout=1), after)
+    left = subprocess.run(["pgrep", "-f", f"{agent} events --wait=30"], capture_output=True, text=True).stdout.split()
+    check("mcp: its process is gone", not left, left)
+    check("mcp: ends with its client", mcp.end() == 0)
+    cli("close", "talk")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent")
     ap.add_argument("--play")
-    ap.add_argument("--only", default="edit,web,sharing,live")
+    ap.add_argument("--only", default="edit,web,sharing,live,extras")
     a = ap.parse_args()
     agent = a.agent
     if not agent:
@@ -1131,6 +1317,8 @@ def main():
         sharing_checks(cli, viewer, work, project, clip)
     if "live" in only:
         live_checks(cli, viewer, work, env, os.path.dirname(sock_path))
+    if "extras" in only:
+        extras_checks(cli, viewer, agent, work, project, env, hostile, sound)
 
     def raw(payload):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
