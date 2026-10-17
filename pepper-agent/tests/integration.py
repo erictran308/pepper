@@ -492,6 +492,229 @@ def seekbar_checks(cli, viewer, frames):
     cli("close", "frames")
 
 
+def picture_pair(dir):
+    """Two pictures alike but for a white box."""
+    a, b = os.path.join(dir, "before.png"), os.path.join(dir, "after.png")
+    for path, extra in ((a, ""), (b, ",drawbox=x=100:y=80:w=80:h=60:color=white:t=fill")):
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=1",
+                        "-vf", "format=rgb24" + extra, "-frames:v", "1", path], check=True)
+    return a, b
+
+
+def bright_share(path):
+    """The share of a picture's pixels that aren't near black."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", "format=gray", "-f", "rawvideo", "-"],
+                         capture_output=True).stdout
+    return sum(1 for p in raw if p > 40) / max(len(raw), 1)
+
+
+def last_frame(video, dir):
+    """A video's last frame, as a PNG."""
+    out = os.path.join(dir, "last.png")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-sseof", "-0.2", "-i", video, "-update", "1", out], check=True)
+    return out
+
+
+COUNTER = """<!doctype html><title>Counter</title>
+<button id="b" onclick="this.textContent='clicked '+(window.n=(window.n||0)+1)">Click me</button>
+<input id="in" aria-label="Name"><button id="dark" onclick="document.body.style.background='#000'">Dark</button>"""
+
+
+def sharing_checks(cli, viewer, work, project, clip):
+    """Two agents' sessions in one viewer, recordings, before and after."""
+    def write(path, data):
+        with open(path, "w") as f:
+            f.write(data if isinstance(data, str) else json.dumps(data))
+
+    for source in cli("sources").get("sources", []):
+        cli("close", source["name"], "--force")
+    alice = cli("session", "new", "--owner", "alice")
+    bob = cli("session", "new")
+    a, b = alice.get("session", ""), bob.get("session", "")
+    check("session new gives a token and an owner", len(a) >= 16 and alice.get("owner") == "alice", alice)
+    check("an owner's name by default", bob.get("owner") == "agent-2" and a != b, bob)
+    bad = cli("session", "new", "--owner", "no good", ok=False)
+    check("an owner's name is checked", bad.get("error", {}).get("code") == "BAD_ARGS", bad)
+
+    mine = cli("open", clip, "--name", "a-clip", "--session", a).get("source", {})
+    check("a session's source is its owner's", mine.get("owner") == "alice", mine)
+    check("its label says whose", viewer.wait_for(b"a-clip (alice)"))
+    cli("open", clip, "--name", "free")
+    taken = cli("seek", "3", "--source", "a-clip", "--session", b, ok=False).get("error", {})
+    check("another agent can't drive it: NOT_OWNER", taken.get("code") == "NOT_OWNER" and "alice" in taken.get("message", ""), taken)
+    taken = cli("pause", "--source", "a-clip", ok=False).get("error", {})
+    check("nor can a command without a session", taken.get("code") == "NOT_OWNER", taken)
+    taken = cli("close", "a-clip", "--session", b, ok=False).get("error", {})
+    check("nor close it", taken.get("code") == "NOT_OWNER", taken)
+    forced = cli("seek", "3", "--source", "a-clip", "--session", b, "--force")
+    check("unless --force", abs((forced.get("time_pos") or 0) - 3) < 0.1, forced)
+    fake = cli("where", "--session", "0" * 32, ok=False).get("error", {})
+    check("a session the viewer didn't give is refused", fake.get("code") == "BAD_ARGS" and "session new" in fake.get("hint", ""), fake)
+    # A newer viewer takes the commands that name none, but not a session's.
+    other = Viewer(viewer.agent, viewer.env, viewer.cwd)
+    other.wait_for(b"waiting for an agent")
+    bare = lambda *a: json.loads(subprocess.run([viewer.agent, *a], capture_output=True, text=True,
+                                                cwd=viewer.cwd, env=viewer.env).stdout or "{}")
+    check("a session's commands go to the viewer that gave it",
+          bare("where", "a-clip", "--session", a).get("viewer") == str(viewer.pid)
+          and bare("sources").get("viewer") == str(other.pid))
+    other.end()
+    cli("focus", "free")
+    own = cli("where", "--session", a)
+    check("without --source, a session's command goes to its own source", own.get("source") == "a-clip", own)
+    hers = [s.get("name") for s in cli("sources", "--owner", "alice").get("sources", [])]
+    check("sources --owner lists that agent's", hers == ["a-clip"], hers)
+    cli("say", "look at the intro", "--session", a)
+    check("say shows who says it", viewer.wait_for(b"alice: look at the intro"))
+    since = cli("events").get("last_id", 0)
+    cli("focus", "a-clip")
+    viewer.keys(b"m")
+    cli("focus", "free")
+    viewer.keys(b"m")
+    got = cli("events", "--since", str(since), "--owner", "alice").get("events", [])
+    check("events --owner: that agent's sources only", [e.get("source") for e in got] == ["a-clip"], got)
+    check("an event says its source's owner", got and got[0].get("owner") == "alice", got)
+
+    # A video's recording: the stretch that played, cut from the file.
+    cli("seek", "2", "--source", "a-clip", "--session", a)
+    started = cli("record", "start", "a-clip", "--session", a)
+    check("record start", started.get("recording") is True and abs((started.get("from") or 0) - 2) < 0.1, started)
+    check("the label shows it's recording", viewer.wait_for("● REC".encode()))
+    again = cli("record", "start", "a-clip", "--session", a, ok=False)
+    check("one recording a source", again.get("error", {}).get("code") == "BAD_ARGS", again)
+    cli("review", "2", "4", "--source", "a-clip", "--session", a)
+    time.sleep(2.4)
+    rec = cli("record", "stop", "--session", a, timeout=120)
+    path = rec.get("path", "")
+    check("record stop cuts what played from the file", os.path.isfile(path) and abs((rec.get("duration") or 0) - 2) < 0.2, rec)
+    check("into .pepper/recordings", "/.pepper/recordings/a-clip-" in path, path)
+    check("with a sheet to check it by", os.path.isfile(rec.get("sheet") or ""), rec)
+    none = cli("record", "stop", "a-clip", "--session", a, ok=False)
+    check("record stop with none under way: BAD_ARGS", none.get("error", {}).get("code") == "BAD_ARGS", none)
+    cli("record", "start", "free")
+    still = cli("record", "stop", "free", ok=False)
+    check("nothing played: FAILED", still.get("error", {}).get("code") == "FAILED", still)
+    cli("close", "free")
+
+    # A preview's: cut from the cut's clips.
+    cut = os.path.join(project, "cut4.json")
+    write(cut, {"pepper_edit": 1, "clips": [{"src": clip, "in": 2, "out": 4},
+                                            {"src": os.path.join(work, "frames.mp4"), "in": 0, "out": 2}]})
+    cli("edit", "preview", cut, "--name", "cut4", "--session", a)
+    cli("seek", "1", "--source", "cut4", "--session", a)
+    cli("record", "start", "cut4", "--session", a)
+    cli("review", "1", "3", "--source", "cut4", "--session", a)
+    time.sleep(2.4)
+    rec = cli("record", "stop", "cut4", "--session", a, timeout=120)
+    check("a preview's recording is rendered from its cut",
+          rec.get("project") == cut and abs((rec.get("duration") or 0) - 2) < 0.2 and os.path.isfile(rec.get("path", "")), rec)
+    cli("close", "cut4", "--session", a)
+    cli("close", "a-clip", "--session", a)
+
+    if cli("status").get("deps", {}).get("chrome", {}).get("ok"):
+        site = os.path.join(work, "site4")
+        os.makedirs(site)
+        write(os.path.join(site, "index.html"), COUNTER)
+        server = serve(site)
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        cli("web", "open", url, "--name", "a-app", "--session", a)
+        cli("web", "open", url, "--name", "b-app", "--session", b)
+        lay = cli("layout", "grid")
+        check("two agents' pages side by side", len(lay.get("visible", [])) == 2, lay)
+        cli("web", "click", "#b", "--session", a)
+        cli("web", "click", "#b", "--session", b)
+        cli("web", "click", "#b", "--session", b)
+        count = lambda s: cli("web", "eval", "window.n||0", "--session", s).get("value")
+        check("each agent drives its own page", (count(a), count(b)) == (1, 2), (count(a), count(b)))
+        taken = cli("web", "click", "#b", "--source", "b-app", "--session", a, ok=False).get("error", {})
+        check("not the other's: NOT_OWNER", taken.get("code") == "NOT_OWNER", taken)
+        looked = cli("web", "shot", "b-app", "--session", a)
+        check("but it may look at it", os.path.isfile(looked.get("path", "")), looked)
+
+        script = os.path.join(work, "demo.json")
+        write(script, [{"click": "#b"}, {"wait": 0.5}, {"type": ["#in", "Ada"]}, {"press": "Enter"},
+                       {"say": "that's the demo"}])
+        run = cli("record", "run", script, "--session", b, timeout=180)
+        check("record run runs every step", run.get("completed") is True and len(run.get("steps", [])) == 5, run)
+        check("and records the page meanwhile", os.path.isfile(run.get("path", "")) and run.get("source") == "b-app"
+              and (run.get("duration") or 0) >= 1.5 and (run.get("frames") or 0) >= 45, run)
+        check("at the page's own size, not its box's", (run.get("width"), run.get("height")) == (1920, 1200), run)
+        check("the demo's steps happened", count(b) == 3)
+        write(script, [{"click": "#dark"}])
+        dark = cli("record", "run", script, "--session", b, timeout=120)
+        share = bright_share(last_frame(dark.get("path", ""), work))
+        check("a recording ends on what the page shows last", share < 0.1, share)
+        cli("web", "reload", "--session", b)
+        write(script, [{"click": 3}, {"fly": "away"}])
+        e = cli("record", "run", script, "--session", b, ok=False).get("error", {})
+        check("a bad script: every problem at once",
+              e.get("code") == "BAD_ARGS" and [p.get("at") for p in e.get("problems", [])] == ["steps[0]", "steps[1]"], e)
+        write(script, [{"click": "#b"}, {"click": "#nope"}, {"click": "#b"}])
+        r = cli("record", "run", script, "--session", b, timeout=120)
+        check("a failing step ends the run; its recording is kept",
+              r.get("completed") is False and r.get("failed", {}).get("step") == 1 and os.path.isfile(r.get("path", "")), r)
+        cli("record", "start", "--max", "1", "--session", b)
+        time.sleep(2)
+        auto = cli("record", "stop", "--session", b, timeout=60)
+        check("--max ends a recording by itself; record stop gives it",
+              os.path.isfile(auto.get("path", "")) and 0.8 <= (auto.get("duration") or 0) <= 1.3, auto)
+
+        shown = cli("play", run.get("path", ""), "--session", b).get("source", {})
+        check("play shows a recording, playing",
+              shown.get("kind") == "recording" and shown.get("status") == "playing" and shown.get("owner") == "agent-2", shown)
+        since = cli("events").get("last_id", 0)
+        cli("focus", shown.get("name", ""))
+        viewer.keys(b"y")
+        ev = (cli("events", "--since", str(since), "--until", "approve", "--wait", "5", "--owner", "agent-2")
+              .get("events") or [{}])[-1]
+        check("the human approves the demo with y",
+              ev.get("type") == "approve" and ev.get("kind") == "recording" and ev.get("file") == run.get("path"), ev)
+        for name, s in (("a-app", a), ("b-app", b), (shown.get("name", ""), b)):
+            cli("close", name, "--session", s)
+        server.shutdown()
+
+    # Before and after.
+    clip2 = os.path.join(work, "clip2.mp4")
+    shutil.copy(clip, clip2)
+    c = cli("compare", clip, clip2, "--sync")
+    check("compare opens both side by side", c.get("compare") == {"before": "before", "after": "after", "sync": True}, c)
+    check("labelled", viewer.wait_for(b"before [before]") and viewer.wait_for(b"after [after]"))
+    cli("seek", "5", "--source", "after")
+    time.sleep(0.6)
+    w = cli("where", "before")
+    check("with --sync the other follows a seek", abs((w.get("time_pos") or 0) - 5) < 0.1, w)
+    cli("play", "--source", "after")
+    time.sleep(1)
+    w = cli("where", "before")
+    check("and plays with it", w.get("paused") is False, w)
+    cli("pause", "--source", "after")
+    time.sleep(0.5)
+    wa, wb = cli("where", "after"), cli("where", "before")
+    check("and pauses with it, at the same time",
+          wb.get("paused") is True and abs((wa.get("time_pos") or 0) - (wb.get("time_pos") or 9)) < 0.1, (wa, wb))
+    since = cli("events").get("last_id", 0)
+    viewer.keys(b"x")
+    ev = (cli("events", "--since", str(since), "--until", "reject", "--wait", "5").get("events") or [{}])[-1]
+    check("a verdict on a comparison names both", ev.get("compare") == {"before": "before", "after": "after"}, ev)
+
+    pa, pb = picture_pair(work)
+    cli("compare", "off")
+    c = cli("compare", pa, pb)
+    check("compare two pictures", c.get("compare", {}).get("sync") is False, c)
+    viewer.keys(b"d")
+    check("d shows their difference", viewer.wait_for(b"after [difference]"))
+    time.sleep(0.5)
+    share = bright_share(cli("snapshot", "after").get("path", ""))
+    check("black but where they differ", 0.02 < share < 0.1, share)
+    viewer.keys(b"d")
+    time.sleep(0.5)
+    share = bright_share(cli("snapshot", "after").get("path", ""))
+    check("d again: the after picture", share > 0.5, share)
+    cli("compare", "off")
+    for name in ("before", "after"):
+        cli("close", name)
+
+
 def web_checks(cli, viewer, work, run_dir):
     if not cli("status").get("deps", {}).get("chrome", {}).get("ok"):
         print("skip web: no Chrome (PEPPER_CHROME)")
@@ -628,6 +851,7 @@ def main():
 
     env = dict(os.environ)
     env.pop("TMUX", None)
+    env.pop("PEPPER_AGENT_SESSION", None)
     # No Pepper holds this name: pepper-play draws to nowhere.
     env["PEPPER_PORT"] = "io.github.erictran308.pepper.0"
     env["PEPPER_PLAY"] = play
@@ -751,6 +975,7 @@ def main():
 
     edit_checks(cli, viewer, work, project, clip, hostile)
     web_checks(cli, viewer, work, os.path.dirname(sock_path))
+    sharing_checks(cli, viewer, work, project, clip)
 
     def raw(payload):
         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
