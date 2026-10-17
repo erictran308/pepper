@@ -67,6 +67,9 @@ pepper-agent record run demo.json --source app   # a demo: the page recorded whi
 pepper-agent play .pepper/recordings/app-….mp4   # shown to the human, for y or x
 pepper-agent compare v1.mp4 v2.mp4 --sync        # before and after, side by side, as one
 pepper-agent session new --owner agent-2         # several agents in one viewer: your own sources
+pepper-agent watch out/plot.png                  # shown again each time it's rendered again
+pepper-agent pipe new --name sim                 # a FIFO: frames a program writes show live
+pepper-agent open rtsp://cam/s --credentials-env CAM   # a live stream; its password never shown
 ```
 
 Every command prints one JSON object; errors are JSON on stderr with a `code` and a `hint` to act on, and a non-zero exit. `--human` prints for people. `pepper-agent <command> --help` has an example.
@@ -88,8 +91,51 @@ Every command prints one JSON object; errors are JSON on stderr with a `code` an
 | `record start`, `stop`, `run` | Recordings: a page as it shows (30 fps), a video's stretch that played, or a page while a script of steps drives it; `play <file>` shows one for approval |
 | `compare` | Before and after side by side, two videos locked together (`--sync`), two pictures' difference |
 | `session new` | A session for one of several agents in a viewer: what it opens is its own, labelled with its name |
+| `watch` | A file shown again each time it's rendered again (a plot, a render, a GIF), once it stops changing |
+| `pipe new` | A FIFO whose frames show live as a program writes them: y4m, MJPEG or raw BGRA |
+| `open <stream>` | rtsp, rtmp, srt, udp or HLS, live, reconnecting by itself; `--credentials-env` for its password |
 
 Files it makes go in `.pepper/` in the current folder (`snapshots/`, `cache/`, `points/`, `edits/`, `renders/`, `recordings/`), which gets a `.gitignore` of its own. Pictures are at most 1568 px on their long side.
+
+## Writing frames into a pipe
+
+`pepper-agent pipe new` answers with a FIFO's path; anything that writes frames into it shows them live: a simulation, a shader toy, a game loop. In Python (10 s of a gradient sliding left, as YUV4MPEG2: a header line, then `FRAME` and the picture's bytes):
+
+```python
+import json, subprocess, time
+pipe = json.loads(subprocess.check_output(["pepper-agent", "pipe", "new", "--name", "sim"]))["pipe"]
+w, h = 320, 240
+with open(pipe, "wb") as out:  # waits until the viewer reads
+    out.write(f"YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg\n".encode())
+    for n in range(300):  # 10 s of a gradient sliding left
+        row = bytes((x + 4 * n) % 256 for x in range(w))
+        out.write(b"FRAME\n" + row * h + bytes([128]) * (w * h // 2))
+        out.flush()
+        time.sleep(1 / 30)
+```
+
+In Rust, given the pipe's path (`pepper-agent pipe new | jq -r .pipe`):
+
+```rust
+use std::{fs::OpenOptions, io::Write, thread, time::Duration};
+
+fn main() -> std::io::Result<()> {
+    let path = std::env::args().nth(1).expect("the pipe: pepper-agent pipe new");
+    let (w, h) = (320usize, 240usize);
+    let mut out = OpenOptions::new().write(true).open(path)?; // waits until the viewer reads
+    write!(out, "YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg\n")?;
+    for n in 0..300 {
+        let row: Vec<u8> = (0..w).map(|x| ((x + 4 * n) % 256) as u8).collect();
+        out.write_all(b"FRAME\n")?;
+        out.write_all(&row.repeat(h))?;
+        out.write_all(&vec![128; w * h / 2])?;
+        thread::sleep(Duration::from_millis(33));
+    }
+    Ok(())
+}
+```
+
+Raw BGRA is simpler still (`pipe new --format bgra --size 320x240 --fps 30`, then 320×240×4 bytes a frame), and anything ffmpeg can make goes too: `ffmpeg -re -i in.mp4 -f yuv4mpegpipe -y <pipe>`. When the writer closes the pipe, the last frame stays and the pipe waits for the next writer.
 
 ## With video-use
 
@@ -126,6 +172,10 @@ pepper-agent web click …                │ OSC 777;pepper;place (its own tty)
 - The keys passed to a source are a fixed list (pause, seeks, frame steps, speed, volume, tracks): never mpv's console, screenshots or quit. `i` and `o` (mpv's stats and progress) are the viewer's, for ranges.
 - Recordings: a page's screencast frames go to an ffmpeg the viewer runs, the latest one every 1/30 s (Chrome sends a frame only when the page changes), encoded by VideoToolbox into the viewer's own folder; `record stop` moves the file into `.pepper/recordings/`. A video's recording is the stretch that played, cut from the file itself (a preview's, rendered from its cut), never a capture of the screen. `record run` takes only the verbs it knows, checked before anything runs.
 - Sessions: `session new` gives a random token (after the viewer's id, so a session's commands reach its viewer when a newer one runs); a source opened with it is that session's, and the viewer refuses another's commands that would drive, record or close it unless they say `force`. It keeps agents from stepping on each other by mistake, not out: they're the user's own programs, as the socket's peers are.
+- Watched files: the file's folder is followed with FSEvents (a render may write a new file and rename it over the old), and the file is loaded again once its size, time and inode haven't changed for 250 ms (2 s at most while it keeps changing): never half a render.
+- Pipes: the FIFO is made in the viewer's own folder (0700), only the user's (0600), and goes with its source. mpv reads it through libavformat (`ffmpeg://file:`), as a stream that can't seek: mpv's own file reading probes a FIFO as if it could and stalls. Frames show as they come (`untimed`, mpv's `low-latency` profile). At the writer's end the player loads it again, which waits for the next writer; on close, a writer that opens and closes it lets a player still waiting go.
+- Streams: mpv's `low-latency` profile (but HLS, whose segments are seconds long), reading the streams' setup so a recording can have it, and a network timeout of 10 s. One that ends or fails is tried again after 1 s, then 2, 4, 8, 10. A recording is mpv's `stream-record`: the packets as they came, from the next keyframe, then copied into an MP4.
+- Passwords: an address's user and password are taken out (`***`) of everything shown or written: answers, labels, events, the viewer's record and its log, mpv's and ffmpeg's messages (taken out as they're read). `--credentials-env` reads them from the environment, percent-encoded into the address, which the viewer gives pepper-play over its IPC, never on a command line.
 - `said`, on events and answers: the transcript beside the edit or the footage (video-use's `edit/transcripts/<name>.json`: Scribe's word list, by the EDL's name for the source or the file's stem) read for the moment, by `pepper-agent` itself, not the viewer. Phrases break as video-use's `pack_transcripts.py` breaks them (0.5 s of silence, a new speaker); pauses are gaps of 0.15 s or more between words. Its text is made inert like the rest.
 
 It's Rust with no dependencies but the system's (ffmpeg and pepper-play are run, not linked), MIT licensed like the rest of Pepper.
@@ -137,4 +187,4 @@ cargo test                     # unit tests
 tests/integration.py           # the viewer in a pseudo-terminal, driven as an agent and a human
 ```
 
-The integration test runs the real viewer, pepper-play and mpv on generated clips (a hostile file name and tags among them) and Chrome on a local page (a hostile title and console), with a `PEPPER_PORT` no Pepper holds, so nothing shows: it checks the commands, the keys and the mouse, the events, what reaches the terminal, the pages kept to this machine, sessions, recordings and comparing, and the socket's refusals. Seeing the picture needs a test Pepper (`../CLAUDE.md`, Gotchas). `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture` times the web frames' decoding.
+The integration test runs the real viewer, pepper-play and mpv on generated clips (a hostile file name and tags among them) and Chrome on a local page (a hostile title and console), with a `PEPPER_PORT` no Pepper holds, so nothing shows: it checks the commands, the keys and the mouse, the events, what reaches the terminal, the pages kept to this machine, sessions, recordings and comparing, watched files, pipes, an RTSP stream behind a password (`tests/rtsp_server.py`, a test camera in Python's standard library that relays ffmpeg's RTP over RTSP's TCP mode) with the password nowhere it shouldn't be, and the socket's refusals. `--only live` (or `edit`, `web`, `sharing`) runs one group after the basics. Seeing the picture needs a test Pepper (`../CLAUDE.md`, Gotchas). `PEPPER_BENCH_JPEGS=<folder> cargo test --release draw_speed -- --ignored --nocapture` times the web frames' decoding.
