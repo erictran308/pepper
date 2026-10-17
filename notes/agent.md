@@ -335,3 +335,19 @@ Three commands on a file, `scenes`, `silences` and `transcribe` (`src/analyze.rs
   - **MCP alone.** No shell (Bash not allowed), only `--mcp-config` with `pepper-agent mcp`. Prompt: *"Look at clip.mp4 for me: where do its shots change, and what is said in it? Then show it to me in Pepper, paused at the start of the second shot, and wait until I've looked."*
     - The agent called `guide` and `status`, then `probe`, `scenes`, `transcribe` and `sheet`. It `open`ed the clip, `seek`ed to 4.0 and looked at a `snapshot` (an image) to be sure it was the second shot.
     - It told the human with `say` and waited (`events`). Then it gave the shots (0, 4 and 8 s) and the words, with the pause across the first cut. 37 s and $0.45.
+
+## Security review before the first release (2026-10-17)
+
+Everything since 1.3.1-pepper.2 (pepper-agent, and `pepper-build.sh`'s lines for it) was reviewed in four parts: the socket, CLI and MCP server; media, editing and the programs run on files; pages; and what reaches the terminal and the files written. Each finding was then checked on its own. One passed the review's bar; three more were real but scored under it, and two were noted on the way. All are fixed, each with a check in the integration test.
+
+- **Links in a project's `.pepper/`** (the one over the bar). A repository or an archive could ship `.pepper/events.jsonl` as a link. The viewer appended each event through it, to any file the user can write, with text a file name or a page chose: a `$(…)` in a clip's name ran when a shell read its startup file. Now (`src/files.rs`):
+  - every folder under `.pepper/` must be the user's own and not a link (refused otherwise; made 0700 if others could open it);
+  - a line is added only to a plain file (`O_NOFOLLOW`), and the events go to the viewer's own folder if `events.jsonl` is anything else;
+  - files are written to a new name and moved over, and the name a program (ffmpeg, whisper.cpp) writes is cleared first;
+  - a cached answer is read only from a plain file.
+- **A stream's password in Now Playing.** The viewer's pepper-play published mpv's `media-title`. For a stream with no title, that's the address's last part: `user:password@host` for `rtsp://cam:554`. The viewer's players now run with `--input-media-keys=no` (no Now Playing, no media keys). Also, pepper-play's messages are redacted before they're cut to 400 characters: a cut inside a long password left it unmarked.
+- **`--human` printed keys raw.** A page's own object (from `web eval`, or a point's source, which a dev build's metadata gives) could carry an escape sequence in a key's name. Keys are made inert now, and a point's source is made again in Rust, as a file name and numbers.
+- **Link-local addresses.** Chrome's proxy bypass always adds 169.254/16 and fe80::/10, so a page without `--allow-remote` could reach them on the network. The bypass list starts with `<-loopback>` now (rules are read last to first), and names 127.0.0.0/8 itself.
+- **`-o .pepper/../x.mp4`** counted as inside `.pepper/`, so an existing file could be replaced without `--overwrite`. The output's folder is resolved first.
+
+The integration test has a `links` group for the first: a viewer of its own in a project whose `.pepper/` holds links (the events file, the snapshots folder, a cached frame and the name it's made under). Before the fixes, the new checks failed; after, they pass.
