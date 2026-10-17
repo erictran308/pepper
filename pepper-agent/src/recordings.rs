@@ -141,11 +141,30 @@ pub fn stop(args: &Args, source: Option<&str>) -> Result<Value> {
 /// The viewer's recording, from its own folder into `out`.
 fn take_raw(raw: &Path, out: &Path) -> Result<()> {
     let run = proto::run_dir()?;
+    if raw.starts_with(&run) && raw.extension().is_some_and(|e| e == "mkv") && !raw.is_file() {
+        return Err(Error::new("FAILED", "nothing came while it was recorded")
+            .hint("Record while it plays: pepper-agent where says its status."));
+    }
     if !raw.starts_with(&run) || !raw.is_file() {
         return Err(Error::new(
             "FAILED",
             "the viewer's recording isn't where it should be",
         ));
+    }
+    if raw.extension().is_some_and(|e| e == "mkv") {
+        // mpv answers before it has closed the file: until it stops growing.
+        let mut last = None;
+        for _ in 0..50 {
+            let len = std::fs::metadata(raw).map(|m| m.len()).ok();
+            if len.is_some() && len == last {
+                break;
+            }
+            last = len;
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let made = to_mp4(raw, out);
+        let _ = std::fs::remove_file(raw);
+        return made;
     }
     if std::fs::rename(raw, out).is_err() {
         std::fs::copy(raw, out)
@@ -153,6 +172,52 @@ fn take_raw(raw: &Path, out: &Path) -> Result<()> {
         let _ = std::fs::remove_file(raw);
     }
     Ok(())
+}
+
+/// A stream's recording (what mpv got, kept in Matroska) as an MP4: its
+/// packets as they came if MP4 takes them (H.264, HEVC, AAC), else encoded.
+fn to_mp4(raw: &Path, out: &Path) -> Result<()> {
+    let ffmpeg = media::tool("ffmpeg")?;
+    let made = |codecs: &[&str]| -> std::result::Result<(), String> {
+        let done = std::process::Command::new(&ffmpeg)
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(format!("file:{}", raw.display()))
+            .args(["-map", "0:v:0", "-map", "0:a?"])
+            .args(codecs)
+            .args(["-movflags", "+faststart", "-f", "mp4"])
+            .arg(format!("file:{}", out.display()))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if done.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&done.stderr);
+        Err(err.lines().rev().take(2).collect::<Vec<_>>().join(" | "))
+    };
+    let encoded = [
+        "-vf",
+        "format=yuv420p",
+        "-c:v",
+        "h264_videotoolbox",
+        "-q:v",
+        "60",
+        "-c:a",
+        "aac",
+    ];
+    let why = match made(&["-c", "copy"]).or_else(|_| made(&encoded)) {
+        Ok(()) => return Ok(()),
+        Err(why) => why,
+    };
+    let _ = std::fs::remove_file(out);
+    Err(Error::new(
+        "FAILED",
+        format!(
+            "the recording couldn't be made an MP4: {}",
+            text::inert(&text::redact_urls(&why), 300)
+        ),
+    )
+    .hint("Record while it shows frames: pepper-agent where says its status."))
 }
 
 fn sheet_of(work: &Path, file: &Path) -> Option<String> {
@@ -415,6 +480,10 @@ pub fn compare(args: &Args) -> Result<Value> {
         }
         let (cmd, mut request) = match crate::open_target(given)? {
             Target::Media(t) => ("open", Value::obj().with("target", t).with("kind", "media")),
+            Target::Stream(t) => (
+                "open",
+                Value::obj().with("target", t).with("kind", "stream"),
+            ),
             Target::Web(t) => (
                 "web.open",
                 Value::obj().with("target", t).with("kind", "web"),

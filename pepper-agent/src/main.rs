@@ -125,10 +125,10 @@ const SPECS: &[Spec] = &[
     },
     Spec {
         name: "open",
-        usage: "open <file|url> [--name NAME] [--play] [--kind media] [--edit PROJECT] [--owner NAME]",
-        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file. --owner labels its box (a session's sources have their owner's name).",
+        usage: "open <file|url> [--name NAME] [--play] [--kind media] [--edit PROJECT] [--owner NAME] [--credentials-env VAR]",
+        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file. --owner labels its box (a session's sources have their owner's name). A stream (rtsp://, rtmp://, srt://, udp://, or HLS: an http(s) .m3u8) plays live and reconnects by itself; --credentials-env names an environment variable holding its user:password, never shown.",
         example: "pepper-agent open raw/take1.mp4 --name take1",
-        values: &["name", "kind", "edit", "owner"],
+        values: &["name", "kind", "edit", "owner", "credentials-env"],
         flags: &["play"],
         min: 1,
         max: 1,
@@ -514,6 +514,26 @@ const SPECS: &[Spec] = &[
         max: usize::MAX,
     },
     Spec {
+        name: "watch",
+        usage: "watch <file> [--name NAME]",
+        about: "Shows a file and shows it again each time it's rendered again (once the file stops changing): a plot, a frame, a Remotion or Manim render, a GIF. Videos and GIFs loop; pictures stay; SVG and HTML show in the viewer's browser.",
+        example: "pepper-agent watch out/plot.png --name plot",
+        values: &["name"],
+        flags: &[],
+        min: 1,
+        max: 1,
+    },
+    Spec {
+        name: "pipe new",
+        usage: "pipe new [--format y4m|mjpeg|bgra] [--size WxH] [--fps N] [--name NAME]",
+        about: "A FIFO (in the viewer's private folder) whose frames show live as a program writes them: y4m (the default; its header says the size), MJPEG, or raw BGRA of --size at --fps. Answers at once with the path and a command to try it. When the writer closes it, the last frame stays and the pipe waits for the next.",
+        example: "pepper-agent pipe new --name sim",
+        values: &["format", "size", "fps", "name"],
+        flags: &[],
+        min: 0,
+        max: 0,
+    },
+    Spec {
         name: "session new",
         usage: "session new [--owner NAME]",
         about: "A session for one agent among several in one viewer: a token to pass with every command (--session, or PEPPER_AGENT_SESSION). The sources it opens are its own, labeled with --owner: others can't drive or close them without --force.",
@@ -611,6 +631,7 @@ const GROUPS: &[(&str, &[&str])] = &[
             "web eval",
         ],
     ),
+    ("Live output and streams", &["watch", "pipe new"]),
     (
         "Several agents, recordings, before and after",
         &[
@@ -651,6 +672,7 @@ fn group_usage(group: &str) -> String {
         "web" => "a page in the viewer, live (a headless Chrome of the viewer's own)",
         "session" => "one agent's own sources, among several agents in one viewer",
         "record" => "what a source shows, to a file in .pepper/recordings/",
+        "pipe" => "frames a program writes, shown live",
         _ => "a cut as a JSON project (pepper-agent schema edit): checked, shown, rendered",
     };
     let mut out = format!("pepper-agent {group} <action>: {intro}.\n\n");
@@ -811,10 +833,12 @@ fn main() -> ExitCode {
     let human_anywhere = args.iter().any(|a| a == "--human");
     // `web <action>`, `edit <action>`, ... are one command.
     let (name, rest) = match (name.as_str(), args.get(1)) {
-        ("web" | "edit" | "session" | "record", Some(action)) if !action.starts_with('-') => {
+        ("web" | "edit" | "session" | "record" | "pipe", Some(action))
+            if !action.starts_with('-') =>
+        {
             (format!("{name} {action}"), &args[2..])
         }
-        ("web" | "edit" | "session" | "record", _) => {
+        ("web" | "edit" | "session" | "record" | "pipe", _) => {
             print!("{}", group_usage(name));
             return ExitCode::SUCCESS;
         }
@@ -1011,6 +1035,7 @@ fn run(spec: &Spec, args: &Args) -> Result<Value> {
         "record stop" => recordings::stop(args, args.plain.first().map(String::as_str)),
         "record run" => recordings::run(args),
         "compare" => recordings::compare(args),
+        "watch" => watch(spec, args),
         "play" if !args.plain.is_empty() => recordings::play(args),
         "edit render" => {
             let quality = match args.value("quality") {
@@ -1170,6 +1195,7 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
             let given = first.unwrap_or("");
             let (target, kind) = match (open_target(given)?, args.value("kind")) {
                 (Target::Media(t), None | Some("media")) => (t, "media"),
+                (Target::Stream(t), None | Some("media" | "stream")) => (t, "stream"),
                 (Target::Web(t), None | Some("web")) => (t, "web"),
                 (Target::Media(t), Some("web")) => (web_target(&t)?, "web"),
                 (_, Some(kind)) => {
@@ -1178,6 +1204,10 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
                         format!("--kind {}: media or web", text::inert(kind, 20)),
                     ));
                 }
+            };
+            let target = match args.value("credentials-env") {
+                Some(var) => with_credentials(&target, var)?,
+                None => target,
             };
             v.set("target", target);
             v.set("kind", kind);
@@ -1274,6 +1304,35 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
             }
         }
         "layout" => v.set("mode", first),
+        "watch" => {
+            v.set("target", first);
+            if let Some(name) = args.value("name") {
+                v.set("name", name);
+            }
+        }
+        "pipe new" => {
+            for key in ["format", "name"] {
+                if let Some(value) = args.value(key) {
+                    v.set(key, value);
+                }
+            }
+            if let Some(size) = args.value("size") {
+                let (w, h) = size
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                    .ok_or_else(|| Error::new("BAD_ARGS", "--size: WxH, like 640x360"))?;
+                v.set("width", w);
+                v.set("height", h);
+            }
+            if let Some(fps) = args.value("fps") {
+                let fps: f64 = fps
+                    .parse()
+                    .ok()
+                    .filter(|f: &f64| f.is_finite())
+                    .ok_or_else(|| Error::new("BAD_ARGS", "--fps: frames a second, like 30"))?;
+                v.set("fps", fps);
+            }
+        }
         "sources" | "session new" => {
             if let Some(owner) = args.value("owner") {
                 v.set("owner", owner);
@@ -1348,11 +1407,36 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
     Ok(v)
 }
 
-/// What `open` shows: media (a file, a video's address) or a page.
+/// What `open` shows: media (a file, a video's address), a stream or a
+/// page.
 #[derive(Debug, PartialEq)]
 enum Target {
     Media(String),
+    Stream(String),
     Web(String),
+}
+
+/// `url` with the user and password held by the environment variable
+/// `var`, which is never printed.
+fn with_credentials(url: &str, var: &str) -> Result<String> {
+    let credentials = std::env::var(var).map_err(|_| {
+        Error::new(
+            "BAD_ARGS",
+            format!(
+                "--credentials-env: {} isn't set in this shell",
+                text::inert(var, 60)
+            ),
+        )
+        .hint("Set it to user:password (export CAM=user:password), then name it: --credentials-env CAM.")
+    })?;
+    if !url.contains("://") {
+        return Err(Error::new(
+            "BAD_ARGS",
+            "--credentials-env goes with an address, not a file",
+        ));
+    }
+    text::with_credentials(url, &credentials)
+        .map_err(|e| Error::new("BAD_ARGS", format!("--credentials-env: {e}")))
 }
 
 /// What `open` loads: an absolute path to a file, a video's web address, or
@@ -1366,13 +1450,14 @@ fn open_target(given: &str) -> Result<Target> {
     {
         let lower = scheme.to_ascii_lowercase();
         return match lower.as_str() {
+            _ if viewer::is_stream(given) => Ok(Target::Stream(given.to_owned())),
             "http" | "https" if viewer::is_local(given) => Ok(Target::Web(given.to_owned())),
             "http" | "https" => Ok(Target::Media(given.to_owned())),
             "file" => open_target(&given[7..]),
             _ => Err(Error::new(
                 "UNSUPPORTED",
                 format!(
-                    "{}:// addresses aren't shown yet: files and http(s) only",
+                    "{}:// addresses aren't shown: files, http(s), and streams (rtsp, rtmp, srt, udp)",
                     text::inert(scheme, 20)
                 ),
             )),
@@ -1415,10 +1500,41 @@ fn web_target(given: &str) -> Result<String> {
     Ok(format!("file://{}", file.display()))
 }
 
+/// `watch`: a file shown again when it's rendered again; a page (SVG,
+/// HTML) in the viewer's browser, reloaded when its folder changes.
+fn watch(spec: &Spec, args: &Args) -> Result<Value> {
+    let file = media::local_file(&args.plain[0])?;
+    let given = file.display().to_string();
+    let (cmd, request) = match open_target(&given)? {
+        Target::Web(url) => {
+            let mut request = Value::obj().with("target", url).with("kind", "web").with(
+                "watch",
+                file.parent()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default(),
+            );
+            if let Some(name) = args.value("name") {
+                request.set("name", name);
+            }
+            ("web.open", request)
+        }
+        _ => {
+            let mut request = request_args(spec, args)?;
+            request.set("target", given);
+            ("watch", request)
+        }
+    };
+    let (viewer, mut answer) = recordings::ask(args, cmd, request, answer_wait(spec, args))?;
+    if let Value::Obj(members) = &mut answer {
+        members.insert(0, ("viewer".into(), Value::from(viewer.id.as_str())));
+    }
+    Ok(answer)
+}
+
 /// How long to wait for a viewer's answer.
 fn answer_wait(spec: &Spec, args: &Args) -> Duration {
     let base = match spec.name {
-        "open" | "web open" => 60,
+        "open" | "web open" | "watch" => 60,
         "seek" | "loop" | "review" => 20,
         name if name.starts_with("web ") => 60,
         _ => 10,
@@ -1906,6 +2022,7 @@ mod tests {
         assert!(group_usage("web").contains("web wait-for"));
         assert!(group_usage("edit").contains("edit render"));
         assert!(group_usage("record").contains("record run"));
+        assert!(group_usage("pipe").contains("pipe new"));
         for (name, _, schema) in SCHEMAS {
             let schema = json::parse(schema).unwrap_or_else(|e| panic!("schema {name}: {e}"));
             assert!(schema.get_str("$schema").is_some(), "{name}");
@@ -2016,8 +2133,32 @@ mod tests {
             open_target("localhost:5173").unwrap(),
             web("http://localhost:5173")
         );
-        assert_eq!(open_target("rtsp://cam/x").unwrap_err().code, "UNSUPPORTED");
+        let stream = |t: &str| Target::Stream(t.into());
+        assert_eq!(open_target("rtsp://cam/x").unwrap(), stream("rtsp://cam/x"));
+        assert_eq!(
+            open_target("http://localhost:8080/live.m3u8").unwrap(),
+            stream("http://localhost:8080/live.m3u8")
+        );
         assert_eq!(open_target("av://lavfi:x").unwrap_err().code, "UNSUPPORTED");
+        // A password from the environment, never in the command line.
+        let open = SPECS.iter().find(|s| s.name == "open").unwrap();
+        let line = |extra: &[&str]| {
+            let words: Vec<String> = ["rtsp://cam:554/s"]
+                .iter()
+                .chain(extra)
+                .map(|s| s.to_string())
+                .collect();
+            request_args(open, &parse_args(open, &words).unwrap())
+        };
+        unsafe { std::env::set_var("PEPPER_AGENT_TEST_CAM", "me:se/cret") };
+        let made = line(&["--credentials-env", "PEPPER_AGENT_TEST_CAM"]).unwrap();
+        assert_eq!(
+            made.get_str("target"),
+            Some("rtsp://me:se%2Fcret@cam:554/s")
+        );
+        assert_eq!(made.get_str("kind"), Some("stream"));
+        let unset = line(&["--credentials-env", "PEPPER_AGENT_NO_SUCH_VAR"]).unwrap_err();
+        assert!(!unset.message.contains("cret") && unset.code == "BAD_ARGS");
         assert_eq!(
             open_target("no-such-file.mp4").unwrap_err().code,
             "NOT_FOUND"

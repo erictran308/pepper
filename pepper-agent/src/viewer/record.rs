@@ -45,6 +45,8 @@ pub struct Recording {
     web: Option<WebRecorder>,
     /// A video's: where it was when the recording started.
     from: Option<f64>,
+    /// A pipe's or a stream's: the file mpv writes what it gets into.
+    stream: Option<PathBuf>,
 }
 
 /// A page's frames to ffmpeg, on a thread of their own.
@@ -235,6 +237,17 @@ impl Viewer {
                 format!("--max: seconds, 1 to {MAX_SECONDS}"),
             ));
         }
+        if self.sources[i]
+            .live
+            .as_ref()
+            .is_some_and(|l| l.unrecordable())
+        {
+            return Err(Error::new(
+                "UNSUPPORTED",
+                "a pipe's frames can't be recorded here yet",
+            )
+            .hint("Have the program write its frames to a file as well (ffmpeg's tee muxer, or a second output), and show that with pepper-agent play."));
+        }
         self.finished.retain(|(s, _)| *s != sid);
         let source = &self.sources[i];
         let recording = if source.web.is_some() {
@@ -256,6 +269,28 @@ impl Viewer {
                 max: Duration::from_secs_f64(max),
                 web: Some(recorder),
                 from: None,
+                stream: None,
+            }
+        } else if source
+            .live
+            .as_ref()
+            .is_some_and(|l| l.records_as_it_comes())
+        {
+            // What comes is all there is: mpv writes it as it gets it.
+            self.shot_count += 1;
+            let path = self
+                .shots
+                .join(format!("rec-{sid}-{}.mkv", self.shot_count));
+            if let Some(player) = &mut self.sources[i].player {
+                player.set("stream-record", path.display().to_string());
+            }
+            Recording {
+                sid,
+                started: Instant::now(),
+                max: Duration::from_secs_f64(max),
+                web: None,
+                from: None,
+                stream: Some(path),
             }
         } else {
             Recording {
@@ -264,8 +299,10 @@ impl Viewer {
                 max: Duration::from_secs_f64(max),
                 web: None,
                 from: Some(source.time_pos.unwrap_or(0.0)),
+                stream: None,
             }
         };
+        let source = &self.sources[i];
         let answer = Value::obj()
             .with("source", source.name.as_str())
             .with("kind", source.kind)
@@ -282,6 +319,15 @@ impl Viewer {
     pub(super) fn record_stop(&mut self, req: super::Request) {
         match self.stop_recording(&req.args) {
             Ok((sid, Finished::Job(job))) => self.wait(req, STOP_WAIT, WaitFor::Job { job, sid }),
+            Ok((sid, Finished::Reply(request, result))) => self.wait(
+                req,
+                STOP_WAIT,
+                WaitFor::Reply {
+                    sid,
+                    request,
+                    result,
+                },
+            ),
             Ok((_, Finished::Now(answer))) => req.answer(answer),
             Err(e) => req.answer(Err(e)),
         }
@@ -311,13 +357,21 @@ impl Viewer {
         Ok((sid, self.finish(i, recording)))
     }
 
-    /// Ends a recording: a page's in a job, a video's at once.
+    /// Ends a recording: a page's in a job, a pipe's or a stream's once
+    /// mpv has closed its file, a video's at once.
     fn finish(&mut self, i: usize, recording: Recording) -> Finished {
         let source = &self.sources[i];
         let mut about = Value::obj()
             .with("source", source.name.as_str())
             .with("kind", source.kind);
         source.origin(&mut about);
+        if let Some(path) = recording.stream {
+            about.set("raw", path.display().to_string());
+            return match &mut self.sources[i].player {
+                Some(player) => Finished::Reply(player.set("stream-record", ""), about),
+                None => Finished::Now(Ok(about)),
+            };
+        }
         match recording.web {
             Some(recorder) => {
                 if let Some(page) = source.web.as_ref().and_then(|w| w.page.clone()) {
@@ -374,6 +428,7 @@ impl Viewer {
             let name = self.sources[i].name.clone();
             match self.finish(i, recording) {
                 Finished::Job(job) => self.auto_stops.push((job, sid)),
+                Finished::Reply(_, done) => self.finished.push((sid, Ok(done))),
                 Finished::Now(done) => self.finished.push((sid, done)),
             }
             self.flash(format!(
@@ -403,9 +458,11 @@ impl Viewer {
 }
 
 /// How a recording ended: a page's file is being finished by a job; a
-/// video's stretch (or why there's none) is known now.
+/// pipe's or a stream's once the player answers this request; a video's
+/// stretch (or why there's none) is known now.
 enum Finished {
     Job(u64),
+    Reply(u64, Value),
     Now(Result<Value>),
 }
 

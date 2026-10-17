@@ -18,6 +18,7 @@ mod compare;
 mod frames;
 mod input;
 mod layout;
+mod live;
 mod pages;
 mod player;
 mod pointing;
@@ -49,6 +50,7 @@ use layout::{Cells, Mode};
 use player::Player;
 use screen::{Row, Screen};
 
+pub use live::is_stream;
 pub use player::find_play;
 pub use web::is_local;
 
@@ -168,6 +170,19 @@ struct Source {
     /// name for the label.
     session: Option<String>,
     owner: Option<String>,
+    /// A watched file, a pipe or a stream: when it loads again.
+    live: Option<live::Live>,
+}
+
+/// A source to add: what `add_source` needs besides the request.
+struct New {
+    kind: &'static str,
+    target: String,
+    play: bool,
+    session: Option<String>,
+    owner: Option<String>,
+    edit: Option<edit::Timeline>,
+    live: Option<live::Live>,
 }
 
 impl Source {
@@ -177,6 +192,9 @@ impl Source {
     }
 
     fn status(&self) -> &'static str {
+        if let Some(status) = self.live.as_ref().and_then(live::Live::status) {
+            return status;
+        }
         match self.state {
             State::Loading => "loading",
             State::Failed(_) | State::Gone(_) => "error",
@@ -279,6 +297,9 @@ impl Source {
                 v.set("clip", clip);
             }
         }
+        if let Some(live) = &self.live {
+            live.to_json(&mut v);
+        }
         if let Some(error) = self.error() {
             v.set("error", error);
         }
@@ -307,6 +328,12 @@ enum WaitFor {
         review_to: Option<f64>,
     },
     Shot {
+        sid: u64,
+        request: u64,
+        result: Value,
+    },
+    /// A command of the player's: `result`, once the player has done it.
+    Reply {
         sid: u64,
         request: u64,
         result: Value,
@@ -641,6 +668,7 @@ impl Viewer {
     /// Under --debug, a line in the viewer's log.
     fn note(&self, line: &str) {
         if let Some(log) = &self.log {
+            let line = text::redact_urls(line);
             let _ = files::append_line(log, &format!("{} {line}", sys::iso_time(sys::now())));
         }
     }
@@ -677,6 +705,7 @@ impl Viewer {
             self.end_long_recordings();
             self.sync_drift();
             self.reload_watched();
+            self.pump_live();
             if let Some((_, at)) = &self.flash
                 && at.elapsed() >= FLASH
             {
@@ -706,7 +735,11 @@ impl Viewer {
             Msg::WebOpened(sid, page) => self.on_web_opened(sid, page),
             Msg::Job(job, result) => self.on_job(job, result),
             Msg::BoxSize(token, size) => self.on_box_size(&token, size),
-            Msg::Watch(sid) => self.on_watch(sid),
+            Msg::Watch(sid) => {
+                if !self.on_watch_live(sid) {
+                    self.on_watch(sid);
+                }
+            }
         }
     }
 
@@ -1427,6 +1460,10 @@ impl Viewer {
                 WaitFor::Job { .. } => wait
                     .req
                     .answer(Err(Error::new("TIMEOUT", "the page didn't finish in time"))),
+                WaitFor::Reply { .. } => wait.req.answer(Err(Error::new(
+                    "TIMEOUT",
+                    "the player didn't answer in time",
+                ))),
                 WaitFor::Events { .. } => {}
             }
         }
@@ -1506,17 +1543,21 @@ impl Viewer {
                     self.record_dirty = true;
                     self.dirty = true;
                 }
+                self.live_started(i);
                 self.on_restart(sid);
                 self.seek_done(i);
                 self.sync_seek(sid);
             }
             Some("end-file") if line.get_str("reason") == Some("error") => {
-                let source = &mut self.sources[i];
                 let why = text::inert(
                     line.get_str("file_error")
                         .unwrap_or("it couldn't be played"),
                     200,
                 );
+                if self.live_failed(i, &why) {
+                    return;
+                }
+                let source = &mut self.sources[i];
                 let detail = source
                     .log
                     .iter()
@@ -1569,6 +1610,9 @@ impl Viewer {
             "eof-reached" => {
                 source.eof = data.bool().unwrap_or(false);
                 self.record_dirty = true;
+                if self.sources[i].eof && self.sources[i].live.is_some() {
+                    self.live_ended(i);
+                }
             }
             "paused-for-cache" => source.buffering = data.bool().unwrap_or(false),
             "dwidth" | "dheight" => {
@@ -1636,6 +1680,20 @@ impl Viewer {
                         .hint("A source with sound only has no picture to take.")));
                     }
                 }
+                WaitFor::Reply {
+                    sid: s,
+                    request: r,
+                    result,
+                } if s == sid && r == request => {
+                    if ok {
+                        wait.req.answer(Ok(result));
+                    } else {
+                        wait.req.answer(Err(Error::new(
+                            "FAILED",
+                            format!("the player couldn't: {error}"),
+                        )));
+                    }
+                }
                 what => self.waits.push(Wait { what, ..wait }),
             }
         }
@@ -1649,6 +1707,7 @@ impl Viewer {
                 WaitFor::Loaded { sid: s }
                 | WaitFor::Restart { sid: s, .. }
                 | WaitFor::Shot { sid: s, .. }
+                | WaitFor::Reply { sid: s, .. }
                 | WaitFor::Job { sid: s, .. } => *s == sid,
                 WaitFor::Events { .. } => false,
             };
@@ -1697,6 +1756,8 @@ impl Viewer {
             "record.stop" => return self.record_stop(req),
             "compare" => self.set_compare(&args),
             "open" | "web.open" => return self.open(req),
+            "watch" => return self.watch(req),
+            "pipe.new" => self.pipe_new(&args),
             "close" => self.close(&args),
             "layout" => self.set_layout(&args),
             "focus" => self.set_focus(&args),
@@ -1848,6 +1909,13 @@ impl Viewer {
         }
     }
 
+    fn watch(&mut self, req: Request) {
+        match self.start_watch(&req.args) {
+            Ok(sid) => self.wait(req, OPEN_WAIT, WaitFor::Loaded { sid }),
+            Err(e) => req.answer(Err(e)),
+        }
+    }
+
     fn start_open(&mut self, args: &Value) -> Result<u64> {
         let target = args
             .get_str("target")
@@ -1856,8 +1924,10 @@ impl Viewer {
         if kind == "web" {
             return self.start_web(args);
         }
-        // A recording `play` shows is a video like any other, so labelled.
+        // A recording `play` shows is a video like any other, so labelled;
+        // a stream's address is a stream, however asked for.
         let kind: &'static str = match kind {
+            "media" | "stream" if live::is_stream(target) => "stream",
             "media" => "media",
             "recording" => "recording",
             other => {
@@ -1876,7 +1946,26 @@ impl Viewer {
             .get("edit")
             .map(edit::Timeline::from_json)
             .transpose()?;
-        let play = args.get_bool("play").unwrap_or(false);
+        let stream = kind == "stream";
+        self.add_source(
+            args,
+            New {
+                kind,
+                target: target.to_owned(),
+                // A stream is live: it plays.
+                play: stream || args.get_bool("play").unwrap_or(false),
+                session,
+                owner,
+                edit,
+                live: stream.then(|| live::Live::Stream(live::Streamed::new())),
+            },
+        )
+    }
+
+    /// A source with a player, named as the request says: in the box of
+    /// the source of that name if there's one (the same kind of plain
+    /// video), or a new one.
+    fn add_source(&mut self, args: &Value, new: New) -> Result<u64> {
         let name = args.get_str("name");
         if let Some(name) = name
             && !valid_name(name)
@@ -1887,13 +1976,17 @@ impl Viewer {
             )
             .hint("A name is 1 to 64 of A-Z a-z 0-9 . _ / -, starting with a letter or digit."));
         }
-        if let Some(i) = name.and_then(|n| self.sources.iter().position(|s| s.name == n))
+        let same = name.and_then(|n| self.sources.iter().position(|s| s.name == n));
+        if let Some(i) = same
             && self.sources[i].player.is_some()
+            && self.sources[i].live.is_none()
+            && new.live.is_none()
             && self.check_owner(i, args).map(|_| true)?
         {
             // The same name again: the new target, in the same box.
             let source = &mut self.sources[i];
-            source.target = target.to_owned();
+            source.target = new.target.clone();
+            source.kind = new.kind;
             source.state = State::Loading;
             source.time_pos = None;
             source.duration = None;
@@ -1901,13 +1994,13 @@ impl Viewer {
             source.review_to = None;
             source.loop_ab = None;
             source.log.clear();
-            source.edit = edit;
+            source.edit = new.edit;
             source.scrub = seekbar::Scrub::default();
             if let Some(player) = &mut source.player {
                 player.set("ab-loop-a", "no");
                 player.set("ab-loop-b", "no");
-                player.set("pause", !play);
-                player.command(&["loadfile", target, "replace"]);
+                player.set("pause", !new.play);
+                player.command(&["loadfile", &new.target, "replace"]);
             }
             let sid = source.sid;
             self.focus = Some(i);
@@ -1915,8 +2008,8 @@ impl Viewer {
             self.relayout();
             return Ok(sid);
         }
-        if let Some(i) = name.and_then(|n| self.sources.iter().position(|s| s.name == n)) {
-            // Its player ended: it goes, and a new one comes.
+        if let Some(i) = same {
+            // Another kind, or its player ended: it goes, and a new one comes.
             self.check_owner(i, args)?;
             self.remove_source(i);
         }
@@ -1928,7 +2021,7 @@ impl Viewer {
         }
         let name = match name {
             Some(n) => n.to_owned(),
-            None => self.unique_name(target),
+            None => self.unique_name(&new.target),
         };
         let token = sys::random_hex().map_err(|e| Error::new("FAILED", format!("a token: {e}")))?;
         let sid = self.next_sid;
@@ -1938,21 +2031,28 @@ impl Viewer {
                 Error::new("MISSING_DEP", format!("cannot run {}: {e}", self.play.display()))
                     .hint("pepper-play comes with Pepper; mpv's library too must be installed: brew install mpv")
             })?;
-        if play {
+        let load = match &new.live {
+            Some(live) => {
+                live.prepare(&mut player, &new.target);
+                live.load_target(&new.target)
+            }
+            None => new.target.clone(),
+        };
+        if new.play {
             player.set("pause", false);
         }
-        player.command(&["loadfile", target, "replace"]);
+        player.command(&["loadfile", &load, "replace"]);
         self.sources.push(Source {
             sid,
             name,
-            kind,
-            target: target.to_owned(),
+            kind: new.kind,
+            target: new.target,
             token,
             player: Some(player),
             state: State::Loading,
             time_pos: None,
             duration: None,
-            paused: !play,
+            paused: !new.play,
             eof: false,
             buffering: false,
             size: (None, None),
@@ -1962,9 +2062,10 @@ impl Viewer {
             placed: None,
             log: Vec::new(),
             web: None,
-            edit,
-            session,
-            owner,
+            edit: new.edit,
+            session: new.session,
+            owner: new.owner,
+            live: new.live,
             fps: None,
             scrub: seekbar::Scrub::default(),
         });
@@ -1976,6 +2077,8 @@ impl Viewer {
 
     /// A name from the file's or the address's last part, not taken yet.
     fn unique_name(&self, target: &str) -> String {
+        // Never a part of a user and password.
+        let target = text::redact_url(target);
         let last = target
             .trim_end_matches('/')
             .rsplit('/')
@@ -2381,8 +2484,13 @@ impl Viewer {
         v.set("duration", s.duration.map(round3));
         v.set("paused", s.paused);
         v.set("frame", s.frame());
+        v.set("width", s.size.0);
+        v.set("height", s.size.1);
         if let (Some(edit), Some(t)) = (&s.edit, s.time_pos) {
             edit.describe(t, &mut v);
+        }
+        if let Some(live) = &s.live {
+            live.to_json(&mut v);
         }
         if let Some((a, b)) = s.loop_ab {
             v.set("loop", vec![round3(a), round3(b)]);
@@ -2464,6 +2572,8 @@ impl Viewer {
                 player.stop();
                 players.push(player);
             }
+            // A pipe's player may be waiting for a writer: let it go.
+            source.live = None;
             if let Some(web) = source.web.take() {
                 pages.push(web);
             }
@@ -2544,9 +2654,9 @@ fn clamp_time(t: f64, duration: Option<f64>) -> f64 {
     }
 }
 
-/// What may be loaded: an absolute path to a file, or an http(s) address.
-/// Nothing else reaches mpv's `loadfile` (which would take its own
-/// protocols, `av://`, `edl://` and the rest).
+/// What may be loaded: an absolute path to a file, an http(s) address, or
+/// a stream's (rtsp, rtmp, srt, udp). Nothing else reaches mpv's `loadfile`
+/// (which would take its own protocols, `av://`, `edl://` and the rest).
 fn check_target(target: &str) -> Result<()> {
     if target.len() > 4096 {
         return Err(Error::new("BAD_ARGS", "the target is too long"));
@@ -2561,18 +2671,18 @@ fn check_target(target: &str) -> Result<()> {
             format!("no file at {}", text::inert(target, 300)),
         ));
     }
-    if target.starts_with("https://") || target.starts_with("http://") {
+    if target.starts_with("https://") || target.starts_with("http://") || live::is_stream(target) {
         if target.chars().any(|c| c.is_control() || c == ' ') {
             return Err(Error::new(
                 "BAD_ARGS",
-                "a web address holds no spaces or control characters",
+                "an address holds no spaces or control characters",
             ));
         }
         return Ok(());
     }
     Err(Error::new(
         "BAD_ARGS",
-        "the target must be an absolute path or an http(s) address",
+        "the target must be an absolute path, an http(s) address or a stream's (rtsp, rtmp, srt, udp)",
     ))
 }
 

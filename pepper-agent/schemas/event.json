@@ -13,7 +13,7 @@
     },
     "at": {"type": "string", "format": "date-time", "description": "When, UTC."},
     "source": {"type": "string", "description": "The source's name, when it's about one."},
-    "kind": {"enum": ["media", "web", "recording"], "description": "recording: a file play showed as one (a demo for approval)."},
+    "kind": {"enum": ["media", "web", "recording", "watch", "pipe", "stream"], "description": "recording: a file play showed as one (a demo for approval); watch: a file shown again when it's rendered again; pipe: frames a program writes; stream: a live stream (its address without its password)."},
     "owner": {"type": "string", "description": "The owner's name of the source, when an agent's session opened it."},
     "compare": {"type": "object", "description": "approve, reject: the two compared, when the source was one of them.", "properties": {"before": {"type": "string"}, "after": {"type": "string"}}},
     "file": {"type": "string", "description": "A video's file or address (any password taken out)."},
