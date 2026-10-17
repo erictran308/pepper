@@ -70,9 +70,9 @@ class Viewer:
         with self.lock:
             return bytes(self.out)
 
-    def keys(self, data):
+    def keys(self, data, pause=0.3):
         os.write(self.fd, data)
-        time.sleep(0.3)
+        time.sleep(pause)
 
     def wait_for(self, needle, timeout=10):
         end = time.time() + timeout
@@ -154,6 +154,342 @@ def press_at(viewer, box, viewport, css, cell=(10, 20)):
     cw, ch = (round(bh * aspect), bh) if bw / bh > aspect else (bw, round(bw / aspect))
     ox, oy = (bw - cw) // 2, (bh - ch) // 2
     return (int(bx + ox + css[0] * cw / viewport["width"]), int(by + oy + css[1] * ch / viewport["height"]))
+
+
+def frames_clip(dir):
+    """4 s at 25 fps, no sound, each frame showing its number as 8 black or white
+    bars (bit k in the k-th 40 pixels): lossy encoding can't change it."""
+    path = os.path.join(dir, "frames.mp4")
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "nullsrc=size=320x240:rate=25,geq=lum='16+219*mod(floor(N/pow(2,floor(X/40))),2)':cb=128:cr=128",
+                    "-t", "4", "-c:v", "libx264", "-pix_fmt", "yuv420p", path], check=True)
+    return path
+
+
+def frame_numbers(path):
+    """Each frame's number, read back from its bars."""
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", "crop=320:2:0:119,format=gray",
+                          "-f", "rawvideo", "-"], capture_output=True, check=True).stdout
+    rows = [raw[i:i + 320] for i in range(0, len(raw) - 639, 640)]
+    return [sum((row[20 + 40 * k] > 128) << k for k in range(8)) for row in rows]
+
+
+def edit_checks(cli, viewer, work, project, clip, hostile):
+    frames = frames_clip(work)
+    cut = os.path.join(project, "cut.json")
+    rel = lambda p: os.path.relpath(p, project)
+
+    def write(path, data):
+        with open(path, "w") as f:
+            json.dump(data, f)
+
+    # A hostile file name among the clips: its path goes into the EDL and the events.
+    write(cut, {"pepper_edit": 1, "clips": [
+        {"src": rel(clip), "in": 2, "out": 4, "name": "open"},
+        {"src": rel(hostile), "in": 0.5, "out": 2.5},
+        {"src": rel(frames), "in": "0:01", "out": 2.4},
+    ]})
+    v = cli("edit", "validate", cut)
+    check("edit validate says a good project is", v.get("valid") is True and v.get("duration") == 5.4, v)
+    check("its output is the first clip's", v.get("output") == {"width": 640, "height": 360, "fps": 30, "fit": "pad"}, v)
+    bad = os.path.join(project, "bad.json")
+    write(bad, {"pepper_edit": 1, "outptu": {}, "clips": [
+        {"src": rel(clip), "in": 10, "out": 14},
+        {"src": "nope.mp4"},
+        {"src": rel(clip), "in": "1:99", "name": "\x1b]2;x\x07"},
+        {"src": rel(clip), "in": 3, "out": 2},
+    ]})
+    e = cli("edit", "validate", bad, ok=False).get("error", {})
+    ats = [p.get("at") for p in e.get("problems", [])]
+    check("edit validate lists every problem at once", e.get("code") == "INVALID_PROJECT" and ats == [
+        "outptu", "clips[0].out", "clips[1].src", "clips[2].name", "clips[2].in", "clips[3].out"], ats)
+    t = cli("edit", "timeline", cut, "--at", "2.5,4.5")
+    at = t.get("at", [{}, {}])
+    check("edit timeline maps output to source time",
+          at[0].get("clip") == 1 and at[0].get("src_time") == 1.0 and at[1].get("clip") == 2 and at[1].get("src_time") == 1.5, at)
+    check("and lists each clip's span", [c.get("start") for c in t.get("clips", [])] == [0, 2, 4], t.get("clips"))
+
+    p = cli("edit", "preview", cut)
+    src = p.get("source", {})
+    check("edit preview opens the cut, paused", src.get("name") == "cut" and src.get("status") == "paused", p)
+    check("the preview is as long as the cut", abs((src.get("duration") or 0) - 5.4) < 0.1, src)
+    check("its source says its project", src.get("project") == cut, src)
+    check("the EDL is in .pepper/edits", p.get("edl", "").endswith("/.pepper/edits/cut.edl") and os.path.isfile(p.get("edl", "")), p)
+    since = cli("events").get("last_id", 0)
+    cli("seek", "2.5")
+    w = cli("where")
+    check("where on a preview gives the clip and its file's time",
+          w.get("clip") == 1 and abs((w.get("src_time") or 0) - 1.0) < 0.05 and "evil" in w.get("src", ""), w)
+    check("the label says which clip", viewer.wait_for(b"clip 2 of 3"))
+    check("a preview's seek bar shows its cuts", viewer.wait_for("│".encode()) and viewer.wait_for("●".encode()))
+    viewer.keys(b"m")
+    cli("seek", "4.5")
+    viewer.keys(b"n")
+    viewer.keys(b"too long")
+    viewer.keys(b"\r")
+    viewer.keys(b"y")
+    ev = cli("events", "--since", str(since), "--until", "approve", "--wait", "5")
+    got = {e.get("type"): e for e in ev.get("events", [])}
+    mark, note, ok = got.get("mark", {}), got.get("note", {}), got.get("approve", {})
+    check("a mark on a preview has both times",
+          mark.get("project") == cut and mark.get("clip") == 1 and abs((mark.get("time") or 0) - 2.5) < 0.05
+          and abs((mark.get("src_time") or 0) - 1.0) < 0.05 and "file" not in mark, mark)
+    check("a note too", note.get("clip") == 2 and abs((note.get("src_time") or 0) - 1.5) < 0.05
+          and note.get("src") == frames and note.get("text") == "too long", note)
+    check("y approves", ok.get("project") == cut and ok.get("source") == "cut", ok)
+    check("the mark's flash names the clip", viewer.wait_for(b"clip 2 of 3 (evil"))
+    check("the clip's file name reaches the terminal inert", b"\x1b]2;pwned" not in viewer.screen())
+    shot = cli("snapshot")
+    check("a snapshot of a preview has the clip's time", shot.get("clip") == 2 and shot.get("project") == cut, shot)
+
+    # The human asked for the middle clip to go: the same box shows the new cut.
+    write(cut, {"pepper_edit": 1, "clips": [
+        {"src": rel(clip), "in": 2, "out": 4, "name": "open"},
+        {"src": rel(frames), "in": 1, "out": 2.4},
+    ]})
+    p = cli("edit", "preview", cut)
+    check("a preview again shows the new cut", abs((p.get("source", {}).get("duration") or 0) - 3.4) < 0.1, p)
+    check("in the same box", [s.get("name") for s in cli("sources").get("sources", [])].count("cut") == 1)
+    cli("seek", "2.5")
+    w = cli("where")
+    check("its times are the new cut's", w.get("clip") == 1 and abs((w.get("src_time") or 0) - 1.5) < 0.05, w)
+    # The note (frames.mp4 at 1.5) is still in the new cut, at 2.5; the mark
+    # on the clip that went is gone, so after the note there's nothing.
+    cli("seek", "0")
+    viewer.keys(b">")
+    w = cli("where")
+    check("> goes to the next mark, kept in place in the revised cut", abs((w.get("time_pos") or -9) - 2.5) < 0.05, w)
+    check("paused on it, the keys row shows the note", viewer.wait_for(b"your note at 0:02.5") and viewer.wait_for(b": too long"))
+    check("marks show on the seek bar", "◆".encode() in viewer.screen())
+    viewer.keys(b">")
+    check("the mark whose clip was cut out is gone", viewer.wait_for(b"No mark after this one"))
+    viewer.keys(b"<")
+    check("< goes back", viewer.wait_for(b"No mark before this one"))
+    cli("close", "cut")
+
+    r = subprocess.run([viewer.agent, "edit", "render", cut], capture_output=True, text=True, cwd=project, env=viewer.env)
+    out = json.loads(r.stdout or "{}")
+    check("edit render makes the cut", r.returncode == 0 and os.path.isfile(out.get("path", "")), r.stderr[-300:])
+    check("as a draft in .pepper/renders", out.get("path", "").endswith("/.pepper/renders/cut.draft.mp4")
+          and out.get("encoder") == "h264_videotoolbox", out)
+    check("as long as the project", abs((out.get("duration") or 0) - 3.4) < 0.04, out)
+    check("with a contact sheet to look at", os.path.isfile(out.get("sheet") or ""), out)
+    check("progress comes on stderr", '{"progress":{"step":"render"' in r.stderr, r.stderr[:200])
+    streams = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type,width,height", "-of", "csv=p=0",
+                              out.get("path", "")], capture_output=True, text=True).stdout.split()
+    check("its picture is the output's, and its sound is there", streams == ["video,640,360", "audio"], streams)
+
+    # Frame by frame: each clip from its in, nothing dropped or doubled at the cut.
+    exact = os.path.join(project, "exact.json")
+    write(exact, {"pepper_edit": 1, "output": {"width": 320, "height": 240, "fps": 25}, "clips": [
+        {"src": rel(frames), "in": 1.0, "out": 2.4}, {"src": rel(frames), "in": 0.4, "out": 1.6}]})
+    made = os.path.join(project, "exact.mp4")
+    cli("edit", "render", exact, "-o", made)
+    want = list(range(25, 60)) + list(range(10, 40))
+    check("a render is frame-exact at its cuts", frame_numbers(made) == want, frame_numbers(made))
+    again = cli("edit", "render", exact, "-o", made, ok=False)
+    check("a file that exists isn't replaced without --overwrite", again.get("error", {}).get("code") == "BAD_ARGS", again)
+    final = cli("edit", "render", exact, "-o", made, "--overwrite", "--quality", "final")
+    check("--overwrite --quality final", final.get("encoder") == "libx264" and frame_numbers(made) == want, final)
+    over = cli("edit", "render", exact, "-o", frames, "--overwrite", ok=False)
+    check("never over a clip's file", over.get("error", {}).get("code") == "BAD_ARGS" and os.path.getsize(frames) > 0, over)
+    leftovers = [f for f in os.listdir(project) if ".part" in f]
+    check("no half-written files are left", not leftovers, leftovers)
+
+    seekbar_checks(cli, viewer, frames)
+    video_use_checks(cli, viewer, work, clip, frames)
+
+    schemas = cli("schema").get("schemas", [])
+    check("schema lists its schemas", [s.get("name") for s in schemas] == ["edit", "event", "error", "timeline", "render"], schemas)
+    check("schema edit is a JSON Schema", "$schema" in cli("schema", "edit"))
+
+
+def video_use_checks(cli, viewer, work, clip, frames):
+    """video-use's way (github.com/browser-use/video-use): footage, an edit/ folder
+    with its edl.json and Scribe transcripts. Pepper previews the EDL, shows its
+    render, and marks come back with the range and what was said."""
+    edit = os.path.join(work, "edit")
+    os.makedirs(os.path.join(edit, "transcripts"), exist_ok=True)
+    edl = os.path.join(edit, "edl.json")
+    with open(edl, "w") as f:
+        json.dump({"version": 1, "sources": {"talk": "../clip.mp4", "frames": frames},
+                   "ranges": [{"source": "talk", "start": 1.0, "end": 3.0, "beat": "HOOK", "quote": "hello world"},
+                              {"source": "frames", "start": 0.5, "end": 2.0, "beat": "END"}],
+                   "subtitles": "edit/master.srt", "total_duration_s": 3.5}, f)
+    with open(os.path.join(edit, "transcripts", "talk.json"), "w") as f:
+        json.dump({"words": [
+            {"text": "hello", "start": 1.0, "end": 1.4, "type": "word", "speaker_id": "speaker_0"},
+            {"text": " ", "start": 1.4, "end": 1.5, "type": "spacing"},
+            {"text": "world", "start": 1.5, "end": 2.1, "type": "word", "speaker_id": "speaker_0"},
+            {"text": "again\u001b]2;x\u0007", "start": 2.6, "end": 3.0, "type": "word", "speaker_id": "speaker_0"}]}, f)
+
+    v = cli("edit", "validate", edl)
+    check("edit validate reads video-use's edl.json", v.get("valid") is True and v.get("clips") == 2 and v.get("duration") == 3.5, v)
+    check("and says what a preview of it leaves out",
+          any("subtitles" in (w.get("warning") or "") for w in v.get("warnings", [])), v.get("warnings"))
+    t = cli("edit", "timeline", edl, "--at", "0.7")
+    at = (t.get("at") or [{}])[0]
+    check("edit timeline gives a range's source name and quote",
+          [(c.get("source"), c.get("name"), c.get("quote")) for c in t.get("clips", [])]
+          == [("talk", "HOOK", "hello world"), ("frames", "END", None)], t.get("clips"))
+    check("and what was said there, from the transcript",
+          (at.get("said") or {}).get("word", {}).get("text") == "world" and at.get("src_time") == 1.7, at)
+    check("with the pauses either side, to cut in",
+          (at.get("said") or {}).get("pause_before") == [0, 1.0] and (at.get("said") or {}).get("pause_after") == [2.1, 2.6], at)
+    raw = subprocess.run([viewer.agent, "edit", "timeline", edl, "--at", "1.8"], capture_output=True, cwd=viewer.cwd, env=viewer.env)
+    check("a transcript's text comes out inert", b"again]2;x" in raw.stdout and b"\x1b" not in raw.stdout
+          and b"\x07" not in raw.stdout, raw.stdout[:300])
+
+    bad = os.path.join(edit, "bad.json")
+    with open(bad, "w") as f:
+        json.dump({"sources": {"talk": "../clip.mp4"},
+                   "ranges": [{"source": "talk", "start": 1, "end": 99}, {"source": "nope", "start": 0, "end": 1}]}, f)
+    e = cli("edit", "validate", bad, ok=False).get("error", {})
+    check("its problems are said in its own terms",
+          [p.get("at") for p in e.get("problems", [])] == ["ranges[1].source", "ranges[0].end"], e)
+    r = cli("edit", "render", edl, ok=False).get("error", {})
+    check("its render is video-use's render.py", r.get("code") == "UNSUPPORTED" and "render.py" in r.get("hint", ""), r)
+
+    p = cli("edit", "preview", edl)
+    check("edit preview shows video-use's cut", abs((p.get("source", {}).get("duration") or 0) - 3.5) < 0.1, p.get("source"))
+    since = cli("events").get("last_id", 0)
+    cli("seek", "0.7")
+    viewer.keys(b"m")
+    ev = cli("events", "--since", str(since), "--wait", "5").get("events", [{}])
+    mark = ev[0] if ev else {}
+    said = mark.get("said") or {}
+    check("a mark on it names the range and what was said",
+          mark.get("clip_name") == "HOOK" and abs((mark.get("src_time") or 0) - 1.7) < 0.05
+          and said.get("word", {}).get("text") == "world" and said.get("phrase") == "hello world", mark)
+    # A range: i at one end, o at the other, a note.
+    since = cli("events").get("last_id", 0)
+    cli("seek", "0.3")
+    viewer.keys(b"i")
+    check("i opens a range", viewer.wait_for(b"range from 0:00.3"))
+    cli("seek", "1.2")
+    viewer.keys(b"o")
+    check("o asks for its note", viewer.wait_for(b"note on the range 0:00.3"))
+    viewer.keys(b"cut this")
+    viewer.keys(b"\r")
+    ev = cli("events", "--since", str(since), "--wait", "5").get("events", [{}])
+    rng = ev[0] if ev else {}
+    check("a range gives both ends in the cut and in the source",
+          rng.get("type") == "range" and abs((rng.get("time") or 0) - 0.3) < 0.05 and abs((rng.get("to") or 0) - 1.2) < 0.05
+          and abs((rng.get("src_time") or 0) - 1.3) < 0.05 and abs((rng.get("to_src_time") or 0) - 2.2) < 0.05
+          and rng.get("to_clip") == 0 and rng.get("note") == "cut this", rng)
+    check("and what was said at each end", (rng.get("said") or {}).get("word", {}).get("text") == "hello"
+          and (rng.get("to_said") or {}).get("in_silence") is True, rng)
+    # Deleting: at 0.7 are the mark and the range around it; d asks first.
+    cli("seek", "0.7")
+    since = cli("events").get("last_id", 0)
+    viewer.keys(b"d")
+    check("d asks before deleting the newest mark there",
+          viewer.wait_for(b"d again deletes your range 0:00.3") and viewer.wait_for(b": cut this"))
+    viewer.keys(b"x")
+    viewer.keys(b"d")
+    viewer.keys(b"d")
+    ev = cli("events", "--since", str(since), "--wait", "5").get("events", [])
+    check("any other key keeps it (and isn't taken as itself)", [e.get("type") for e in ev] == ["delete"], ev)
+    gone = ev[0] if ev else {}
+    check("d again deletes it, and the agent is told", gone.get("deletes") == [rng.get("id")]
+          and (gone.get("deleted") or {}).get("type") == "range" and (gone.get("deleted") or {}).get("note") == "cut this", gone)
+    viewer.keys(b"d")
+    viewer.keys(b"d")
+    ids = [e.get("id") for e in cli("events", "--since", "0").get("events", [])]
+    check("deleted marks are left out of events", rng.get("id") not in ids and mark.get("id") not in ids, ids)
+    cli("seek", "0")
+    viewer.keys(b">")
+    check("and off the bar", viewer.wait_for(b"No marks yet"))
+    cli("close", p.get("source", {}).get("name", "edl"))
+
+    # Its render (here the same cut, made by edit render) shown with the EDL.
+    same = os.path.join(edit, "same.json")
+    with open(same, "w") as f:
+        json.dump({"pepper_edit": 1, "output": {"width": 640, "height": 360, "fps": 30}, "clips": [
+            {"src": "../clip.mp4", "in": 1.0, "out": 3.0}, {"src": frames, "in": 0.5, "out": 2.0}]}, f)
+    preview = os.path.join(edit, "preview.mp4")
+    cli("edit", "render", same, "-o", preview, "--overwrite")
+    o = cli("open", preview, "--edit", edl, "--name", "vu")
+    check("open --edit shows a render with its cut", o.get("source", {}).get("project") == edl and not o.get("warnings"), o)
+    since = cli("events").get("last_id", 0)
+    cli("seek", "2.4")
+    viewer.keys(b"m")
+    ev = cli("events", "--since", str(since), "--wait", "5").get("events", [{}])
+    mark = ev[0] if ev else {}
+    check("a mark on the render gives the range and the time in its source",
+          mark.get("clip") == 1 and mark.get("clip_name") == "END" and mark.get("file") == preview
+          and abs((mark.get("src_time") or 0) - 0.9) < 0.05, mark)
+    cli("close", "vu")
+
+    fake = os.path.join(work, "skills", "video-use")
+    os.makedirs(os.path.join(fake, "helpers"), exist_ok=True)
+    open(os.path.join(fake, "SKILL.md"), "w").write("---\nname: video-use\n---\n")
+    open(os.path.join(fake, "helpers", "render.py"), "w").write("")
+    s = subprocess.run([viewer.agent, "status"], capture_output=True, text=True, cwd=viewer.cwd,
+                       env={**viewer.env, "VIDEO_USE_DIR": fake})
+    vu = json.loads(s.stdout or "{}").get("video_use", {})
+    check("status finds video-use", vu.get("installed") is True and vu.get("path") == fake, vu)
+
+
+def seekbar_checks(cli, viewer, frames):
+    """The human's mouse on a video: its seek bar, and the wheel a frame a notch."""
+    src = cli("open", frames, "--name", "frames").get("source", {})
+    # The box takes the picture's shape once the player says it.
+    deadline = time.time() + 5
+    while time.time() < deadline and not (src.get("width") and src.get("box")):
+        time.sleep(0.1)
+        src = next((s for s in cli("sources").get("sources", []) if s.get("name") == "frames"), {})
+    time.sleep(0.2)
+    src = next((s for s in cli("sources").get("sources", []) if s.get("name") == "frames"), src)
+    col, row, cols, rows = src.get("box") or (0, 0, 1, 1)
+    d = src.get("duration") or 4
+    # The bar is the row under the box: its middle, in pixels (10×20 cells).
+    y = (row + rows) * 20 + 10
+    at = lambda t: int(col * 10 + t / d * cols * 10)
+    mouse = lambda code, x, end="M": viewer.keys(f"\x1b[<{code};{x};{y}{end}".encode(), 0.05)
+    # A pixel of the bar is this long; a frame, 0.04 s.
+    near = d / (cols * 10) + 0.041
+    since = cli("events").get("last_id", 0)
+
+    def settle(want, tolerance=0.001):
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            w = cli("where", "frames")
+            if abs((w.get("time_pos") or -9) - want) <= tolerance:
+                return w
+            time.sleep(0.1)
+        return cli("where", "frames")
+
+    mouse(0, at(2.0))
+    mouse(0, at(2.0), "m")
+    w = settle(2.0, near)
+    check("a click on the seek bar goes to that time", abs((w.get("time_pos") or -9) - 2.0) < near, w)
+    check("and the label gives its frame", viewer.wait_for(b"frame "))
+    shot = cli("snapshot", "frames")
+    got = frame_numbers(shot.get("path", "/nonexistent")) if os.path.isfile(shot.get("path", "")) else []
+    check("it shows the frame the bar says", got == [round((w.get("time_pos") or 0) * 25)], (got, w))
+    mouse(0, at(1.0))
+    mouse(32, at(1.6))
+    mouse(32, at(2.4))
+    mouse(32, at(3.0))
+    mouse(0, at(3.0), "m")
+    w = settle(3.0, near)
+    check("a drag on the seek bar scrubs, landing where it's let go", abs((w.get("time_pos") or -9) - 3.0) < near, w)
+
+    # The wheel over the picture: three notches forward, one back, a frame each.
+    start = cli("where", "frames").get("time_pos") or 0
+    px = int((col + cols / 2) * 10)
+    py = int((row + rows / 2) * 20)
+    for code in (65, 65, 65, 64):
+        viewer.keys(f"\x1b[<{code};{px};{py}M".encode(), 0.01)
+    w = settle(start + 2 / 25, 0.005)
+    check("the wheel steps a frame a notch, however fast", abs((w.get("time_pos") or -9) - (start + 2 / 25)) < 0.005
+          and w.get("paused") is True, (start, w))
+    shot = cli("snapshot", "frames")
+    got = frame_numbers(shot.get("path", "/nonexistent")) if os.path.isfile(shot.get("path", "")) else []
+    check("to exactly that frame", got == [round(start * 25) + 2], (got, start))
+    check("seeking with the mouse sends no events", not cli("events", "--since", str(since)).get("events"))
+    cli("close", "frames")
 
 
 def web_checks(cli, viewer, work, run_dir):
@@ -413,6 +749,7 @@ def main():
     check("the socket is the user's only", oct(os.stat(sock_path).st_mode & 0o777) == "0o600")
     check("its folder too", oct(os.stat(os.path.dirname(sock_path)).st_mode & 0o777) == "0o700")
 
+    edit_checks(cli, viewer, work, project, clip, hostile)
     web_checks(cli, viewer, work, os.path.dirname(sock_path))
 
     def raw(payload):
