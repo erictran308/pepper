@@ -183,6 +183,32 @@ asks them to (`--force`). Without `--source`, your commands go to your only
 source of the kind. `sources --owner` and `events --owner` give yours only;
 `layout grid` shows four at once. A session lasts as long as its viewer, and your commands go to that viewer even when the human starts another.
 
+## Live output and streams
+
+```sh
+pepper-agent watch out/plot.png --name plot   # shown again each time it's rendered again
+pepper-agent pipe new --name sim              # {"pipe": "<path>", "try": "<a command>"}: write frames into it
+pepper-agent open rtsp://cam.local/stream --name cam --credentials-env CAM   # CAM=user:password in your env
+pepper-agent snapshot cam                     # look at it yourself
+```
+
+- `watch` shows a file and shows it again once a new render of it stops
+  changing (written in place or renamed over): a plot, a frame, a Remotion
+  or Manim render. Videos and GIFs loop, pictures stay, SVG and HTML show in
+  the viewer's browser. `where` says `reloads` and `reloaded_at`.
+- `pipe new` makes a FIFO that frames show from as a program writes them:
+  y4m (the default; its header says the size), `--format mjpeg`, or
+  `--format bgra --size WxH --fps N`. Opening it for writing waits until the
+  viewer reads it. When the writer closes it, the last frame stays and the
+  pipe waits for the next (`where`: `status` waiting, `writers`). It can't be
+  recorded yet.
+- A stream (rtsp://, rtmp://, srt://, udp://, or an http(s) .m3u8) plays live
+  with little delay and reconnects by itself (`status` reconnecting,
+  `reconnects`). Never put its password in a command: the user exports it
+  (`CAM=user:password`) and you pass `--credentials-env CAM`. A password is
+  never shown: `***` in every answer, label and log. `record start`/`stop`
+  records a stream as it comes, from its next keyframe.
+
 ## Looking yourself (no viewer needed for files)
 
 - `sheet` first: the cheapest look at a whole file, or `--from`/`--to` a part.
@@ -223,6 +249,9 @@ source of the kind. `sources --owner` and `events --owner` give yours only;
 | `play <recording>` | `pepper-agent play .pepper/recordings/app-….mp4` | Shows a recording, playing, for the human's `y` or `x` |
 | `compare <a> <b>` | `pepper-agent compare v1.mp4 v2.mp4 --sync` | Before and after side by side; `compare off` |
 | `session new` | `pepper-agent session new --owner agent-2` | Your own sources among other agents'; pass `--session` with every command |
+| `watch <file>` | `pepper-agent watch out/plot.png` | A file shown again each time it's rendered again |
+| `pipe new` | `pepper-agent pipe new --format bgra --size 640x360 --fps 30` | A FIFO whose frames show as a program writes them (y4m, mjpeg, bgra) |
+| `open <stream>` | `pepper-agent open rtsp://cam/s --credentials-env CAM` | A live stream that reconnects; its password from the environment, never shown |
 
 Commands act on the focused source unless given `--source NAME` (or a name,
 for `snapshot` and `where`); `web` ones on the focused or only page; in a
@@ -282,7 +311,7 @@ returns all before it too; `--type point,note`, `--source NAME` and
 | `NO_VIEWER` | Ask the human to open a split in Pepper and run `pepper-agent view` |
 | `NO_SOURCE` | `pepper-agent sources` for names; `open` it first |
 | `NOT_FOUND` | Check the path (relative paths are from your shell's folder), or the selector (`web dom`) |
-| `LOAD_FAILED` | A file: `probe` it. A page: is the dev server running, on that port? |
+| `LOAD_FAILED` | A file: `probe` it. A page: is the dev server running, on that port? A stream: it's tried again by itself; check its address and credentials |
 | `ORIGIN_BLOCKED` | Only this machine's pages open; `--allow-remote` only if the user wants that |
 | `LIMIT_REACHED` | Close a source, or ask for a second viewer and use `--viewer` |
 | `TIMEOUT` | Nothing yet: wait again, or `say` something to the human |
@@ -305,5 +334,6 @@ returns all before it too; `--type point,note`, `--source NAME` and
   without asking. Don't open remote pages with `--allow-remote` unless asked.
 - Prefer showing (`open`, `review`, `edit preview`, a live page) to rendering
   new files; render `--quality final` once the human approves.
-- Ask before deleting anything. Don't put passwords in commands; they're logged.
+- Ask before deleting anything. Don't put passwords in commands; they're
+  logged: a stream's go in an environment variable (`--credentials-env`).
 - Sharing a viewer, keep to your own sources; `--force` only when the user asks.

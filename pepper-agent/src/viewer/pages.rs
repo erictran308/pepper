@@ -270,6 +270,7 @@ impl Viewer {
             edit: None,
             session,
             owner,
+            live: None,
             fps: None,
             scrub: super::seekbar::Scrub::default(),
         });

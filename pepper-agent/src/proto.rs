@@ -73,6 +73,8 @@ pub const COMMANDS: &[&str] = &[
     "record.start",
     "record.stop",
     "compare",
+    "watch",
+    "pipe.new",
 ];
 
 /// The folder the viewers' sockets and records are in, made if need be:

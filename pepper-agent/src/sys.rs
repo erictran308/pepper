@@ -20,6 +20,7 @@ unsafe extern "C" {
     fn fcntl(fd: c_int, cmd: c_int, ...) -> c_int;
     fn dup2(from: c_int, to: c_int) -> c_int;
     fn gettimeofday(tv: *mut c_void, tz: *mut c_void) -> c_int;
+    fn mkfifo(path: *const c_char, mode: u16) -> c_int;
 }
 
 pub fn uid() -> u32 {
@@ -64,6 +65,17 @@ pub fn alive(pid: u32) -> bool {
     pid > 0
         && (unsafe { kill(pid, 0) } == 0
             || std::io::Error::last_os_error().raw_os_error() == Some(EPERM))
+}
+
+/// A FIFO at `path` only this user can open.
+pub fn make_fifo(path: &std::path::Path) -> std::io::Result<()> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: a NUL-terminated path.
+    if unsafe { mkfifo(c_path.as_ptr(), 0o600) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// 32 hex digits from /dev/urandom.

@@ -125,7 +125,10 @@ impl Player {
                 loop {
                     match read_line(&mut reader, MAX_LINE) {
                         Ok(Some(line)) => {
-                            let line = crate::text::inert(line.trim_end(), MAX_LOG_LINE);
+                            let line = crate::text::redact_urls(&crate::text::inert(
+                                line.trim_end(),
+                                MAX_LOG_LINE,
+                            ));
                             if tx.send(Msg::Player(sid, Event::Log(line))).is_err() {
                                 return;
                             }

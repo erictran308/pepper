@@ -56,6 +56,68 @@ pub fn redact_url(url: &str) -> String {
     url.to_owned()
 }
 
+/// `text` with no password in it: every address's user and password
+/// (`scheme://user:pw@host`) shown as `***`, and anything after an HTTP
+/// `Authorization:`. For what other programs say (mpv's and ffmpeg's
+/// messages), which may quote the address they were given.
+pub fn redact_urls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| c.is_whitespace() || "/?#\"'<>,;)]}".contains(c))
+            .unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(user) => {
+                out.push_str("***");
+                out.push_str(&tail[user..end]);
+            }
+            None => out.push_str(&tail[..end]),
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    match out.to_ascii_lowercase().find("authorization:") {
+        Some(at) => format!("{}authorization: ***", &out[..at]),
+        None => out,
+    }
+}
+
+/// `url` with `credentials` (`user:password`, from an environment
+/// variable) as its user and password, each percent-encoded.
+pub fn with_credentials(url: &str, credentials: &str) -> Result<String, String> {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err("credentials go with an address (scheme://host/...)".into());
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    if rest[..end].contains('@') {
+        return Err("the address has a user already: give it one way, not both".into());
+    }
+    let (user, password) = credentials.split_once(':').unwrap_or((credentials, ""));
+    if user.is_empty() || credentials.chars().any(char::is_control) {
+        return Err("credentials are user:password".into());
+    }
+    let encode = |s: &str| -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    let userinfo = if password.is_empty() {
+        encode(user)
+    } else {
+        format!("{}:{}", encode(user), encode(password))
+    };
+    Ok(format!("{scheme}://{userinfo}@{rest}"))
+}
+
 /// A time in seconds, as given: `83.5`, `1:23.5`, `00:01:23.500`; or, with
 /// `+` or `-` in front, from where playback is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -194,6 +256,36 @@ mod tests {
         assert_eq!(redact_url("https://host/p?u=a@b"), "https://host/p?u=a@b");
         assert_eq!(redact_url("/Users/me/a@b.mp4"), "/Users/me/a@b.mp4");
         assert_eq!(redact_url("/a/b://c@d"), "/a/b://c@d");
+    }
+
+    #[test]
+    fn passwords_are_not_said() {
+        assert_eq!(
+            redact_urls("Failed to open rtsp://me:secret@cam:554/s (401)"),
+            "Failed to open rtsp://***@cam:554/s (401)"
+        );
+        assert_eq!(
+            redact_urls("a http://u:p@h/x and srt://h:1?passphrase=x \"udp://x:y@z\""),
+            "a http://***@h/x and srt://h:1?passphrase=x \"udp://***@z\""
+        );
+        assert_eq!(redact_urls("no address, a@b"), "no address, a@b");
+        assert_eq!(
+            redact_urls("[http] Authorization: Basic dXNlcjpwYXNz"),
+            "[http] authorization: ***"
+        );
+        assert_eq!(
+            with_credentials("rtsp://cam:554/s", "me:p@ss/w:rd").as_deref(),
+            Ok("rtsp://me:p%40ss%2Fw%3Ard@cam:554/s")
+        );
+        assert_eq!(
+            with_credentials("http://h", "me").as_deref(),
+            Ok("http://me@h")
+        );
+        assert!(with_credentials("rtsp://a:b@cam/s", "me:x").is_err());
+        assert!(with_credentials("rtsp://cam/s", ":x").is_err());
+        assert!(with_credentials("/a/file", "me:x").is_err());
+        let url = with_credentials("rtsp://cam/s", "me:secret").unwrap();
+        assert!(!redact_urls(&url).contains("secret"));
     }
 
     #[test]
