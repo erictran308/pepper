@@ -351,3 +351,29 @@ Everything since 1.3.1-pepper.2 (pepper-agent, and `pepper-build.sh`'s lines for
 - **`-o .pepper/../x.mp4`** counted as inside `.pepper/`, so an existing file could be replaced without `--overwrite`. The output's folder is resolved first.
 
 The integration test has a `links` group for the first: a viewer of its own in a project whose `.pepper/` holds links (the events file, the snapshots folder, a cached frame and the name it's made under). Before the fixes, the new checks failed; after, they pass.
+
+## Code review of everything Pepper adds (2026-10-18)
+
+A code review of `v1.3.1...pepper` (the Zig patch, the Swift app, pepper-play and pepper-agent) found 15 problems, none in the escape sequence's patch or the port's token and rights handling. Each was checked against the code before it was fixed.
+
+pepper-agent:
+
+- **A short pane stopped the viewer.** With a box's label and seek bar taking every row (a pane about 4 rows high), `layout::fit` clamped to 1..0 and panicked, and the panic hook gave back only the terminal's mode: the pane stayed on the alternate screen with the mouse reported to the shell. `fit` leaves an empty area as it is, and the hook writes the screen's way back too (`screen::LEAVE`).
+- **A recording was what lay between start and stop, not what played.** It was cut from where the video was at `record start` to where it was at `record stop`, so `record start` at 0 then `review 10 20` gave 0 to 20. The viewer now follows the position while it records: playing (or stepping) on grows a stretch, a jump starts another, and `record stop` cuts each stretch in order (`played` in its answer; `edit::excerpt` and `Project::slice` take several).
+- **A recording that started inside a clip's fade-out failed** (ffmpeg's `afade` got a negative start): a part fades over what's left of the fade.
+- **A web page's box could stay blank for good.** If Pepper didn't take its surfaces once (its main thread busy for 500 ms), they weren't offered again until the page changed size: now again a second later, as pepper-play does.
+- **The MCP server dropped a message.** After a line that wasn't UTF-8 it skipped to the next newline, which was the next message's. Only a line too long is read on to its end now.
+- **A password written as it is in an address** (not percent-encoded) and holding `;` `,` `)` `'` `]` `}` wasn't taken out of mpv's messages: the user and password run to the host part's end now.
+- **`is_local`** read `http://evil.example\@localhost/` as local (Chrome goes to evil.example; the proxy still stopped it) and `127.1` or `2130706433` as remote. It reads a host as Chrome does now.
+
+pepper-play and Pepper:
+
+- **The display.** A box keeps its size in points when its window goes to a display of another scale, so its pixels change, but nothing told the client: frames were drawn at the old scale until the tab was resized. And pepper-play's display link was on the main display, not the one Pepper's window is on, so a window on a 60 Hz screen next to a 120 Hz main one got frames at 120 Hz and mpv timed video for 120. Pepper now tells a client again when its window goes to another display or scale, and its size message ends with the display's id (a fourth `UInt32`): pepper-play's link follows it, and mpv is told that display's rate. An older client reads the longer message as before; a newer pepper-play with an older Pepper stays on the main display. Checked in a test Pepper: `Pepper says the box is BoxSize { …, display: Some(2) }`, then `on display 2, Some(60.0) refreshes a second`. Moving a window between displays wasn't tried: this Mac had one display connected.
+- **A stream left in Pepper.** When pepper-play made new surfaces and its token changed at once, the old token's stream stayed registered (its surfaces, a place among the 16): it's detached first now.
+- **Pepper's port held 5 waiting messages**, the kernel's default, shared by every client's frames: a stall of the main thread dropped frames in every box. Now 256.
+- **Pepper posted Ghostty's own icon-changed notification**, so with both apps in the Dock, a config reload in either refreshed the other's icon. Pepper's has its own name.
+- **`pepper-play -- --help`** printed the usage instead of playing a file called `--help`: flags count only before `--`.
+- **The iOS target** (not built here) compiled `PepperServer.swift`, which needs AppKit: it's left out of it.
+- **A doc comment** left when the updater went is gone. The update overlay's state that Ghostty's own code still computes stays: taking it out would make Pepper's patch bigger, not smaller.
+
+Checks: unit tests (pepper-agent 92, pepper-play 18) for each change that can be checked alone, and integration checks for the short pane, the stretches of a recording, and the MCP server after a line that isn't UTF-8.
