@@ -24,8 +24,8 @@ path_before=$PATH
 
 # Pepper's version: Ghostty's, then Pepper's own count on it. The build
 # number counts Pepper's releases.
-pepper_version=1.3.1-pepper.2
-pepper_build=2
+pepper_version=1.3.1-pepper.3
+pepper_build=3
 
 zig_want=0.15.2
 zig_have=$(zig version 2>/dev/null || true)

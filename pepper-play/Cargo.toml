@@ -1,6 +1,6 @@
 [package]
 name = "pepper-play"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Plays video inside Pepper (Ghostty with inline video), through libmpv"
 # The source. libmpv, loaded at run time, is GPL as Homebrew builds it (see
