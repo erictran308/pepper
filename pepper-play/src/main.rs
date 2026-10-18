@@ -299,11 +299,11 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     pub fn run() -> Result<ExitCode, String> {
         from_its_bundle();
         let args: Vec<String> = std::env::args().skip(1).collect();
-        if args.iter().any(|arg| arg == "--version") {
+        if asks(&args, &["--version"]) {
             println!("pepper-play {}", env!("CARGO_PKG_VERSION"));
             return Ok(ExitCode::SUCCESS);
         }
-        if args.is_empty() || args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        if args.is_empty() || asks(&args, &["--help", "-h"]) {
             print!("{USAGE}");
             return Ok(if args.is_empty() {
                 ExitCode::FAILURE
@@ -424,8 +424,9 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             }
         }))
         .inspect_err(|err| eprintln!("pepper-play: {err}"))
-        .ok();
-        let rate = vsync.as_ref().and_then(Vsync::rate);
+        .ok()
+        .map(Arc::new);
+        let rate = vsync.as_deref().and_then(Vsync::rate);
         if setup.debug {
             eprintln!("pepper-play: the display refreshes {rate:?} times a second");
         }
@@ -562,16 +563,24 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         mpv: Mpv,
         setup: &Setup,
         ipc: Vec<(String, String)>,
-        vsync: Option<Vsync>,
+        vsync: Option<Arc<Vsync>>,
         session: &mut Session,
     ) -> Result<(), String> {
         let shared = session.shared.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
+        // mpv is told the display's rate (mpv_options) unless the user said
+        // one: it's told again when the box goes to another display.
+        let retime = vsync.as_deref().and_then(Vsync::rate).is_some()
+            && !setup
+                .args
+                .options
+                .iter()
+                .any(|(name, _)| name == "display-fps-override");
         let render = std::thread::spawn({
             let shared = shared.clone();
             let port = setup.port.clone();
             let debug = setup.debug;
-            move || render(mpv, shared, port, debug, vsync, ready_tx)
+            move || render(mpv, shared, port, debug, vsync, retime, ready_tx)
         });
         let ready = ready_rx
             .recv()
@@ -647,6 +656,15 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 None => (option, "yes"),
             },
         })
+    }
+
+    /// Whether the command line says one of `flags` before `--`: after it,
+    /// everything is a file or an address (`pepper-play -- --help` plays a
+    /// file called `--help`).
+    fn asks(args: &[String], flags: &[&str]) -> bool {
+        args.iter()
+            .take_while(|arg| *arg != "--")
+            .any(|arg| flags.contains(&arg.as_str()))
     }
 
     fn set_option(mpv: Mpv, name: &str, value: &str) -> Result<(), String> {
@@ -1060,13 +1078,37 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     }
 
     /// Takes Pepper's reports of the box's size, for as long as the program
-    /// runs.
-    fn follow_sizes(reports: pepper::Reports, shared: Arc<Shared>, debug: bool) {
-        while let Some((token, size)) = reports.next() {
+    /// runs. With a display link, it follows the display the box is on, and
+    /// tells mpv that display's rate if it's timing video to it (`retime`).
+    fn follow_sizes(
+        reports: pepper::Reports,
+        shared: Arc<Shared>,
+        debug: bool,
+        link: Option<(Arc<Vsync>, Mpv, bool)>,
+    ) {
+        let mut on = None;
+        while let Some((token, report)) = reports.next() {
             if debug {
-                eprintln!("pepper-play: Pepper says the box is {size:?}");
+                eprintln!("pepper-play: Pepper says the box is {report:?}");
             }
-            let Some(size) = surface_size(size) else {
+            let ours = shared.lock().token.as_ref() == Some(&token);
+            if ours
+                && let (Some(display), Some((vsync, mpv, retime))) = (report.display, &link)
+                && on != Some(display)
+                && vsync.follow(display)
+            {
+                on = Some(display);
+                let rate = vsync.rate();
+                if debug {
+                    eprintln!("pepper-play: on display {display}, {rate:?} refreshes a second");
+                }
+                // Not under the state's lock: libmpv may wait on the render
+                // thread, which takes it.
+                if *retime && let Some(rate) = rate {
+                    let _ = set_property(*mpv, "display-fps-override", &format!("{rate:.6}"));
+                }
+            }
+            let Some(size) = surface_size(report) else {
                 continue;
             };
             shared.update(|state| {
@@ -1085,7 +1127,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         shared: Arc<Shared>,
         port: Option<String>,
         debug: bool,
-        vsync: Option<Vsync>,
+        vsync: Option<Arc<Vsync>>,
+        retime: bool,
         ready: mpsc::Sender<Result<(), String>>,
     ) -> Stats {
         // Frames go out at the display's refreshes: this thread wakes for
@@ -1160,7 +1203,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         if let Some(client) = &client {
             let reports = client.reports();
             let shared = shared.clone();
-            std::thread::spawn(move || follow_sizes(reports, shared, debug));
+            let link = vsync.clone().map(|vsync| (vsync, mpv, retime));
+            std::thread::spawn(move || follow_sizes(reports, shared, debug, link));
         }
         let mut ring: Vec<gl::Target> = Vec::new();
         let mut attached: Option<String> = None;
@@ -1291,7 +1335,14 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                     unsafe { mpv::mpv_render_context_report_swap(rc) };
                 }
                 ring.clear();
-                attached = None;
+                // The new surfaces go to Pepper again, under the token; a
+                // stream under one that changed meanwhile ends first, or
+                // Pepper would keep it.
+                if let (Some(client), Some(old)) = (&client, attached.take())
+                    && token.as_ref() != Some(&old)
+                {
+                    client.detach(&old);
+                }
                 refused = None;
                 redraw = true;
                 stats.rings += 1;
@@ -1399,7 +1450,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 // SAFETY: rc is live and its OpenGL context current.
                 unsafe { mpv::mpv_render_context_render(rc, params.as_mut_ptr()) };
                 stats.repeated += 1;
-                if wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, unshown) {
+                if wait_for_refresh(&shared, vsync.as_deref(), &mut waiting, unshown) {
                     waiting_since = Instant::now();
                 } else {
                     // The link wouldn't start: no more waiting for it.
@@ -1442,7 +1493,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             stats.gpu_wait += waited.elapsed();
             stats.drawn += 1;
             last = slot;
-            if at_refresh && wait_for_refresh(&shared, vsync.as_ref(), &mut waiting, Some(slot)) {
+            if at_refresh && wait_for_refresh(&shared, vsync.as_deref(), &mut waiting, Some(slot)) {
                 waiting_since = Instant::now();
             } else {
                 // The link wouldn't start: no more waiting for it.
@@ -1461,7 +1512,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         if let (Some(client), Some(token)) = (&client, &attached) {
             client.detach(token);
         }
-        // No more refreshes.
+        // No more refreshes (the size reports' thread holds the link too).
+        if let Some(vsync) = &vsync {
+            vsync.stop();
+        }
         drop(vsync);
         // SAFETY: rc is live and its OpenGL context current; freed before the
         // targets and the context, and before mpv_terminate_destroy.
@@ -1589,6 +1643,17 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 strings(&["a.mp4", "https://example.com/v", "-", "--odd-name.mp4"])
             );
             assert!(parse_args(&strings(&["--=x"])).is_err());
+        }
+
+        #[test]
+        fn flags_only_before_the_files() {
+            assert!(asks(&strings(&["--help"]), &["--help", "-h"]));
+            assert!(asks(&strings(&["--fs", "-h", "a.mp4"]), &["--help", "-h"]));
+            assert!(!asks(&strings(&["--", "--help"]), &["--help", "-h"]));
+            assert!(!asks(
+                &strings(&["a.mp4", "--", "--version"]),
+                &["--version"]
+            ));
         }
 
         #[test]
@@ -1736,6 +1801,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                     width,
                     height,
                     visible,
+                    display: None,
                 })
             };
             assert_eq!(size(1920, 1080, true), Some((1920, 1080)));

@@ -1,5 +1,6 @@
-//! The display's refresh, from a CVDisplayLink on the main display (this
-//! program has no window, so no display of its own). The render thread
+//! The display's refresh, from a CVDisplayLink on the display Pepper says
+//! the box is on (the main one until it says; this program has no window,
+//! so no display of its own). The render thread
 //! shows each frame at a refresh, as a window's swap would, and tells mpv
 //! then; with the refresh rate, mpv can time video to the display
 //! (`video-sync=display-resample`).
@@ -41,6 +42,7 @@ unsafe extern "C" {
         callback: Output,
         context: *mut c_void,
     ) -> i32;
+    fn CVDisplayLinkSetCurrentCGDisplay(link: DisplayLink, display: u32) -> i32;
     fn CVDisplayLinkStart(link: DisplayLink) -> i32;
     fn CVDisplayLinkStop(link: DisplayLink) -> i32;
     fn CVDisplayLinkIsRunning(link: DisplayLink) -> u8;
@@ -116,6 +118,13 @@ impl Vsync {
         let period = unsafe { CVDisplayLinkGetNominalOutputVideoRefreshPeriod(self.link) };
         (period.flags & TIME_INDEFINITE == 0 && period.value > 0 && period.scale > 0)
             .then(|| period.scale as f64 / period.value as f64)
+    }
+
+    /// Follows `display` (a CGDirectDisplayID) from now on: its refreshes,
+    /// and its rate. False if the link can't.
+    pub fn follow(&self, display: u32) -> bool {
+        // SAFETY: a live link; any display id may be asked for.
+        unsafe { CVDisplayLinkSetCurrentCGDisplay(self.link, display) == 0 }
     }
 
     /// Calls at each refresh from now on (the first at the next one). False

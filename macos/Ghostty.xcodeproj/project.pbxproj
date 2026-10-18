@@ -160,6 +160,7 @@
 				"Features/Custom App Icon/Extensions/Notification+AppIcon.swift",
 				"Features/Custom App Icon/Extensions/UserDefaults+AppIcon.swift",
 				"Features/Global Keybinds/GlobalEventTap.swift",
+				Features/Pepper/PepperServer.swift,
 				Features/QuickTerminal/QuickTerminal.xib,
 				Features/QuickTerminal/QuickTerminalController.swift,
 				Features/QuickTerminal/QuickTerminalPosition.swift,

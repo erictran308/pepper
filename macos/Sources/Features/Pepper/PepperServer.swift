@@ -29,10 +29,12 @@ import QuartzCore
 /// - detach: the token; ends the stream.
 ///
 /// Pepper answers on the client's port, never waiting for it:
-/// - size: the token, then the box's width and height in pixels and whether
-///   it's placed, as `UInt32`s. Sent when a token's stream and placement
-///   both exist, and when the placement moves, resizes or goes, so the
-///   client draws its frames at the box's size.
+/// - size: the token, then the box's width and height in pixels, whether
+///   it's placed, and the display it's on (a CGDirectDisplayID, 0 if not
+///   known), as `UInt32`s. Sent when a token's stream and placement both
+///   exist, and when the placement moves, resizes or goes, or its window
+///   goes to another display, so the client draws its frames at the box's
+///   size and that display's refreshes.
 ///
 /// The kernel's notices that a client died come on a port of their own, which
 /// no other process can send to.
@@ -86,6 +88,10 @@ final class PepperServer {
     private static let noticeSize = 256
     /// The most messages handled before the rest of the main queue runs.
     private static let drainBatch = 64
+    /// The most messages waiting on the port (the kernel's default is 5):
+    /// room for every stream's frames through a moment's stall of the main
+    /// thread.
+    private static let queueLimit: mach_port_msgcount_t = 256
     /// The layer each view's boxes go in.
     private static let containerName = "pepper"
 
@@ -137,6 +143,7 @@ final class PepperServer {
         var width: UInt32
         var height: UInt32
         var visible: Bool
+        var display: UInt32
     }
 
     private var port = mach_port_t(MACH_PORT_NULL)
@@ -185,6 +192,23 @@ final class PepperServer {
             Self.logger.error("bootstrap_check_in(\(name, privacy: .public)) failed: \(kr)")
             return
         }
+        var limits = mach_port_limits_t(mpl_qlimit: Self.queueLimit)
+        let limited = withUnsafeMutablePointer(to: &limits) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+                mach_port_set_attributes(
+                    mach_task_self_,
+                    port,
+                    MACH_PORT_LIMITS_INFO,
+                    $0,
+                    mach_msg_type_number_t(
+                        MemoryLayout<mach_port_limits_t>.size / MemoryLayout<natural_t>.size
+                    )
+                )
+            }
+        }
+        if limited != KERN_SUCCESS {
+            Self.logger.warning("the port's queue stays at the default: \(limited)")
+        }
         setenv("PEPPER_PORT", name, 1)
         let play = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Helpers/Pepper.app/Contents/MacOS/pepper-play")
@@ -200,6 +224,14 @@ final class PepperServer {
         notifySource.setEventHandler { [weak self] in self?.drainNotices() }
         notifySource.resume()
         self.notifySource = notifySource
+        // A window going to another display, of another scale: its boxes
+        // are other sizes in pixels, and their clients are told.
+        for name in [NSWindow.didChangeBackingPropertiesNotification, NSWindow.didChangeScreenNotification] {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let window = note.object as? NSWindow else { return }
+                self?.windowMoved(window)
+            }
+        }
         Self.logger.info("listening on \(name, privacy: .public)")
     }
 
@@ -257,6 +289,21 @@ final class PepperServer {
         layer.contents = currentSurface(token)
         CATransaction.commit()
         report(token)
+    }
+
+    /// A window went to another display, or its scale changed: its boxes
+    /// keep their size in points, so their pixels follow the scale, and each
+    /// client hears of its box's pixels and display.
+    private func windowMoved(_ window: NSWindow) {
+        let scale = window.backingScaleFactor
+        for (token, var placement) in placements where placement.view?.window === window {
+            placement.pixels = CGSize(
+                width: (placement.layer.frame.width * scale).rounded(),
+                height: (placement.layer.frame.height * scale).rounded()
+            )
+            placements[token] = placement
+            report(token)
+        }
     }
 
     /// The layer a view's boxes go in: the view's size, clipping them, so a
@@ -619,10 +666,11 @@ final class PepperServer {
             size = BoxSize(
                 width: UInt32(placement.pixels.width),
                 height: UInt32(placement.pixels.height),
-                visible: true
+                visible: true,
+                display: placement.view?.window?.screen?.displayID ?? 0
             )
         } else if let last = stream.reported {
-            size = BoxSize(width: last.width, height: last.height, visible: false)
+            size = BoxSize(width: last.width, height: last.height, visible: false, display: last.display)
         } else {
             return
         }
@@ -643,7 +691,7 @@ final class PepperServer {
     /// or that's gone, misses it.
     private func send(_ size: BoxSize, token: String, to client: mach_port_t) -> kern_return_t {
         let headerSize = MemoryLayout<mach_msg_header_t>.size
-        let byteCount = headerSize + Self.tokenSize + 3 * MemoryLayout<UInt32>.size
+        let byteCount = headerSize + Self.tokenSize + 4 * MemoryLayout<UInt32>.size
         let kr = withUnsafeTemporaryAllocation(byteCount: byteCount, alignment: 8) { buffer in
             guard let raw = buffer.baseAddress else { return KERN_FAILURE }
             raw.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
@@ -660,7 +708,7 @@ final class PepperServer {
                 }
             }
             var offset = headerSize + Self.tokenSize
-            for value in [size.width, size.height, size.visible ? 1 : 0] {
+            for value in [size.width, size.height, size.visible ? 1 : 0, size.display] {
                 raw.storeBytes(of: value, toByteOffset: offset, as: UInt32.self)
                 offset += MemoryLayout<UInt32>.size
             }
