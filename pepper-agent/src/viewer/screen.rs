@@ -112,11 +112,14 @@ impl Screen {
 
     /// Gives the pane back as it was.
     pub fn leave(&mut self) {
-        self.write(
-            "\x1b[0m\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l",
-        );
+        self.write(LEAVE);
     }
 }
+
+/// What gives the pane back: the mouse, paste, wrap and cursor as they
+/// were, and the screen the shell had.
+pub const LEAVE: &str =
+    "\x1b[0m\x1b[?1016l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?7h\x1b[?25h\x1b[?1049l";
 
 #[cfg(test)]
 mod tests {

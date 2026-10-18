@@ -143,6 +143,10 @@ pub fn fit(area: Cells, cell: (f64, f64), aspect: Option<f64>) -> Cells {
     let Some(aspect) = aspect.filter(|a| a.is_finite() && *a > 0.0) else {
         return area;
     };
+    // No room at all (a pane a few rows high): nothing to fit.
+    if area.cols == 0 || area.rows == 0 {
+        return area;
+    }
     let (w, h) = (area.cols as f64 * cell.0, area.rows as f64 * cell.1);
     let (cols, rows) = if w / h > aspect {
         (((h * aspect) / cell.0).round() as u16, area.rows)
@@ -326,6 +330,9 @@ mod tests {
         assert_eq!(fit(a, CELL, None), a);
         assert_eq!(fit(a, CELL, Some(f64::NAN)), a);
         assert_eq!(fit(area(1, 1), CELL, Some(100.0)), area(1, 1));
+        // A box with no rows left (the label and seek bar took them).
+        assert_eq!(fit(area(160, 0), CELL, Some(16.0 / 9.0)), area(160, 0));
+        assert_eq!(fit(area(0, 45), CELL, Some(16.0 / 9.0)), area(0, 45));
     }
 
     #[test]

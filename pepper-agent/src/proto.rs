@@ -247,6 +247,10 @@ pub fn request(
 }
 
 /// One line, without its newline, of at most `max` bytes; None at the end.
+/// read_line's error for a line longer than asked, whose rest is still to
+/// be read.
+pub const TOO_LONG: &str = "line too long";
+
 pub fn read_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     let n = reader.take(max as u64 + 1).read_until(b'\n', &mut buf)?;
@@ -258,7 +262,7 @@ pub fn read_line(reader: &mut impl BufRead, max: usize) -> std::io::Result<Optio
     } else if buf.len() > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "line too long",
+            TOO_LONG,
         ));
     }
     String::from_utf8(buf)
@@ -340,7 +344,11 @@ mod tests {
         assert_eq!(read_line(&mut r, 10).unwrap().as_deref(), Some("def"));
         assert_eq!(read_line(&mut r, 10).unwrap(), None);
         let mut r = BufReader::new(&b"0123456789abc\n"[..]);
-        assert!(read_line(&mut r, 10).is_err());
+        assert_eq!(read_line(&mut r, 10).unwrap_err().to_string(), TOO_LONG);
+        // Not UTF-8: that line is read whole, the next is the next.
+        let mut r = BufReader::new(&b"\xff\xfe\nnext\n"[..]);
+        assert_ne!(read_line(&mut r, 10).unwrap_err().to_string(), TOO_LONG);
+        assert_eq!(read_line(&mut r, 10).unwrap().as_deref(), Some("next"));
         let mut r = BufReader::new(&b"0123456789\n"[..]);
         assert_eq!(
             read_line(&mut r, 10).unwrap().as_deref(),

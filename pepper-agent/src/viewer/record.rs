@@ -2,9 +2,10 @@
 //! screencast goes to an ffmpeg in the viewer's own folder at a steady
 //! frame rate, its latest frame each tick (Chrome sends frames only when
 //! the page changes: a still page is a still picture, not a gap); a video's
-//! recording is the stretch that played, which `pepper-agent record stop`
-//! cuts from the file itself. The viewer writes only in its own folder;
-//! the command moves the file into `.pepper/recordings/`.
+//! recording is the stretches that played (a seek starts another), which
+//! `pepper-agent record stop` cuts from the file itself. The viewer writes
+//! only in its own folder; the command moves the file into
+//! `.pepper/recordings/`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,12 @@ const DEFAULT_SECONDS: f64 = 120.0;
 const STOP_WAIT: Duration = Duration::from_secs(60);
 /// How long a page's recording waits for its first frame at its size.
 const FIRST_WAIT: Duration = Duration::from_millis(500);
+/// A video's position moving on by more than this, or back, is a jump: a
+/// new stretch of what played.
+const MAX_STEP: f64 = 1.0;
+/// The shortest stretch kept, and the most stretches.
+const MIN_SPAN: f64 = 0.05;
+const MAX_SPANS: usize = 64;
 
 /// What a page's recorder is sent.
 pub enum RecMsg {
@@ -43,8 +50,8 @@ pub struct Recording {
     max: Duration,
     /// A page's: its recorder.
     web: Option<WebRecorder>,
-    /// A video's: where it was when the recording started.
-    from: Option<f64>,
+    /// A video's: the stretches that played since it started, in order.
+    played: Option<Vec<(f64, f64)>>,
     /// A pipe's or a stream's: the file mpv writes what it gets into.
     stream: Option<PathBuf>,
 }
@@ -268,7 +275,7 @@ impl Viewer {
                 started: Instant::now(),
                 max: Duration::from_secs_f64(max),
                 web: Some(recorder),
-                from: None,
+                played: None,
                 stream: None,
             }
         } else if source
@@ -289,7 +296,7 @@ impl Viewer {
                 started: Instant::now(),
                 max: Duration::from_secs_f64(max),
                 web: None,
-                from: None,
+                played: None,
                 stream: Some(path),
             }
         } else {
@@ -298,7 +305,10 @@ impl Viewer {
                 started: Instant::now(),
                 max: Duration::from_secs_f64(max),
                 web: None,
-                from: Some(source.time_pos.unwrap_or(0.0)),
+                played: Some({
+                    let t = source.time_pos.unwrap_or(0.0);
+                    vec![(t, t)]
+                }),
                 stream: None,
             }
         };
@@ -308,7 +318,14 @@ impl Viewer {
             .with("kind", source.kind)
             .with("recording", true)
             .with("max", max)
-            .with("from", recording.from);
+            .with(
+                "from",
+                recording
+                    .played
+                    .as_ref()
+                    .and_then(|p| p.first())
+                    .map(|s| s.0),
+            );
         self.recordings.push(recording);
         self.dirty = true;
         Ok(answer)
@@ -389,10 +406,13 @@ impl Viewer {
                 }))
             }
             None => {
-                let from = recording.from.unwrap_or(0.0);
-                let to = source.time_pos.unwrap_or(from);
-                let (from, to) = (from.min(to), from.max(to));
-                if to - from < 0.05 {
+                let played: Vec<(f64, f64)> = recording
+                    .played
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(a, b)| b - a >= MIN_SPAN)
+                    .collect();
+                let (Some(first), Some(last)) = (played.first(), played.last()) else {
                     return Finished::Now(Err(Error::new(
                         "FAILED",
                         "nothing played while it was recorded",
@@ -400,11 +420,50 @@ impl Viewer {
                     .hint(
                         "Play it (pepper-agent play, or review a b) between record start and stop.",
                     )));
-                }
-                about.set("from", (from * 1000.0).round() / 1000.0);
-                about.set("to", (to * 1000.0).round() / 1000.0);
+                };
+                let ms = |t: f64| (t * 1000.0).round() / 1000.0;
+                about.set("from", ms(first.0));
+                about.set("to", ms(last.1));
+                about.set(
+                    "played",
+                    played
+                        .iter()
+                        .map(|&(a, b)| Value::from(vec![Value::from(ms(a)), Value::from(ms(b))]))
+                        .collect::<Vec<_>>(),
+                );
                 Finished::Now(Ok(about))
             }
+        }
+    }
+
+    /// A video's position moved: what's being recorded grows while it plays
+    /// on (or steps on), and a jump (a seek, `review`) starts another
+    /// stretch.
+    pub(super) fn track_played(&mut self, i: usize) {
+        let (sid, Some(t)) = (self.sources[i].sid, self.sources[i].time_pos) else {
+            return;
+        };
+        let Some(played) = self
+            .recordings
+            .iter_mut()
+            .find(|r| r.sid == sid)
+            .and_then(|r| r.played.as_mut())
+        else {
+            return;
+        };
+        if let Some(last) = played.last_mut() {
+            if t >= last.1 && t - last.1 <= MAX_STEP {
+                last.1 = t;
+                return;
+            }
+            // Too short to keep: where it is now instead.
+            if last.1 - last.0 < MIN_SPAN {
+                *last = (t, t);
+                return;
+            }
+        }
+        if played.len() < MAX_SPANS {
+            played.push((t, t));
         }
     }
 

@@ -76,8 +76,12 @@ pub fn serve() -> Result<()> {
         let line = match crate::proto::read_line(&mut reader, MAX_LINE) {
             Ok(Some(line)) => line,
             Ok(None) => break,
-            Err(_) => {
-                let _ = reader.skip_until(b'\n');
+            Err(e) => {
+                // A line too long is read on to its end; one that isn't
+                // UTF-8 was read whole already.
+                if e.to_string() == crate::proto::TOO_LONG {
+                    let _ = reader.skip_until(b'\n');
+                }
                 server.fail(&Value::Null, -32700, "a message too long, or not UTF-8");
                 continue;
             }

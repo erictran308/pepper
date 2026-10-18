@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::layout;
 use crate::pepper::{self, BoxSize};
@@ -21,6 +21,9 @@ use crate::surface::Surface;
 
 /// Surfaces per stream: one shown, one waiting, one drawn into.
 const RING: usize = 3;
+/// How long after Pepper didn't take the surfaces they go again (as
+/// pepper-play's ATTACH_AGAIN), not with every frame.
+const ATTACH_AGAIN: Duration = Duration::from_secs(1);
 /// Pepper's limits for a surface (PepperServer.swift).
 const MAX_PIXELS: u64 = 6144 * 3456;
 const MAX_SIDE: u32 = 8192;
@@ -109,6 +112,7 @@ fn run(
     let mut size = (0, 0);
     let mut next = 0;
     let mut attached = false;
+    let mut refused: Option<Instant> = None;
     let mut decoder: Option<Decoder> = None;
     // VideoToolbox couldn't make a decoder: ImageIO from then on.
     let mut no_hardware = false;
@@ -144,7 +148,8 @@ fn run(
         let mut shown = false;
         if let (Some(client), true, Some(own)) = (&client, visible, jpeg_size(&jpeg)) {
             let target = capped(own);
-            if target != size {
+            let again = !attached && refused.is_none_or(|when| when.elapsed() >= ATTACH_AGAIN);
+            if target != size || again {
                 ring = (0..RING)
                     .filter_map(|_| Surface::new(target.0, target.1))
                     .collect();
@@ -155,6 +160,7 @@ fn run(
                 };
                 note(format!("surfaces {}x{}: {made:?}", target.0, target.1));
                 attached = made.is_ok();
+                refused = (!attached).then(Instant::now);
                 if !attached {
                     ring.clear();
                 }

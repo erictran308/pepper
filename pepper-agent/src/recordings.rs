@@ -98,11 +98,28 @@ pub fn stop(args: &Args, source: Option<&str>) -> Result<Value> {
         );
         // A render shown with its cut is cut from the render; a preview
         // (no file), from the cut's own clips.
+        // What played: one stretch, or more if it was sought meanwhile.
+        let played: Vec<(f64, f64)> = match done.get("played").and_then(Value::arr) {
+            Some(list) => list
+                .iter()
+                .filter_map(|span| match span {
+                    Value::Arr(pair) if pair.len() == 2 => Some((pair[0].num()?, pair[1].num()?)),
+                    _ => None,
+                })
+                .collect(),
+            None => vec![(from, to)],
+        };
         let project = match (done.get_str("file"), done.get_str("project")) {
             (Some(file), _) if file.starts_with('/') => {
-                edit::excerpt(&work, Path::new(file), from, to)?
+                edit::excerpt(&work, Path::new(file), &played)?
             }
-            (None, Some(project)) => edit::load(&work, project)?.slice(from, to),
+            (None, Some(project)) => {
+                let part = edit::load(&work, project)?.slice(&played);
+                if part.clips.is_empty() {
+                    return Err(Error::new("FAILED", "nothing of the cut was played"));
+                }
+                part
+            }
             _ => {
                 return Err(Error::new(
                     "UNSUPPORTED",
@@ -123,6 +140,15 @@ pub fn stop(args: &Args, source: Option<&str>) -> Result<Value> {
         }
         v.set("from", from);
         v.set("to", to);
+        if played.len() > 1 {
+            v.set(
+                "played",
+                played
+                    .iter()
+                    .map(|&(a, b)| Value::from(vec![Value::from(a), Value::from(b)]))
+                    .collect::<Vec<_>>(),
+            );
+        }
         v
     };
     for key in ["source", "kind", "owner", "file", "url", "project"] {
