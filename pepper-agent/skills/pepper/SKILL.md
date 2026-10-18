@@ -165,9 +165,10 @@ text]`), `press`, `scroll`, `goto`, `reload`, `back`, `wait` (seconds),
 ends the run with `failed` (which step, its error), and the recording up to
 it is kept: it may show the bug. Or by hand: `record start app`, drive it (or
 let the human), `record stop app`. A page records at 30 fps as it shows (a
-still page is a still picture). A video's recording is the stretch that
-played between start and stop (`review a b`, or `play`), cut from the file;
-a preview's is rendered from its cut. Recordings go in `.pepper/recordings/`;
+still page is a still picture). A video's recording is what played between
+start and stop (`review a b`, or `play`), each stretch in order (a seek
+starts another: `played` lists them), cut from the file; a preview's is
+rendered from its cut. Recordings go in `.pepper/recordings/`;
 one stops by itself after `--max` (120 s, 600 at most).
 
 ## Before and after
@@ -266,7 +267,7 @@ pepper-agent snapshot cam                     # look at it yourself
 | `web console`, `web errors` | `pepper-agent web errors --since 4` | The console; exceptions, failed requests, HTTP 400+; `last_id` for `--since` |
 | `web dom <sel>`, `web a11y` | `pepper-agent web dom 'main .card'` | HTML of what a selector finds; the accessibility tree |
 | `web eval <js>` | `pepper-agent web eval 'document.title'` | Runs JavaScript in the page (pages on this machine only) |
-| `record start`, `record stop` | `pepper-agent record stop app` | Records a source (a page as it shows, a video's stretch that played) into `.pepper/recordings/`, with a sheet |
+| `record start`, `record stop` | `pepper-agent record stop app` | Records a source (a page as it shows, what of a video played) into `.pepper/recordings/`, with a sheet |
 | `record run <script>` | `pepper-agent record run demo.json --source app` | Records a page while it runs a script of steps |
 | `play <recording>` | `pepper-agent play .pepper/recordings/app-….mp4` | Shows a recording, playing, for the human's `y` or `x` |
 | `compare <a> <b>` | `pepper-agent compare v1.mp4 v2.mp4 --sync` | Before and after side by side; `compare off` |

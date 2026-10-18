@@ -130,7 +130,8 @@ impl Device {
 
 /// Whether `url` may be opened without --allow-remote: a page on this
 /// machine (localhost, a name under .localhost, 127.x.x.x, ::1), a file,
-/// or a blank page.
+/// or a blank page. Read as Chrome reads it: `\` ends the host as `/`
+/// does, and 127.1 is 127.0.0.1.
 pub fn is_local(url: &str) -> bool {
     if url == "about:blank" {
         return true;
@@ -141,7 +142,7 @@ pub fn is_local(url: &str) -> bool {
     match scheme.to_ascii_lowercase().as_str() {
         "file" => true,
         "http" | "https" => {
-            let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+            let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
             let host = authority.rsplit('@').next().unwrap_or("");
             let host = if let Some(v6) = host.strip_prefix('[') {
                 v6.split(']').next().unwrap_or("")
@@ -151,13 +152,48 @@ pub fn is_local(url: &str) -> bool {
             let host = host.trim_end_matches('.').to_ascii_lowercase();
             host == "localhost"
                 || host.ends_with(".localhost")
-                || host == "::1"
                 || host
-                    .parse::<std::net::Ipv4Addr>()
+                    .parse::<std::net::Ipv6Addr>()
                     .is_ok_and(|ip| ip.is_loopback())
+                || ipv4(&host).is_some_and(|ip| ip.is_loopback())
         }
         _ => false,
     }
+}
+
+/// An IPv4 address as a browser reads a host: one to four parts, each
+/// decimal, hex (0x) or octal (a leading 0), the last filling the bytes
+/// left (127.1 is 127.0.0.1, 2130706433 too).
+fn ipv4(host: &str) -> Option<std::net::Ipv4Addr> {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() > 4 {
+        return None;
+    }
+    let mut numbers = Vec::with_capacity(parts.len());
+    for part in parts {
+        let (digits, radix) = match part.strip_prefix("0x").or(part.strip_prefix("0X")) {
+            Some(hex) => (hex, 16),
+            None if part.len() > 1 && part.starts_with('0') => (&part[1..], 8),
+            None => (part, 10),
+        };
+        let number = if digits.is_empty() && radix == 16 {
+            0
+        } else if !digits.is_empty() && digits.chars().all(|c| c.is_digit(radix)) {
+            u64::from_str_radix(digits, radix).ok()?
+        } else {
+            return None;
+        };
+        numbers.push(number);
+    }
+    let (last, first) = numbers.split_last()?;
+    if first.iter().any(|&n| n > 255) || *last >= 1u64 << (8 * (4 - first.len())) {
+        return None;
+    }
+    let mut ip = *last;
+    for (i, &n) in first.iter().enumerate() {
+        ip += n << (8 * (3 - i));
+    }
+    Some(std::net::Ipv4Addr::from(ip as u32))
 }
 
 /// A web address as given, checked: http(s), file or about:blank, no
@@ -2160,6 +2196,11 @@ mod tests {
             "http://127.1.2.3/",
             "http://[::1]:3000/",
             "http://user:pw@localhost:3000/",
+            "http://127.1:5173/",
+            "http://0x7f.1/",
+            "http://2130706433/",
+            "http://0177.0.0.1/",
+            "http://[0:0:0:0:0:0:0:1]/",
             "file:///Users/me/site/index.html",
             "about:blank",
         ] {
@@ -2171,6 +2212,11 @@ mod tests {
             "http://evil.com/?localhost",
             "http://evil.com#@localhost",
             "http://localhost@evil.com/",
+            "http://evil.example\\@localhost/",
+            "http://127.0.0.1.evil.com/",
+            "http://127.0.0.1.5/",
+            "http://4294967296/",
+            "http://[::ffff:127.0.0.1]/",
             "http://192.168.1.2:3000/",
             "http://[::2]/",
             "http://0.0.0.0:3000/",

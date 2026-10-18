@@ -66,8 +66,10 @@ pub fn redact_urls(text: &str) -> String {
     while let Some(at) = rest.find("://") {
         let (head, tail) = rest.split_at(at + 3);
         out.push_str(head);
+        // Up to where an address's host part surely ends: a password may
+        // hold , ; ) ' and the like as they are.
         let end = tail
-            .find(|c: char| c.is_whitespace() || "/?#\"'<>,;)]}".contains(c))
+            .find(|c: char| c.is_whitespace() || "/?#\"<>".contains(c))
             .unwrap_or(tail.len());
         match tail[..end].rfind('@') {
             Some(user) => {
@@ -269,6 +271,14 @@ mod tests {
             "a http://***@h/x and srt://h:1?passphrase=x \"udp://***@z\""
         );
         assert_eq!(redact_urls("no address, a@b"), "no address, a@b");
+        for password in ["pa;ss", "pa,ss", "pa)ss", "pa'ss", "pa]ss", "pa}ss"] {
+            let said = redact_urls(&format!("Failed to open rtsp://cam:{password}@10.0.0.5/s."));
+            assert_eq!(said, "Failed to open rtsp://***@10.0.0.5/s.", "{password}");
+        }
+        assert_eq!(
+            redact_urls("(rtsp://u:p@h) and 'rtsp://u:p@h'"),
+            "(rtsp://***@h) and 'rtsp://***@h'"
+        );
         assert_eq!(
             redact_urls("[http] Authorization: Basic dXNlcjpwYXNz"),
             "[http] authorization: ***"

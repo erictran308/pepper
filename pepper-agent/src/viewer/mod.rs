@@ -547,6 +547,10 @@ pub fn run(options: Options) -> Result<()> {
 fn give_terminal_back() {
     if let Some((fd, mode)) = SAVED_MODE.get() {
         let _ = sys::set_mode(*fd, mode);
+        // The screen too, or the shell gets the mouse's reports as text.
+        if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
+            let _ = tty.write_all(screen::LEAVE.as_bytes());
+        }
     }
 }
 
@@ -1604,6 +1608,7 @@ impl Viewer {
                         player.set("pause", true);
                     }
                 }
+                self.track_played(i);
             }
             "duration" => source.duration = data.num(),
             "pause" => {

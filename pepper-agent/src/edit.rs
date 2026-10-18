@@ -123,22 +123,35 @@ impl Project {
         self.clips.iter().map(Clip::length).sum()
     }
 
-    /// The part of the cut from `from` to `to` (the output's times), as a
-    /// project of its own: what a recording of its preview played.
-    pub fn slice(&self, from: f64, to: f64) -> Project {
-        let mut at = 0.0;
+    /// The parts of the cut from each `(from, to)` (the output's times), in
+    /// that order, as a project of its own: what a recording of its preview
+    /// played. A part that starts inside a clip's fade-out (or ends inside
+    /// its fade-in) fades over what's left of it.
+    pub fn slice(&self, spans: &[(f64, f64)]) -> Project {
         let mut clips = Vec::new();
-        for clip in &self.clips {
-            let (start, end) = (at, at + clip.length());
-            at = end;
-            let (a, b) = (from.max(start), to.min(end));
-            if b - a > 1e-6 {
-                let mut part = clip.clone();
-                part.start = clip.start + (a - start);
-                part.end = clip.start + (b - start);
-                part.fade_in = if a > start { 0.0 } else { clip.fade_in };
-                part.fade_out = if b < end { 0.0 } else { clip.fade_out };
-                clips.push(part);
+        for &(from, to) in spans {
+            let mut at = 0.0;
+            for clip in &self.clips {
+                let (start, end) = (at, at + clip.length());
+                at = end;
+                let (a, b) = (from.max(start), to.min(end));
+                if b - a > 1e-6 {
+                    let mut part = clip.clone();
+                    part.start = clip.start + (a - start);
+                    part.end = clip.start + (b - start);
+                    let length = part.length();
+                    part.fade_in = if a > start {
+                        0.0
+                    } else {
+                        clip.fade_in.min(length)
+                    };
+                    part.fade_out = if b < end {
+                        0.0
+                    } else {
+                        clip.fade_out.min(length)
+                    };
+                    clips.push(part);
+                }
             }
         }
         Project {
@@ -366,7 +379,7 @@ fn source_key(project: &Path, src: &Path) -> Option<String> {
 
 /// A file from `from` to `to`, as a project of one clip at the file's own
 /// size and rate: what a recording of the file played.
-pub fn excerpt(work: &Path, file: &Path, from: f64, to: f64) -> Result<Project> {
+pub fn excerpt(work: &Path, file: &Path, spans: &[(f64, f64)]) -> Result<Project> {
     let probe = media::probe(work, file)?;
     let facts = Facts::of(&probe);
     let (w, h) = facts
@@ -378,8 +391,24 @@ pub fn excerpt(work: &Path, file: &Path, from: f64, to: f64) -> Result<Project> 
             .filter(|f| (1.0..=240.0).contains(f))
             .unwrap_or(30.0),
     );
-    let end = facts.duration.map_or(to, |d| to.min(d));
-    if end - from < 0.04 {
+    let clips: Vec<Clip> = spans
+        .iter()
+        .filter_map(|&(from, to)| {
+            let (start, end) = (from.max(0.0), facts.duration.map_or(to, |d| to.min(d)));
+            (end - start >= 0.04).then(|| Clip {
+                src: file.to_owned(),
+                name: None,
+                start,
+                end,
+                fade_in: 0.0,
+                fade_out: 0.0,
+                audio: facts.audio,
+                key: None,
+                quote: None,
+            })
+        })
+        .collect();
+    if clips.is_empty() {
         return Err(Error::new("FAILED", "nothing of it was played"));
     }
     Ok(Project {
@@ -392,17 +421,7 @@ pub fn excerpt(work: &Path, file: &Path, from: f64, to: f64) -> Result<Project> 
             fps_text,
             fit: Fit::Pad,
         },
-        clips: vec![Clip {
-            src: file.to_owned(),
-            name: None,
-            start: from.max(0.0),
-            end,
-            fade_in: 0.0,
-            fade_out: 0.0,
-            audio: facts.audio,
-            key: None,
-            quote: None,
-        }],
+        clips,
         warnings: Vec::new(),
     })
 }
@@ -1491,6 +1510,12 @@ pub fn render(work: &Path, project: &Project, ask: &RenderAsk) -> Result<Value> 
              then show it: pepper-agent open edit/preview.mp4 --edit edit/edl.json",
         ));
     }
+    if project.clips.is_empty() {
+        return Err(Error::new(
+            "BAD_ARGS",
+            "nothing to render: the cut is empty",
+        ));
+    }
     let ffmpeg = media::tool("ffmpeg")?;
     let out = render_path(work, project, ask)?;
     let format = match out.extension().and_then(|e| e.to_str()) {
@@ -1882,11 +1907,24 @@ mod tests {
         assert_eq!(t.cuts[2].at, 7.0);
         // A part of the cut, as a project: 2.5 to 8 is the end of clip 0,
         // all of clip 1, the start of clip 2.
-        let part = p.slice(2.5, 8.0);
+        let part = p.slice(&[(2.5, 8.0)]);
         let spans: Vec<(f64, f64)> = part.clips.iter().map(|c| (c.start, c.end)).collect();
         assert_eq!(spans, [(4.5, 5.0), (5.0, 9.0), (1.5, 2.5)]);
         assert_eq!(part.duration(), 5.5);
-        assert!(p.slice(20.0, 30.0).clips.is_empty());
+        assert!(p.slice(&[(20.0, 30.0)]).clips.is_empty());
+        // Two stretches (a seek between), in the order they played.
+        let two = p.slice(&[(7.5, 8.0), (0.0, 1.0)]);
+        let spans: Vec<(f64, f64)> = two.clips.iter().map(|c| (c.start, c.end)).collect();
+        assert_eq!(spans, [(2.0, 2.5), (2.0, 3.0)]);
+        // Starting inside a fade-out: it fades over what's left.
+        let mut faded = p.clips[0].clone();
+        faded.fade_out = 1.0;
+        faded.fade_in = 0.5;
+        let f = project(vec![faded]);
+        let tail = f.slice(&[(2.7, 3.0)]);
+        assert!((tail.clips[0].fade_out - 0.3).abs() < 1e-9 && tail.clips[0].fade_in == 0.0);
+        let head = f.slice(&[(0.0, 0.2)]);
+        assert!((head.clips[0].fade_in - 0.2).abs() < 1e-9 && head.clips[0].fade_out == 0.0);
         assert_eq!(t.locate(0.0), Some((0, 2.0)));
         assert_eq!(t.locate(2.5), Some((0, 4.5)));
         // A cut belongs to the clip after it.
