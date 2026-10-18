@@ -103,6 +103,9 @@ struct SizeMessage {
     width: u32,
     height: u32,
     visible: u32,
+    /// The display the box is on (a CGDirectDisplayID, 0 if not known).
+    /// An older Pepper sends the message without it.
+    display: u32,
 }
 
 unsafe extern "C" {
@@ -155,6 +158,8 @@ pub struct BoxSize {
     /// Whether the box is placed at all: Pepper says so, with the last size,
     /// when it's taken away.
     pub visible: bool,
+    /// The display it's on, if Pepper says.
+    pub display: Option<u32>,
 }
 
 pub struct Client {
@@ -371,9 +376,10 @@ impl Reports {
             let message = (header.id == MSG_SIZE
                 && simple
                 && from_pepper
-                && size >= size_of::<SizeMessage>())
+                && size >= std::mem::offset_of!(SizeMessage, display))
             .then(|| {
-                // SAFETY: checked to be a simple message this long.
+                // SAFETY: checked to be a simple message this long; its
+                // display is read only if it's longer still.
                 unsafe { &*(header as *const Header).cast::<SizeMessage>() }
             });
             let report = message.and_then(|message| {
@@ -383,6 +389,9 @@ impl Reports {
                         width: message.width,
                         height: message.height,
                         visible: message.visible != 0,
+                        display: (size >= size_of::<SizeMessage>())
+                            .then_some(message.display)
+                            .filter(|&d| d != 0),
                     },
                 ))
             });
@@ -473,7 +482,9 @@ mod tests {
     fn messages_are_laid_out_as_pepper_reads_them() {
         assert_eq!(size_of::<Header>(), 24);
         assert_eq!(size_of::<Present>(), 24 + 64 + 4);
-        assert_eq!(size_of::<SizeMessage>(), 24 + 64 + 12);
+        // An older Pepper's ends before the display.
+        assert_eq!(std::mem::offset_of!(SizeMessage, display), 24 + 64 + 12);
+        assert_eq!(size_of::<SizeMessage>(), 24 + 64 + 16);
         // Header, descriptor count, a 12-byte descriptor each, the token:
         // where Pepper looks for it.
         assert_eq!(size_of::<Attach<3>>(), 24 + 4 + 3 * 12 + 64);

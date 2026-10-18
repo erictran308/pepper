@@ -167,7 +167,7 @@ A program can also hand Pepper frames itself, without mpv. It looks up `PEPPER_P
 | attach | `0x70700001` | 1 to 4 IOSurfaces (`IOSurfaceCreateMachPort`) as port descriptors, then the token. `msgh_local_port` is a receive right of the program's own, sent as `MAKE_SEND`: Pepper watches it to learn when the program ends, and answers on it. |
 | present | `0x70700002` | The token, then the surface to show, a `UInt32` from 0. |
 | detach | `0x70700003` | The token. |
-| size, from Pepper | `0x70700101` | The token, then the box's width and height in pixels and whether it's placed (`UInt32`s). Sent when the stream and its box both exist, and when the box moves, resizes or goes. |
+| size, from Pepper | `0x70700101` | The token, then the box's width and height in pixels, whether it's placed, and the display it's on (a `CGDirectDisplayID`, 0 if not known) (`UInt32`s; an older Pepper sends no display). Sent when the stream and its box both exist, and when the box moves, resizes or goes, or its window goes to another display. |
 
 Draw each frame into a surface the window server isn't showing (`IOSurfaceIsInUse`), wait for it to finish, then present it. `src/pepper.rs` is a client in Rust, and `macos/Sources/Features/Pepper/PepperServer.swift` is Pepper's side.
 

@@ -22,8 +22,6 @@ class TerminalWindow: NSWindow {
     /// Reset split zoom button in titlebar
     private let resetZoomAccessory = NSTitlebarAccessoryViewController()
 
-    /// Update notification UI in titlebar
-
     /// Visual indicator that mirrors the selected tab color.
     private lazy var tabColorIndicator: NSHostingView<TabColorIndicatorView> = {
         let view = NSHostingView(rootView: TabColorIndicatorView(tabColor: tabColor))
