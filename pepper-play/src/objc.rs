@@ -7,7 +7,7 @@ pub type Id = *mut c_void;
 pub type Sel = *mut c_void;
 
 #[link(name = "objc")]
-unsafe extern "C" {
+unsafe extern "C-unwind" {
     pub fn objc_getClass(name: *const c_char) -> Id;
     pub fn sel_registerName(name: *const c_char) -> Sel;
     pub fn objc_msgSend();
@@ -19,10 +19,12 @@ unsafe extern "C" {
 }
 
 /// `objc_msgSend` as a function of the given type: it must be called
-/// through the method's exact signature.
+/// through the method's exact signature, as `extern "C-unwind"`, so that an
+/// Objective-C exception stops the program (`panic = "abort"`) rather than
+/// unwind through Rust that doesn't expect it.
 macro_rules! send {
     ($ty:ty) => {
-        std::mem::transmute::<unsafe extern "C" fn(), $ty>($crate::objc::objc_msgSend)
+        std::mem::transmute::<unsafe extern "C-unwind" fn(), $ty>($crate::objc::objc_msgSend)
     };
 }
 pub(crate) use send;

@@ -113,10 +113,12 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     /// mpv's options that start its IPC: set once frames can be drawn.
     const IPC_OPTIONS: [&str; 2] = ["input-ipc-client", "input-ipc-server"];
 
-    /// libmpv's handle, which its API lets any thread use.
+    /// libmpv's handle, which its API lets any thread use, but for
+    /// mpv_terminate_destroy: every thread given a copy ends before it.
     #[derive(Clone, Copy)]
     struct Mpv(*mut mpv::Handle);
-    // SAFETY: libmpv's client API is thread-safe.
+    // SAFETY: libmpv's client API is thread-safe, and the threads that hold
+    // a copy end before mpv_terminate_destroy (`play`, `run_mpv`).
     unsafe impl Send for Mpv {}
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,11 +166,16 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         link_idle: bool,
         /// mpv blends frames (`interpolation`), so no frame repeats another.
         interpolation: bool,
+        /// Pepper didn't take the surfaces handed it under this token.
+        refused: Option<String>,
         /// The render thread's messages, for mpv's thread to print: under
         /// ADVANCED_CONTROL the render thread must never wait on a thread
         /// that calls libmpv, and stderr's lock (or a full pipe) could make
         /// it.
         notes: Vec<String>,
+        /// Pepper's client, once it answers after a first try that didn't
+        /// (it may be busy as this starts): for the render thread to take.
+        pepper: Option<pepper::Client>,
     }
 
     #[derive(Default)]
@@ -432,8 +439,9 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         }
         let result = start(mpv, &setup, rate, &mut session)
             .and_then(|ipc| play(mpv, &setup, ipc, vsync, &mut session));
-        // SAFETY: the render thread has freed its render context by now.
-        // While mpv winds down, the main run loop still runs.
+        // SAFETY: the render thread has freed its render context by now, and
+        // it and the size reports' thread, which call libmpv, have ended
+        // (`play`). While mpv winds down, the main run loop still runs.
         unsafe { mpv::mpv_terminate_destroy(mpv.0) };
         let failed = session.failed;
         session.end(failed || result.is_err());
@@ -528,6 +536,12 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 ("term-osd", "no"),
             ]);
         }
+        if mode == Mode::App {
+            // The cover Now Playing shows is the one the app adds (`video-add
+            // … albumart`), not an image mpv finds next to a file it plays,
+            // which this program would read as one (nowplaying.rs).
+            own.push(("cover-art-auto", "no"));
+        }
         let mut options: Vec<(String, String)> = own
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -552,6 +566,12 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 // the app's, who could still change the output with
                 // --vo-add, --profile or --include.
                 "vo" => return Err("--vo is this program's own".into()),
+                // From a shell, mpv's messages stay off but for those the
+                // user names: mpv takes a list given for all of them, and
+                // would turn the others back on (the status line among them).
+                "msg-level" if mode == Mode::Shell && !value.is_empty() => {
+                    options.push((name.clone(), format!("all=no,{value}")))
+                }
                 _ => options.push((name.clone(), value.clone())),
             }
         }
@@ -615,7 +635,16 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         }
 
         shared.update(|state| state.stop = true);
-        let stats = render.join().ok();
+        // The render thread, then the size reports' thread, which the render
+        // thread's end stops: both call libmpv, so both end before mpv is
+        // destroyed (`run_mpv`).
+        let (stats, follow) = match render.join() {
+            Ok((stats, follow)) => (Some(stats), follow),
+            Err(_) => (None, None),
+        };
+        if let Some(follow) = follow {
+            let _ = follow.join();
+        }
         take_notes(session);
         if setup.debug {
             session.stats = stats;
@@ -907,7 +936,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         for note in notes.iter().map(|note| printable(note)) {
             match session.mode {
                 Mode::App => eprintln!("pepper-play: {note}"),
-                Mode::Shell => session.notes.push(note),
+                Mode::Shell if session.notes.len() < MAX_ERRORS => session.notes.push(note),
+                Mode::Shell => {}
             }
         }
     }
@@ -1077,9 +1107,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         Some((shrink(w), shrink(h)))
     }
 
-    /// Takes Pepper's reports of the box's size, for as long as the program
-    /// runs. With a display link, it follows the display the box is on, and
-    /// tells mpv that display's rate if it's timing video to it (`retime`).
+    /// Takes Pepper's reports until the client is dropped (`render`'s end):
+    /// the box's size, and the surfaces it didn't take. With a display link,
+    /// it follows the display the box is on, and tells mpv that display's
+    /// rate if it's timing video to it (`retime`).
     fn follow_sizes(
         reports: pepper::Reports,
         shared: Arc<Shared>,
@@ -1087,7 +1118,14 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         link: Option<(Arc<Vsync>, Mpv, bool)>,
     ) {
         let mut on = None;
-        while let Some((token, report)) = reports.next() {
+        while let Some(report) = reports.next_report() {
+            let (token, report) = match report {
+                pepper::Report::Size(token, report) => (token, report),
+                pepper::Report::Refused(token) => {
+                    shared.update(|state| state.refused = Some(token));
+                    continue;
+                }
+            };
             if debug {
                 eprintln!("pepper-play: Pepper says the box is {report:?}");
             }
@@ -1121,7 +1159,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
     }
 
     /// Owns the OpenGL context, the render context and the surfaces: libmpv
-    /// wants them all on one thread.
+    /// wants them all on one thread. Returns its counts, and the size
+    /// reports' thread it started, which its end has told to end.
     fn render(
         mpv: Mpv,
         shared: Arc<Shared>,
@@ -1130,7 +1169,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         vsync: Option<Arc<Vsync>>,
         retime: bool,
         ready: mpsc::Sender<Result<(), String>>,
-    ) -> Stats {
+    ) -> (Stats, Option<std::thread::JoinHandle<()>>) {
         // Frames go out at the display's refreshes: this thread wakes for
         // each, and is as prompt as a window's would be.
         // SAFETY: sets this thread's own class.
@@ -1140,7 +1179,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             Ok(context) => context,
             Err(err) => {
                 let _ = ready.send(Err(err));
-                return stats;
+                return (stats, None);
             }
         };
         let mut init = mpv::OpenGlInitParams {
@@ -1179,7 +1218,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 "mpv_render_context_create: {}",
                 mpv::error(err)
             )));
-            return stats;
+            return (stats, None);
         }
         // SAFETY: this thread holds `shared` until after rc is freed.
         unsafe {
@@ -1191,21 +1230,42 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         };
         let _ = ready.send(Ok(()));
 
-        let client = match port {
-            Some(name) => pepper::Client::connect(&name)
-                .inspect_err(|err| shared.note(mpv, err.clone()))
-                .ok(),
+        let mut client = match port {
+            Some(name) => match pepper::Client::connect(&name) {
+                Ok(client) => Some(client),
+                Err(err) => {
+                    shared.note(mpv, err);
+                    // Asked again each second until Pepper answers, or this
+                    // ends: the frames show from then on.
+                    let shared = shared.clone();
+                    std::thread::spawn(move || {
+                        loop {
+                            std::thread::sleep(ATTACH_AGAIN);
+                            if shared.lock().stop {
+                                return;
+                            }
+                            if let Ok(client) = pepper::Client::connect(&name) {
+                                return shared.update(|state| state.pepper = Some(client));
+                            }
+                        }
+                    });
+                    None
+                }
+            },
             None => {
                 shared.note(mpv, "PEPPER_PORT is not set; drawing to nowhere".into());
                 None
             }
         };
-        if let Some(client) = &client {
+        // It ends once the client is dropped, at this thread's end; `play`
+        // joins it, as it calls libmpv.
+        let follow_with = |client: &pepper::Client| {
             let reports = client.reports();
             let shared = shared.clone();
             let link = vsync.clone().map(|vsync| (vsync, mpv, retime));
-            std::thread::spawn(move || follow_sizes(reports, shared, debug, link));
-        }
+            std::thread::spawn(move || follow_sizes(reports, shared, debug, link))
+        };
+        let mut follow = client.as_ref().map(follow_with);
         let mut ring: Vec<gl::Target> = Vec::new();
         let mut attached: Option<String> = None;
         // The token Pepper last didn't take the surfaces for, and when: they
@@ -1235,24 +1295,35 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         let mut alloc_failed: Option<Instant> = None;
 
         loop {
-            let (token, size, reported, work, refresh, idle, interpolation) = {
+            // Surfaces Pepper didn't take go again ATTACH_AGAIN later, even
+            // with no frame to draw (paused).
+            let attach_at = refused
+                .as_ref()
+                .filter(|_| attached.is_none())
+                .map(|(_, when)| *when + ATTACH_AGAIN)
+                .filter(|&at| at > Instant::now());
+            let arrived;
+            let (token, size, reported, work, refresh, idle, interpolation, refusal) = {
                 let mut state = shared.lock();
                 let (mut due, mut late) = (false, false);
                 while !(state.frame
                     || state.changed
                     || state.stop
                     || state.refresh
-                    || state.link_idle)
+                    || state.link_idle
+                    || state.refused.is_some()
+                    || state.pepper.is_some())
                 {
-                    // Surfaces to make at a size that has settled, or a frame
-                    // that has waited too long for a refresh.
+                    // Surfaces to make at a size that has settled, or to
+                    // offer again, or a frame that has waited too long for a
+                    // refresh.
                     let late_at = waiting.is_some().then(|| waiting_since + REFRESH_LATE);
-                    let Some(at) = [remake, late_at].into_iter().flatten().min() else {
+                    let Some(at) = [remake, late_at, attach_at].into_iter().flatten().min() else {
                         state = shared.wake.wait(state).unwrap_or_else(|e| e.into_inner());
                         continue;
                     };
                     let Some(left) = at.checked_duration_since(Instant::now()) else {
-                        due = remake.is_some_and(|r| r <= at);
+                        due = remake.is_some_and(|r| r <= at) || attach_at.is_some_and(|a| a <= at);
                         late = late_at.is_some_and(|l| l <= at);
                         break;
                     };
@@ -1267,7 +1338,10 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 }
                 // A refresh due by now that didn't come counts as one.
                 state.refresh |= late;
-                let work = state.frame || state.changed || due;
+                let refusal = state.refused.take();
+                arrived = state.pepper.take();
+                let work =
+                    state.frame || state.changed || due || refusal.is_some() || arrived.is_some();
                 state.frame = false;
                 state.changed = false;
                 (
@@ -1278,8 +1352,30 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                     std::mem::take(&mut state.refresh),
                     std::mem::take(&mut state.link_idle),
                     state.interpolation,
+                    refusal,
                 )
             };
+            // Pepper answered at last: its sizes followed, and the surfaces
+            // offered with the next frame.
+            if let Some(late) = arrived {
+                follow = Some(follow_with(&late));
+                client = Some(late);
+                redraw = true;
+            }
+            // Pepper didn't take the surfaces (too many streams): they go
+            // again after ATTACH_AGAIN, as when they couldn't be sent.
+            if let Some(token) = refusal
+                && attached.as_ref() == Some(&token)
+            {
+                attached = None;
+                if refused.as_ref().is_none_or(|(t, _)| *t != token) {
+                    shared.note(
+                        mpv,
+                        "Pepper didn't take the video (too many streams?): trying again".into(),
+                    );
+                }
+                refused = Some((token, Instant::now()));
+            }
             if refresh && let Some(slot) = waiting.take() {
                 shared.lock().awaiting = false;
                 show(client.as_ref(), attached.as_deref(), slot, &mut stats);
@@ -1289,12 +1385,13 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 unsafe { mpv::mpv_render_context_report_swap(rc) };
             }
             // Nothing was drawn for a while (paused): the link stops until
-            // the next frame.
-            if idle
-                && let Some(vsync) = &vsync
-                && !shared.lock().awaiting
-            {
-                vsync.stop();
+            // the next frame. Not under the state's lock, which the link's
+            // callback takes.
+            if idle && let Some(vsync) = &vsync {
+                let awaiting = shared.lock().awaiting;
+                if !awaiting {
+                    vsync.stop();
+                }
             }
             if !work {
                 continue;
@@ -1512,6 +1609,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         if let (Some(client), Some(token)) = (&client, &attached) {
             client.detach(token);
         }
+        // Ends the size reports' thread's wait for Pepper.
+        drop(client);
         // No more refreshes (the size reports' thread holds the link too).
         if let Some(vsync) = &vsync {
             vsync.stop();
@@ -1522,7 +1621,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
         unsafe { mpv::mpv_render_context_free(rc) };
         drop(ring);
         drop(context);
-        stats
+        (stats, follow)
     }
 
     /// What the render thread did, said at the end under PEPPER_PLAY_DEBUG.
@@ -1705,6 +1804,19 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             assert!(last(&options, "force-window").is_none());
             assert!(last(&options, "terminal").is_none());
             assert!(last(&options, "msg-level").is_none());
+            // An app's cover is the one it adds, not one mpv finds.
+            assert_eq!(last(&options, "cover-art-auto").as_deref(), Some("no"));
+            let args = parse_args(&strings(&["--msg-level=ffmpeg=v", "a.mp4"])).unwrap();
+            let (options, _) = mpv_options(Mode::App, &args, None).unwrap();
+            assert_eq!(last(&options, "msg-level").as_deref(), Some("ffmpeg=v"));
+            // From a shell, the user's messages and no others: mpv would
+            // take `ffmpeg=v` for all of them, the status line too.
+            let (options, _) = mpv_options(Mode::Shell, &args, None).unwrap();
+            assert_eq!(
+                last(&options, "msg-level").as_deref(),
+                Some("all=no,ffmpeg=v")
+            );
+            assert!(last(&options, "cover-art-auto").is_none());
 
             let args = parse_args(&strings(&["--vo=gpu"])).unwrap();
             assert!(mpv_options(Mode::App, &args, None).is_err());
@@ -1811,6 +1923,42 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             assert_eq!(size(6016, 3384, true), Some((6016, 3384)));
             let (w, h) = size(8192, 8192, true).unwrap();
             assert!(w as u64 * h as u64 <= MAX_PIXELS && w == h && w > 4000);
+        }
+
+        #[test]
+        fn size_reports_end_with_the_client() {
+            let client = pepper::Client::own();
+            let shared = Arc::new(Shared::default());
+            shared.lock().token = Some("t".into());
+            let size = pepper::BoxSize {
+                width: 640,
+                height: 360,
+                visible: true,
+                display: None,
+            };
+            client.tell(&pepper::Report::Size("t".into(), size));
+            client.tell(&pepper::Report::Refused("t".into()));
+            let follow = std::thread::spawn({
+                let reports = client.reports();
+                let shared = shared.clone();
+                move || follow_sizes(reports, shared, false, None)
+            });
+            let until = |done: &dyn Fn() -> bool| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !done() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            };
+            until(&|| shared.lock().refused.is_some());
+            assert_eq!(shared.lock().size, Some((640, 360)));
+            assert_eq!(shared.lock().refused.as_deref(), Some("t"));
+            // The render thread's end: the thread ends, so `play` can join
+            // it before mpv is destroyed, and it calls libmpv no more.
+            assert!(!follow.is_finished());
+            drop(client);
+            until(&|| follow.is_finished());
+            assert!(follow.is_finished());
+            follow.join().unwrap();
         }
 
         #[test]

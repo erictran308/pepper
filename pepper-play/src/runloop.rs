@@ -39,16 +39,16 @@ pub fn become_app() -> Id {
     // SAFETY: AppKit calls on the main thread, through the methods' own
     // signatures.
     unsafe {
-        let app: Id = send!(unsafe extern "C" fn(Id, Sel) -> Id)(
+        let app: Id = send!(unsafe extern "C-unwind" fn(Id, Sel) -> Id)(
             class(c"NSApplication"),
             sel(c"sharedApplication"),
         );
-        send!(unsafe extern "C" fn(Id, Sel, isize) -> i8)(
+        send!(unsafe extern "C-unwind" fn(Id, Sel, isize) -> i8)(
             app,
             sel(c"setActivationPolicy:"),
             ACCESSORY,
         );
-        send!(unsafe extern "C" fn(Id, Sel))(app, sel(c"finishLaunching"));
+        send!(unsafe extern "C-unwind" fn(Id, Sel))(app, sel(c"finishLaunching"));
         app
     }
 }
@@ -65,9 +65,10 @@ pub fn run_main(app: Id) {
         let date_after = sel(c"dateWithTimeIntervalSinceNow:");
         while !STOP.load(Ordering::Acquire) {
             let pool = objc_autoreleasePoolPush();
-            let until: Id =
-                send!(unsafe extern "C" fn(Id, Sel, f64) -> Id)(date_class, date_after, LOOK_EVERY);
-            let event: Id = send!(unsafe extern "C" fn(Id, Sel, u64, Id, Id, i8) -> Id)(
+            let until: Id = send!(unsafe extern "C-unwind" fn(Id, Sel, f64) -> Id)(
+                date_class, date_after, LOOK_EVERY,
+            );
+            let event: Id = send!(unsafe extern "C-unwind" fn(Id, Sel, u64, Id, Id, i8) -> Id)(
                 app,
                 next_event,
                 ANY_EVENT,
@@ -76,7 +77,7 @@ pub fn run_main(app: Id) {
                 1,
             );
             if !event.is_null() {
-                send!(unsafe extern "C" fn(Id, Sel, Id))(app, send_event, event);
+                send!(unsafe extern "C-unwind" fn(Id, Sel, Id))(app, send_event, event);
             }
             objc_autoreleasePoolPop(pool);
         }

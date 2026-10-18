@@ -297,6 +297,11 @@ pub inline fn textureOptions(self: Metal) Texture.Options {
             // Indicate that the CPU writes to this resource but never reads it.
             .cpu_cache_mode = .write_combined,
             .storage_mode = self.default_storage_mode,
+            // pepper: every frame in flight shares the custom shaders'
+            // textures (generic.zig, CustomShaderState), so Metal must order
+            // their reads and writes across command buffers: said outright,
+            // not left to `.default`.
+            .hazard_tracking_mode = .tracked,
         },
         .usage = .{
             // textureOptions is currently only used for custom shaders,

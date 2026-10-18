@@ -40,8 +40,12 @@ sdk_ver=$(/usr/bin/xcrun --sdk macosx --show-sdk-version)
 sdk_build=$(/usr/bin/xcrun --sdk macosx --show-sdk-build-version)
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/pepper"
 view="$cache/sdk/MacOSX$sdk_ver-$sdk_build.sdk"
+# This user's alone: what's in it goes into every build.
+mkdir -p "$cache"
+chmod 700 "$cache"
 
-if [ ! -f "$view/.pepper-sdk" ]; then
+# Made again unless it was made from this very SDK.
+if [ "$(cat "$view/.pepper-sdk" 2>/dev/null || true)" != "$sdk" ]; then
     echo "pepper-build: making SDK view $view" >&2
     mkdir -p "$cache/sdk"
     tmp="$view.tmp"
@@ -73,7 +77,11 @@ EOF
 fi
 
 mkdir -p "$cache/bin"
-cat >"$cache/bin/xcrun" <<'EOF'
+# Written under a name of its own, then moved over the old one: a link left
+# at the shim's path is replaced, not written through.
+shim="$cache/bin/.xcrun.$$"
+rm -f "$shim"
+cat >"$shim" <<'EOF'
 #!/bin/sh
 # pepper-build.sh's xcrun: Zig asks exactly this to find the SDK.
 if [ "$#" -eq 3 ] && [ "$1" = --sdk ] && [ "$2" = macosx ] &&
@@ -83,7 +91,8 @@ if [ "$#" -eq 3 ] && [ "$1" = --sdk ] && [ "$2" = macosx ] &&
 fi
 exec /usr/bin/xcrun "$@"
 EOF
-chmod +x "$cache/bin/xcrun"
+chmod +x "$shim"
+mv -f "$shim" "$cache/bin/xcrun"
 
 [ "$#" -gt 0 ] || set -- -Doptimize=ReleaseFast
 # The build copies the app over the one already in zig-out, keeping files
@@ -150,22 +159,45 @@ fail() {
     echo "pepper-build: $*" >&2
     exit 1
 }
-for code in "$app" "$helper" "$app/Contents/MacOS/pepper-agent"; do
+# A signature's entitlements, as XML (none: nothing). codesign failing fails
+# the build, rather than passing what it couldn't read.
+entitlements() {
+    codesign -d --entitlements - --xml "$1" 2>/dev/null ||
+        fail "codesign can't read $1's signature"
+}
+nl='
+'
+# Every program in the app, nested ones too: the app's, pepper-play's,
+# pepper-agent's and Xcode's dock tile plugin today, and any plugin, service
+# or helper a later build adds.
+programs=$(find "$app" -type f -exec file -N -F ' :: ' -- {} + | sed -n 's/ :: *Mach-O.*$//p')
+for known in "$app/Contents/MacOS/ghostty" "$helper/Contents/MacOS/pepper-play" \
+    "$app/Contents/MacOS/pepper-agent"; do
+    case "$nl$programs$nl" in
+    *"$nl$known$nl"*) ;;
+    *) fail "$known isn't among the app's programs" ;;
+    esac
+done
+while IFS= read -r code <&3; do
     case "$(codesign -d --verbose=2 "$code" 2>&1)" in
     *"flags=0x10002(adhoc,runtime)"*) ;;
     *) fail "$code isn't signed with the hardened runtime" ;;
     esac
-    case "$(codesign -d --entitlements - --xml "$code" 2>/dev/null)" in
+    allowed=$(entitlements "$code") || exit 1
+    case "$allowed" in
     *get-task-allow* | *allow-dyld-environment-variables*)
         fail "$code may be debugged or have code put in it" ;;
     esac
-done
-case "$(codesign -d --entitlements - --xml "$app" 2>/dev/null)" in
+done 3<<EOF
+$programs
+EOF
+allowed=$(entitlements "$app") || exit 1
+case "$allowed" in
 *disable-library-validation* | *allow-unsigned-executable-memory* | *allow-jit*)
     fail "$app loads libraries not its own, or makes code" ;;
 esac
 [ ! -e "$app/Contents/Frameworks" ] || fail "$app has frameworks (Sparkle is taken out)"
-[ -z "$(codesign -d --entitlements - --xml "$app/Contents/MacOS/pepper-agent" 2>/dev/null)" ] ||
-    fail "pepper-agent has entitlements"
+allowed=$(entitlements "$app/Contents/MacOS/pepper-agent") || exit 1
+[ -z "$allowed" ] || fail "pepper-agent has entitlements"
 
 echo "pepper-build: $app $pepper_version, with pepper-play $version and pepper-agent $agent_version" >&2

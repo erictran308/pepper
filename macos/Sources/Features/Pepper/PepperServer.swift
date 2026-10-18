@@ -24,9 +24,14 @@ import QuartzCore
 ///   descriptors, then the token. The reply port (msgh_local_port, made a
 ///   send right) is the client: when it dies, its streams and their boxes go.
 ///   The stream is the attaching process's: only it can present, detach or
-///   attach it again.
+///   attach it again, and it ends when that process exits or runs another
+///   program, whatever its client port does. A process has at most
+///   `maxStreamsPerOwner` streams.
 /// - present: the token, then a `UInt32` slot; shows that surface.
 /// - detach: the token; ends the stream.
+/// - hello: any token, with a reply port (a send-once right). Answered at
+///   once, so the client learns from the kernel which process holds this
+///   port's name.
 ///
 /// Pepper answers on the client's port, never waiting for it:
 /// - size: the token, then the box's width and height in pixels, whether
@@ -35,6 +40,10 @@ import QuartzCore
 ///   exist, and when the placement moves, resizes or goes, or its window
 ///   goes to another display, so the client draws its frames at the box's
 ///   size and that display's refreshes.
+/// - refused: the token, when an attach isn't taken (too many streams, a
+///   surface it can't show, a token another process streams to), so the
+///   client can offer its surfaces again later.
+/// - hello's answer: the token.
 ///
 /// The kernel's notices that a client died come on a port of their own, which
 /// no other process can send to.
@@ -48,10 +57,15 @@ final class PepperServer {
         case attach = 0x7070_0001
         case present = 0x7070_0002
         case detach = 0x7070_0003
+        case hello = 0x7070_0004
     }
 
     /// The size message, to a client.
     private static let sizeID: mach_msg_id_t = 0x7070_0101
+    /// To a client, an attach not taken.
+    private static let refusedID: mach_msg_id_t = 0x7070_0102
+    /// To whoever said hello.
+    private static let helloAnswerID: mach_msg_id_t = 0x7070_0103
 
     /// The kernel's dead-name notification (mach/notify.h).
     private static let notifyDeadName: mach_msg_id_t = 0o110
@@ -82,6 +96,10 @@ final class PepperServer {
     /// if the new stream presents nothing.
     private static let keptFrameLimit: TimeInterval = 2
     private static let maxStreams = 16
+    /// The most streams one process has: pepper-agent's viewer shows at most
+    /// 4 pages, and each pepper-play has one. Others can still attach while
+    /// one process has all it may.
+    private static let maxStreamsPerOwner = 4
     private static let maxPlacementsPerView = 4
     private static let maxPlacements = 64
     private static let bufferSize = 1024
@@ -110,7 +128,7 @@ final class PepperServer {
 
     /// A process, by its audit token: its pid, and which program that pid
     /// ran.
-    private struct Sender: Equatable {
+    private struct Sender: Hashable {
         var pid: UInt32
         var version: UInt32
     }
@@ -163,6 +181,9 @@ final class PepperServer {
     private var placements: [String: Placement] = [:]
     private var placementsMade = 0
     private var streamsMade = 0
+    /// The processes that have streams, each watched, so that its streams end
+    /// when it exits or runs another program.
+    private var owners: [Sender: DispatchSourceProcess] = [:]
 
     /// Registers the port and listens on the main queue. Call it before any
     /// surface starts, so every shell gets PEPPER_PORT.
@@ -296,7 +317,11 @@ final class PepperServer {
     /// client hears of its box's pixels and display.
     private func windowMoved(_ window: NSWindow) {
         let scale = window.backingScaleFactor
-        for (token, var placement) in placements where placement.view?.window === window {
+        // Read again at each: a report can end a client's streams, and their
+        // placements with them.
+        let tokens = placements.filter { $0.value.view?.window === window }.map(\.key)
+        for token in tokens {
+            guard var placement = placements[token] else { continue }
             placement.pixels = CGSize(
                 width: (placement.layer.frame.width * scale).rounded(),
                 height: (placement.layer.frame.height * scale).rounded()
@@ -324,11 +349,14 @@ final class PepperServer {
     }
 
     /// Makes room for one more box in `view`: past `maxPlacementsPerView`,
-    /// its oldest goes.
+    /// its oldest box with no stream goes, or its oldest if all have one, so
+    /// output can't push a playing video out with boxes of its own.
     private func makeRoom(in view: Ghostty.SurfaceView) {
         let here = placements.filter { $0.value.view === view }
-        guard here.count >= Self.maxPlacementsPerView,
-              let oldest = here.min(by: { $0.value.order < $1.value.order }) else { return }
+        guard here.count >= Self.maxPlacementsPerView else { return }
+        let idle = here.filter { streams[$0.key] == nil }
+        guard let oldest = (idle.isEmpty ? here : idle)
+            .min(by: { $0.value.order < $1.value.order }) else { return }
         placements.removeValue(forKey: oldest.key)
         remove(oldest.value.layer)
         report(oldest.key)
@@ -395,6 +423,12 @@ final class PepperServer {
             case MACH_RCV_TOO_LARGE:
                 // Without MACH_RCV_LARGE the kernel has already dropped it.
                 Self.logger.warning("dropped a message over \(Self.bufferSize) bytes")
+            case _ where kr & ~MACH_MSG_MASK == MACH_RCV_BODY_ERROR:
+                // The header came out with its reply right, and maybe part of
+                // the body (mach/message.h): freed, or a resource shortage
+                // would leave a sender's rights here.
+                Self.logger.warning("a message's body couldn't be received: \(kr)")
+                mach_msg_destroy(header)
             default:
                 Self.logger.error("mach_msg receive failed: \(kr)")
                 return
@@ -484,6 +518,9 @@ final class PepperServer {
             dropStream(token)
             show(token)
 
+        case .hello:
+            hello(token)
+
         case nil:
             // Notification ids too: the kernel sends those to notifyPort.
             Self.logger.warning("unknown message id \(id)")
@@ -525,45 +562,61 @@ final class PepperServer {
         )
     }
 
-    /// A surface as pepper-play makes them: BGRA, not planar, at most
-    /// `maxSide` pixels a side and the memory that takes.
+    /// A surface as pepper-play makes them: BGRA, not planar, 4 bytes a
+    /// pixel, at most `maxSide` pixels a side, rows that hold them, and the
+    /// memory that takes.
     private static func usable(_ surface: IOSurface) -> Bool {
         surface.pixelFormat == 0x4247_5241 // 'BGRA'
             && surface.planeCount == 0
+            && surface.bytesPerElement == 4
             && (1...maxSide).contains(surface.width)
             && (1...maxSide).contains(surface.height)
+            && surface.bytesPerRow >= 4 * surface.width
+            && surface.allocationSize >= surface.bytesPerRow * surface.height
             && surface.allocationSize <= maxSurfaceBytes
     }
 
     private func attach(_ token: String, _ ports: [mach_port_t], from sender: Sender) {
-        if let stream = streams[token], stream.owner != sender {
-            Self.logger.warning("attach: the token's stream is another process's")
-            return
-        }
         // The client's port, as a send right: it tells us when the client dies.
         let client = header.pointee.msgh_remote_port
         let remoteType = header.pointee.msgh_bits & 0x1f
         guard client != MACH_PORT_NULL, remoteType == UInt32(MACH_MSG_TYPE_MOVE_SEND) else {
-            Self.logger.warning("attach without a client port")
-            return
-        }
-        guard !ports.isEmpty else { return }
-        let surfaces = ports.compactMap { IOSurfaceLookupFromMachPort($0) }
-        guard surfaces.count == ports.count else {
-            Self.logger.warning("attach with a port that isn't an IOSurface")
-            return
-        }
-        guard surfaces.allSatisfy(Self.usable) else {
-            Self.logger.warning("attach: a surface isn't BGRA, or is too big")
-            return
-        }
-        guard streams[token] != nil || streams.count < Self.maxStreams else {
-            Self.logger.warning("attach: too many streams")
+            refuse(from: sender, "no client port")
             return
         }
         guard clientOnly(client) else {
-            Self.logger.warning("attach: the client's port is one Pepper holds already")
+            // Not told: the port is one Pepper holds for something else.
+            refuse(from: sender, "the client's port is one Pepper holds already")
             return
+        }
+        // From here the client is told, so it can offer its surfaces again.
+        let refused = { (why: String) in
+            self.refuse(from: sender, why)
+            _ = self.send(Self.refusedID, token: token, to: client)
+        }
+        if let stream = streams[token], stream.owner != sender {
+            refused("the token's stream is another process's")
+            return
+        }
+        let surfaces = ports.compactMap { IOSurfaceLookupFromMachPort($0) }
+        guard !ports.isEmpty, surfaces.count == ports.count else {
+            refused("no surfaces, or a port that isn't one")
+            return
+        }
+        guard surfaces.allSatisfy(Self.usable) else {
+            refused("a surface isn't BGRA, or is too big")
+            return
+        }
+        // A new stream must fit; an owner's attach on its token replaces one.
+        if streams[token] == nil {
+            guard streams.count < Self.maxStreams else {
+                refused("too many streams")
+                return
+            }
+            guard streams.values.filter({ $0.owner == sender }).count < Self.maxStreamsPerOwner else {
+                refused("the process has all the streams it may")
+                return
+            }
         }
 
         var previous = mach_port_t(MACH_PORT_NULL)
@@ -578,7 +631,7 @@ final class PepperServer {
         )
         guard kr == KERN_SUCCESS else {
             // Most likely the client is already gone.
-            Self.logger.warning("attach: dead-name request failed: \(kr)")
+            refuse(from: sender, "dead-name request failed: \(kr)")
             return
         }
         // Only an earlier attach's request can come back (`clientOnly`).
@@ -586,10 +639,15 @@ final class PepperServer {
 
         // Keep the client's right past mach_msg_destroy.
         header.pointee.msgh_remote_port = mach_port_t(MACH_PORT_NULL)
-        dropStream(token)
         streamsMade += 1
         let serial = streamsMade
-        streams[token] = Stream(surfaces: surfaces, client: client, owner: sender, slot: nil, serial: serial)
+        let stream = Stream(surfaces: surfaces, client: client, owner: sender, slot: nil, serial: serial)
+        // The owner's own stream on the token goes (not by `dropStream`,
+        // which would stop watching the owner).
+        if let replaced = streams.updateValue(stream, forKey: token) {
+            mach_port_deallocate(mach_task_self_, replaced.client)
+        }
+        watch(sender)
         // Not shown yet: the box keeps the last frame of the stream this
         // replaces (its client attaches again at a new size) until the first
         // `present`, rather than going blank between them; the same owner's
@@ -602,6 +660,89 @@ final class PepperServer {
         }
         report(token)
         Self.logger.info("attached \(surfaces.count) surfaces")
+    }
+
+    /// An attach not taken, logged as an error with the sender's pid, so a
+    /// full stream table shows.
+    private func refuse(from sender: Sender, _ why: String) {
+        Self.logger.error("attach from pid \(sender.pid) refused: \(why, privacy: .public)")
+    }
+
+    /// Answers a hello on its reply port, a send-once right: the kernel tells
+    /// the client who sent the answer, so it knows this process holds the
+    /// port's name, not one that took the name of a Pepper that quit.
+    private func hello(_ token: String) {
+        let reply = header.pointee.msgh_remote_port
+        let replyType = header.pointee.msgh_bits & 0x1f
+        guard reply != MACH_PORT_NULL, replyType == UInt32(MACH_MSG_TYPE_MOVE_SEND_ONCE) else { return }
+        let kr = send(
+            Self.helloAnswerID,
+            token: token,
+            to: reply,
+            disposition: mach_msg_type_name_t(MACH_MSG_TYPE_MOVE_SEND_ONCE)
+        )
+        // Sent, the answer took the right; if not, mach_msg_destroy frees it.
+        if kr == KERN_SUCCESS { header.pointee.msgh_remote_port = mach_port_t(MACH_PORT_NULL) }
+    }
+
+    /// Watches the owner's process from its first stream on: when it exits
+    /// or runs another program, its streams end, whatever their client port
+    /// does (a port can outlive the process that named it).
+    private func watch(_ owner: Sender) {
+        guard owners[owner] == nil else { return }
+        let source = DispatchSource.makeProcessSource(
+            identifier: pid_t(bitPattern: owner.pid),
+            eventMask: [.exit, .exec],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in self?.ownerGone(owner) }
+        // The kernel watches whichever process has the pid when this is
+        // registered: if that isn't the owner (it exited first, and the pid
+        // may be another program's now), the owner is gone already. A pid
+        // gone before then makes the event come at once.
+        source.setRegistrationHandler { [weak self] in
+            if Self.running(owner) == false { self?.ownerGone(owner) }
+        }
+        owners[owner] = source
+        source.resume()
+    }
+
+    /// The owner exited or ran another program: its streams go, and their
+    /// boxes, which nothing will show in again.
+    private func ownerGone(_ owner: Sender) {
+        var ended = 0
+        for (token, stream) in streams where stream.owner == owner {
+            dropStream(token)
+            if let placement = placements.removeValue(forKey: token) {
+                remove(placement.layer)
+            }
+            ended += 1
+        }
+        // A watch whose streams had gone already.
+        owners.removeValue(forKey: owner)?.cancel()
+        if ended > 0 {
+            Self.logger.info("pid \(owner.pid) is gone: its \(ended) streams too")
+        }
+    }
+
+    /// Whether the owner still runs, by the audit token of its pid's process
+    /// now; nil if that can't be told (the pid is another user's).
+    private static func running(_ owner: Sender) -> Bool? {
+        let pid = pid_t(bitPattern: owner.pid)
+        var task = mach_port_name_t(MACH_PORT_NULL)
+        guard task_name_for_pid(mach_task_self_, pid, &task) == KERN_SUCCESS else {
+            return kill(pid, 0) == -1 && errno == ESRCH ? false : nil
+        }
+        defer { mach_port_deallocate(mach_task_self_, task) }
+        var token = audit_token_t()
+        var count = mach_msg_type_number_t(MemoryLayout<audit_token_t>.size / MemoryLayout<natural_t>.size)
+        let kr = withUnsafeMutablePointer(to: &token) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(task, task_flavor_t(TASK_AUDIT_TOKEN), $0, &count)
+            }
+        }
+        guard kr == KERN_SUCCESS else { return nil }
+        return token.val.5 == owner.pid && token.val.7 == owner.version
     }
 
     /// Whether the client's name is the streams' alone: a send right with
@@ -636,11 +777,14 @@ final class PepperServer {
     }
 
     /// Ends the token's stream. Its box may still show the stream's last
-    /// frame: every caller but a same-owner `attach` (which replaces it, and
-    /// bounds that) clears or removes the box after.
+    /// frame: every caller clears or removes the box after.
     private func dropStream(_ token: String) {
         guard let stream = streams.removeValue(forKey: token) else { return }
         mach_port_deallocate(mach_task_self_, stream.client)
+        // Its owner's last: that process needn't be watched any more.
+        if !streams.values.contains(where: { $0.owner == stream.owner }) {
+            owners.removeValue(forKey: stream.owner)?.cancel()
+        }
     }
 
     /// The client is gone: its streams go, and their boxes, which nothing
@@ -675,7 +819,12 @@ final class PepperServer {
             return
         }
         guard size != stream.reported else { return }
-        switch send(size, token: token, to: stream.client) {
+        switch send(
+            Self.sizeID,
+            token: token,
+            values: [size.width, size.height, size.visible ? 1 : 0, size.display],
+            to: stream.client
+        ) {
         case KERN_SUCCESS:
             stream.reported = size
             streams[token] = stream
@@ -687,19 +836,25 @@ final class PepperServer {
         }
     }
 
-    /// Sends the size message without waiting: a client whose queue is full,
-    /// or that's gone, misses it.
-    private func send(_ size: BoxSize, token: String, to client: mach_port_t) -> kern_return_t {
+    /// Sends a client a message, the token then `values`, without waiting:
+    /// a client whose queue is full, or that's gone, misses it.
+    private func send(
+        _ id: mach_msg_id_t,
+        token: String,
+        values: [UInt32] = [],
+        to client: mach_port_t,
+        disposition: mach_msg_type_name_t = mach_msg_type_name_t(MACH_MSG_TYPE_COPY_SEND)
+    ) -> kern_return_t {
         let headerSize = MemoryLayout<mach_msg_header_t>.size
-        let byteCount = headerSize + Self.tokenSize + 4 * MemoryLayout<UInt32>.size
+        let byteCount = headerSize + Self.tokenSize + values.count * MemoryLayout<UInt32>.size
         let kr = withUnsafeTemporaryAllocation(byteCount: byteCount, alignment: 8) { buffer in
             guard let raw = buffer.baseAddress else { return KERN_FAILURE }
             raw.initializeMemory(as: UInt8.self, repeating: 0, count: byteCount)
             var header = mach_msg_header_t()
-            header.msgh_bits = mach_msg_bits_t(MACH_MSG_TYPE_COPY_SEND)
+            header.msgh_bits = mach_msg_bits_t(disposition)
             header.msgh_size = mach_msg_size_t(byteCount)
             header.msgh_remote_port = client
-            header.msgh_id = Self.sizeID
+            header.msgh_id = id
             raw.storeBytes(of: header, as: mach_msg_header_t.self)
             let bytes = Array(token.utf8.prefix(Self.tokenSize))
             bytes.withUnsafeBytes { token in
@@ -708,7 +863,7 @@ final class PepperServer {
                 }
             }
             var offset = headerSize + Self.tokenSize
-            for value in [size.width, size.height, size.visible ? 1 : 0, size.display] {
+            for value in values {
                 raw.storeBytes(of: value, toByteOffset: offset, as: UInt32.self)
                 offset += MemoryLayout<UInt32>.size
             }
@@ -723,7 +878,7 @@ final class PepperServer {
             )
         }
         if kr != KERN_SUCCESS {
-            Self.logger.warning("size to client failed: \(kr)")
+            Self.logger.warning("message \(id) to a client failed: \(kr)")
         }
         return kr
     }

@@ -196,7 +196,7 @@ impl NowPlaying {
                 .filter(|v| v.is_finite())
         };
         match name.to_bytes() {
-            b"media-title" => self.title = string(),
+            b"media-title" => self.title = without_userinfo(&string()),
             b"metadata/by-key/artist" => self.artist = string(),
             b"duration" => self.duration = double().unwrap_or(0.0).max(0.0),
             b"speed" => self.speed = double().unwrap_or(1.0),
@@ -257,14 +257,16 @@ impl NowPlaying {
             // reference each, which COVER and self.artwork hold; the ones
             // they held before are released once nothing hands them out.
             unsafe {
-                let path: Id = send!(unsafe extern "C" fn(Id, Sel, *const c_char) -> Id)(
+                let path: Id = send!(unsafe extern "C-unwind" fn(Id, Sel, *const c_char) -> Id)(
                     class(c"NSString"),
                     sel(c"stringWithUTF8String:"),
                     path.as_ptr(),
                 );
-                let image: Id =
-                    send!(unsafe extern "C" fn(Id, Sel) -> Id)(class(c"NSImage"), sel(c"alloc"));
-                let image: Id = send!(unsafe extern "C" fn(Id, Sel, Id) -> Id)(
+                let image: Id = send!(unsafe extern "C-unwind" fn(Id, Sel) -> Id)(
+                    class(c"NSImage"),
+                    sel(c"alloc"),
+                );
+                let image: Id = send!(unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id)(
                     image,
                     sel(c"initWithContentsOfFile:"),
                     path,
@@ -272,6 +274,10 @@ impl NowPlaying {
                 if image.is_null() {
                     return;
                 }
+                // Its size first: once in COVER, an older artwork may hand it
+                // to MediaPlayer, which reads it on a thread of its own.
+                let size: CGSize =
+                    send!(unsafe extern "C-unwind" fn(Id, Sel) -> CGSize)(image, sel(c"size"));
                 let old = std::mem::replace(
                     &mut *COVER.lock().unwrap_or_else(|e| e.into_inner()),
                     image as usize,
@@ -279,18 +285,17 @@ impl NowPlaying {
                 if old != 0 {
                     objc_release(old as Id);
                 }
-                let size: CGSize =
-                    send!(unsafe extern "C" fn(Id, Sel) -> CGSize)(image, sel(c"size"));
-                let artwork: Id = send!(unsafe extern "C" fn(Id, Sel) -> Id)(
+                let artwork: Id = send!(unsafe extern "C-unwind" fn(Id, Sel) -> Id)(
                     class(c"MPMediaItemArtwork"),
                     sel(c"alloc"),
                 );
-                let artwork = send!(unsafe extern "C" fn(Id, Sel, CGSize, *const Block) -> Id)(
-                    artwork,
-                    sel(c"initWithBoundsSize:requestHandler:"),
-                    size,
-                    &raw const COVER_BLOCK.0,
-                );
+                let artwork =
+                    send!(unsafe extern "C-unwind" fn(Id, Sel, CGSize, *const Block) -> Id)(
+                        artwork,
+                        sel(c"initWithBoundsSize:requestHandler:"),
+                        size,
+                        &raw const COVER_BLOCK.0,
+                    );
                 // The info Now Playing has holds the old artwork itself.
                 let old = std::mem::replace(&mut self.artwork, artwork);
                 if !old.is_null() {
@@ -305,13 +310,13 @@ impl NowPlaying {
             // SAFETY: Foundation and MediaPlayer calls through their own
             // signatures, with objects made here or kept by `self`.
             unsafe {
-                let info: Id = send!(unsafe extern "C" fn(Id, Sel) -> Id)(
+                let info: Id = send!(unsafe extern "C-unwind" fn(Id, Sel) -> Id)(
                     class(c"NSMutableDictionary"),
                     sel(c"dictionary"),
                 );
                 let set = |key: Id, value: Id| {
                     if !value.is_null() {
-                        send!(unsafe extern "C" fn(Id, Sel, Id, Id))(
+                        send!(unsafe extern "C-unwind" fn(Id, Sel, Id, Id))(
                             info,
                             sel(c"setObject:forKey:"),
                             value,
@@ -336,17 +341,21 @@ impl NowPlaying {
                     ns_unsigned(MEDIA_TYPE_VIDEO),
                 );
                 set(MPMediaItemPropertyArtwork, self.artwork);
-                let center: Id = send!(unsafe extern "C" fn(Id, Sel) -> Id)(
+                let center: Id = send!(unsafe extern "C-unwind" fn(Id, Sel) -> Id)(
                     class(c"MPNowPlayingInfoCenter"),
                     sel(c"defaultCenter"),
                 );
-                send!(unsafe extern "C" fn(Id, Sel, Id))(center, sel(c"setNowPlayingInfo:"), info);
+                send!(unsafe extern "C-unwind" fn(Id, Sel, Id))(
+                    center,
+                    sel(c"setNowPlayingInfo:"),
+                    info,
+                );
                 let state = if self.paused {
                     STATE_PAUSED
                 } else {
                     STATE_PLAYING
                 };
-                send!(unsafe extern "C" fn(Id, Sel, usize))(
+                send!(unsafe extern "C-unwind" fn(Id, Sel, usize))(
                     center,
                     sel(c"setPlaybackState:"),
                     state,
@@ -392,7 +401,7 @@ unsafe fn ns_string(text: &str) -> Id {
     };
     // SAFETY: in a pool (`publish`), through the method's own signature.
     unsafe {
-        send!(unsafe extern "C" fn(Id, Sel, *const c_char) -> Id)(
+        send!(unsafe extern "C-unwind" fn(Id, Sel, *const c_char) -> Id)(
             class(c"NSString"),
             sel(c"stringWithUTF8String:"),
             text.as_ptr(),
@@ -403,7 +412,7 @@ unsafe fn ns_string(text: &str) -> Id {
 unsafe fn ns_double(value: f64) -> Id {
     // SAFETY: as in `ns_string`.
     unsafe {
-        send!(unsafe extern "C" fn(Id, Sel, f64) -> Id)(
+        send!(unsafe extern "C-unwind" fn(Id, Sel, f64) -> Id)(
             class(c"NSNumber"),
             sel(c"numberWithDouble:"),
             value,
@@ -414,10 +423,58 @@ unsafe fn ns_double(value: f64) -> Id {
 unsafe fn ns_unsigned(value: usize) -> Id {
     // SAFETY: as in `ns_string`.
     unsafe {
-        send!(unsafe extern "C" fn(Id, Sel, usize) -> Id)(
+        send!(unsafe extern "C-unwind" fn(Id, Sel, usize) -> Id)(
             class(c"NSNumber"),
             sel(c"numberWithUnsignedInteger:"),
             value,
         )
+    }
+}
+
+/// `text` with the user and password taken out of any address in it
+/// (`rtsp://user:pass@host/…` → `rtsp://host/…`): mpv's title is the address
+/// when the video has no other, and Now Playing shows it to anyone near.
+fn without_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        let (head, tail) = rest.split_at(at + 3);
+        out.push_str(head);
+        let end = tail
+            .find(|c: char| matches!(c, '/' | '?' | '#') || c.is_whitespace())
+            .unwrap_or(tail.len());
+        let host = tail[..end].rfind('@').map_or(0, |i| i + 1);
+        rest = &tail[host..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_passwords_in_now_playing() {
+        assert_eq!(
+            without_userinfo("rtsp://cam:s3cr@t@10.0.0.2:554/live?x=1"),
+            "rtsp://10.0.0.2:554/live?x=1"
+        );
+        assert_eq!(
+            without_userinfo("http://user@example.com"),
+            "http://example.com"
+        );
+        assert_eq!(
+            without_userinfo("a http://u:p@x/ and ftp://v@y z"),
+            "a http://x/ and ftp://y z"
+        );
+        for kept in [
+            "Big Buck Bunny",
+            "https://example.com/a@b",
+            "user@host",
+            "x://",
+        ] {
+            assert_eq!(without_userinfo(kept), kept);
+        }
     }
 }

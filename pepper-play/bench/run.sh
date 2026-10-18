@@ -18,9 +18,11 @@
 # .txt (the table). Clips by default: every clip clips.sh makes for the
 # bench, and clips/real-1080p.* if there is one. --drag N first drags the
 # box's size about for N seconds (measure.sh --drag); --env sets a variable
-# for the whole bench (the players and the bench's own commands); --player
-# measures that pepper-play instead of building this checkout's. --look runs the checks only eyes can make instead
-# (look.py): a screenshot of colours, and a window drag.
+# for the whole bench (the players and the bench's own commands; a name in
+# capitals, as run.sh's own are lowercase); --player measures that
+# pepper-play instead of building this checkout's. --look runs the checks
+# only eyes can make instead (look.py): a screenshot of colours, and a window
+# drag.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 nl='
@@ -74,14 +76,18 @@ while [ "$#" -gt 0 ]; do
     --player) player=$2 && shift ;;
     --look) look=yes ;;
     --env)
-        case "${2%%=*}" in "" | [!A-Za-z_]* | *[!A-Za-z0-9_]*) die "--env NAME=VALUE" ;; esac
+        # Not one of run.sh's own (lowercase) or IFS: they're exported into
+        # this very shell when run in a tab.
+        case "${2%%=*}" in "" | [!A-Za-z_]* | *[!A-Za-z0-9_]* | *[[:lower:]]* | IFS)
+            die "--env NAME=VALUE, the NAME in capitals and not IFS" ;;
+        esac
         case "$2" in *=*) ;; *) die "--env NAME=VALUE" ;; esac
         case "$2" in *"$nl"*) die "--env: no newlines in values" ;; esac
         envs="$envs$2$nl" && shift
         ;;
     --stamp) stamp=$2 && shift ;;
     --) shift && break ;;
-    -h | --help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' && exit 0 ;;
+    -h | --help) sed -n '/^set -eu$/q;2,$p' "$0" | sed 's/^# \{0,1\}//' && exit 0 ;;
     *) echo "run.sh: unknown option $1 (--help)" >&2 && exit 2 ;;
     esac
     shift
@@ -97,6 +103,14 @@ if [ -n "$new_pepper" ]; then
     # by LaunchServices gets launchd's), its output kept, then a mark that
     # it's done.
     dir=$(mktemp -d "${TMPDIR:-/tmp}/pepper-bench.XXXXXX")
+    # Ghostty splits a direct: command on spaces: under a TMPDIR with any,
+    # the folder goes in /tmp.
+    case "$dir" in
+    *[[:space:]]*)
+        rmdir "$dir" || true
+        dir=$(mktemp -d /tmp/pepper-bench.XXXXXX)
+        ;;
+    esac
     trap 'rm -rf "$dir"' EXIT
     export_line() {
         printf 'export %s\n' "$(q "$1")"
@@ -154,6 +168,8 @@ if [ -z "${PEPPER_PORT:-}" ] || [ -n "${TMUX:-}" ]; then
     echo "run.sh: run it in a Pepper tab (not tmux), or with --new-pepper" >&2
     exit 1
 fi
+# The variables first, for the whole bench: its builds and clips too.
+each_env export
 if [ -z "$player" ]; then
     echo "run.sh: building pepper-play" >&2
     cargo build --release --locked --quiet --manifest-path "$here/../Cargo.toml"
@@ -170,7 +186,6 @@ names=$(printf %s "$clips" | tr , ' ')
 "$here/clips.sh" $names
 # What Pepper and WindowServer cost with nothing playing, to set the rest
 # against.
-each_env export
 [ -z "$idle" ] || "$here/measure.sh" --idle --seconds 20 --label "$label" --out "$out.jsonl"
 for name in $names; do
     "$here/measure.sh" --seconds "$seconds" --label "$label" --out "$out.jsonl" $window \
