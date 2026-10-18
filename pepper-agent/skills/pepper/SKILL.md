@@ -40,7 +40,10 @@ pepper-agent status
   work anywhere.
 - `deps` lists what's missing, with the install command (`chrome` for pages).
   `next` says what to do now. If your commands run in a sandbox, it must let
-  them connect to the Unix sockets in `socket_dir`.
+  them connect to the Unix sockets in `socket_dir`. Through the viewer you
+  then reach only what your sandbox lets you (`SANDBOXED` otherwise): files
+  it lets you read (a page from a file only if you may read its whole
+  folder), nothing off this machine, no stream, no `--allow-remote`.
 
 ## Reviewing a video with the human
 
@@ -138,8 +141,13 @@ open it with `--watch src`), `web shot --selector <it>`, and ask again.
 
 The page is a headless Chrome of the viewer's own, with a fresh profile:
 never the user's, no cookies or logins of theirs. It reaches only this
-machine (localhost, 127.0.0.1, ::1, files) unless opened with
-`--allow-remote`, which only the user should ask for.
+machine (localhost, 127.0.0.1, ::1) unless opened with `--allow-remote`,
+which only the user should ask for. A page from a file is served from its
+own folder on 127.0.0.1 (its `location.href` says so; answers show the
+file): it reaches that folder only, no dot-files (`../` assets don't load;
+serve a site that needs them yourself, on localhost). A page on this machine
+can still send requests to the services on it, so open only pages you
+trust with them.
 
 ## Showing a demo for approval (recordings)
 
@@ -207,7 +215,7 @@ source of the kind. `sources --owner` and `events --owner` give yours only;
 ```sh
 pepper-agent watch out/plot.png --name plot   # shown again each time it's rendered again
 pepper-agent pipe new --name sim              # {"pipe": "<path>", "try": "<a command>"}: write frames into it
-pepper-agent open rtsp://cam.local/stream --name cam --credentials-env CAM   # CAM=user:password in your env
+pepper-agent open rtsp://cam.local/stream --name cam --credentials-env PEPPER_CREDENTIALS_CAM   # PEPPER_CREDENTIALS_CAM=user:password@cam.local in your env
 pepper-agent snapshot cam                     # look at it yourself
 ```
 
@@ -224,9 +232,13 @@ pepper-agent snapshot cam                     # look at it yourself
 - A stream (rtsp://, rtmp://, srt://, udp://, or an http(s) .m3u8) plays live
   with little delay and reconnects by itself (`status` reconnecting,
   `reconnects`). Never put its password in a command: the user exports it
-  (`CAM=user:password`) and you pass `--credentials-env CAM`. A password is
-  never shown: `***` in every answer, label and log. `record start`/`stop`
-  records a stream as it comes, from its next keyframe.
+  (`PEPPER_CREDENTIALS_CAM=user:password@cam.local`: only variables named
+  `PEPPER_CREDENTIALS_…` are read, and sent only to the host they name)
+  and you pass `--credentials-env PEPPER_CREDENTIALS_CAM`. A password is
+  never shown: `***` in every answer, label and log; over a scheme that
+  isn't encrypted (rtsp, rtmp, http, udp, srt) the answer has a `warning` to
+  pass on. `record start`/`stop` records a stream as it comes, from its next
+  keyframe.
 
 ## Looking yourself (no viewer needed for files)
 
@@ -274,7 +286,7 @@ pepper-agent snapshot cam                     # look at it yourself
 | `session new` | `pepper-agent session new --owner agent-2` | Your own sources among other agents'; pass `--session` with every command |
 | `watch <file>` | `pepper-agent watch out/plot.png` | A file shown again each time it's rendered again |
 | `pipe new` | `pepper-agent pipe new --format bgra --size 640x360 --fps 30` | A FIFO whose frames show as a program writes them (y4m, mjpeg, bgra) |
-| `open <stream>` | `pepper-agent open rtsp://cam/s --credentials-env CAM` | A live stream that reconnects; its password from the environment, never shown |
+| `open <stream>` | `pepper-agent open rtsp://cam/s --credentials-env PEPPER_CREDENTIALS_CAM` | A live stream that reconnects; its password from the environment, never shown |
 | `install-skill`, `mcp` | `pepper-agent install-skill` | This guide as a skill; every command as an MCP tool (below) |
 
 Commands act on the focused source unless given `--source NAME` (or a name,
@@ -294,8 +306,8 @@ The human sets these up once, for agents that aren't told to run `guide`:
   or `{"mcpServers": {"pepper": {"command": "pepper-agent", "args": ["mcp"]}}}`
   in a client's config. `web open` is the tool `web_open`; its arguments are
   named as in the usage (`file`, `name`, `play`), with `viewer` and `session`
-  as arguments too. The answer is the command's JSON, and the pictures it
-  names come back as images as well.
+  as arguments too. The answer is the command's JSON, and the pictures
+  pepper-agent made that it names come back as images as well.
 
 ## Events
 
@@ -322,10 +334,12 @@ out). `x`, `y` (and `w`, `h`) are in the source's own units: a video's pixels, a
 page's CSS pixels. `events` options: `--wait SECONDS` (up to 3600) waits for
 one; `--until done` waits for that type (or any of a list, `done,reject`) and
 returns all before it too; `--type point,note`, `--source NAME` and
-`--owner NAME` (a session's sources) filter;
+`--owner NAME` (a session's sources) filter, the event that ends a wait too
+(but a `done`, which is everyone's);
 `--since ID` skips what you've seen. The answer has `events`, `last_id` and
 `events_file`
-(`.pepper/events.jsonl` in the viewer's project).
+(`.pepper/events.jsonl` in the viewer's project the first time, then a new
+`events-<id>.jsonl` there for each viewer).
 
 ## Keys to tell the human
 
@@ -335,13 +349,16 @@ returns all before it too; `--type point,note`, `--source NAME` and
 | `m`, `n` | Mark this moment of a video; write a note (a video pauses while they type) |
 | `i`, `o` | A range of a video: `i` at its start, `o` at its end, then a note ("cut this") |
 | `Enter` | Done: tells you they've finished (`--until done`) |
-| `y`, `x` | Approve or reject what's shown (a cut, a render); after `x`, `n` says why |
+| `y`, `x` | Approve or reject what's shown (a cut, a render); after `x`, `n` says why. Right after a source comes into focus the viewer asks them to press again |
 | `space`, `,` `.`, `←` `→` | A video: pause, a frame back or on, 5 s (`↑` `↓`: 1 min) |
 | the bar, the wheel | A video: click or drag the bar under it to go there; the wheel steps a frame a notch; paused, the label gives the frame |
 | `<`, `>` | A video: to their previous or next mark, note, point or range (◆ on the bar); paused on one, what they wrote shows |
 | `d`, `d` | Delete the mark they're paused on (asks once): you get a `delete` event. Comparing two pictures, `d` shows their difference |
 | wheel, `↑` `↓`, `r` | A page: scroll; reload |
 | `Tab`, `1`–`4`, `z`, `q` | Focus another source; zoom one to the whole pane; quit the viewer |
+
+Keys that arrive all at once (text written into the pane) do nothing, and a
+note's Enter counts only pressed by itself: what the human does is theirs.
 
 ## Errors
 
@@ -351,14 +368,16 @@ returns all before it too; `--type point,note`, `--source NAME` and
 | `NO_SOURCE` | `pepper-agent sources` for names; `open` it first |
 | `NOT_FOUND` | Check the path (relative paths are from your shell's folder), or the selector (`web dom`) |
 | `LOAD_FAILED` | A file: `probe` it. A page: is the dev server running, on that port? A stream: it's tried again by itself; check its address and credentials |
-| `ORIGIN_BLOCKED` | Only this machine's pages open; `--allow-remote` only if the user wants that |
+| `ORIGIN_BLOCKED` | Only this machine's pages open; `--allow-remote` only if the user wants that. A link in the project that leads out of it: open the file it leads to by its own path, if that's what's meant |
 | `LIMIT_REACHED` | Close a source, or ask for a second viewer and use `--viewer` |
 | `TIMEOUT` | Nothing yet: wait again, or `say` something to the human |
 | `BAD_TIME`, `BAD_ARGS` | See the hint's example, or `<command> --help` |
 | `INVALID_PROJECT` | Fix each of `problems` (`at` says where, like `clips[1].out`), then `edit validate` |
 | `MISSING_DEP` | Install what the message names (`brew install ffmpeg`, `brew install mpv`, Chrome); ask the human first for whisper.cpp's model |
-| `NOT_PLAYABLE` | That has no timeline (a page) or no picture |
+| `NOT_PLAYABLE` | That has no timeline (a page) or no picture; or it's a playlist or a list of files: open the media it names |
 | `NOT_OWNER` | Another agent's source: use your own (`sources --owner <you>`); `--force` only if the user asks |
+| `SANDBOXED` | Your sandbox keeps that from you: ask the human to open it, or to let your sandbox read it |
+| `TOO_LONG` | The answer would be over 16 MB: ask for less (`--type`, `--since`, `--source`, a `--selector`) |
 | `UNSUPPORTED`, `FAILED` | Not in this version (devices come later); read the message |
 
 ## Rules
@@ -374,5 +393,6 @@ returns all before it too; `--type point,note`, `--source NAME` and
 - Prefer showing (`open`, `review`, `edit preview`, a live page) to rendering
   new files; render `--quality final` once the human approves.
 - Ask before deleting anything. Don't put passwords in commands; they're
-  logged: a stream's go in an environment variable (`--credentials-env`).
+  logged: a stream's go in an environment variable (`--credentials-env
+  PEPPER_CREDENTIALS_…`).
 - Sharing a viewer, keep to your own sources; `--force` only when the user asks.
