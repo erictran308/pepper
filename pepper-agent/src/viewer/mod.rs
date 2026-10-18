@@ -25,6 +25,7 @@ mod pointing;
 mod record;
 mod screen;
 mod seekbar;
+mod serve;
 mod sharing;
 mod watch;
 mod web;
@@ -33,7 +34,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -75,6 +77,8 @@ const LOG_KEPT: usize = 20;
 /// The most often the screen is drawn.
 const DRAW_EVERY: Duration = Duration::from_millis(40);
 const LOOK_EVERY: Duration = Duration::from_millis(250);
+/// How long a source must have shown in focus before y or x takes it.
+const SEEN_FOR: Duration = Duration::from_millis(500);
 
 /// Event types, as `events --type` takes them.
 pub const EVENT_TYPES: &[&str] = &[
@@ -83,7 +87,8 @@ pub const EVENT_TYPES: &[&str] = &[
 
 /// What the reading and working threads hand the viewer.
 pub enum Msg {
-    Input(Vec<u8>),
+    /// Bytes from the terminal, and when they were read.
+    Input(Vec<u8>, Instant),
     TtyClosed,
     Request(Request),
     Player(u64, player::Event),
@@ -95,25 +100,45 @@ pub enum Msg {
     Job(u64, Result<Value>),
     /// What Pepper says of a box the viewer draws into itself.
     BoxSize(String, pepper::BoxSize),
+    /// Pepper didn't take a box's surfaces: they're offered again later.
+    BoxRefused(String),
+    /// Pepper answered: the viewer's own client, for its pages' boxes.
+    Pepper(Arc<pepper::Client>),
+    /// Pepper didn't answer (yet): said in the log, once.
+    PepperNot(String),
     /// A file changed under a page's --watch folder.
     Watch(u64),
 }
 
-/// A command from an agent, with the connection to answer on.
+/// A command from an agent, with the connection to answer on and who
+/// holds it.
 pub struct Request {
     stream: UnixStream,
     cmd: String,
     args: Value,
+    peer: sys::Peer,
 }
 
 impl Request {
     /// Answers, on a thread of its own: an agent that doesn't read can't
     /// hold up the viewer.
     fn answer(self, result: Result<Value>) {
-        let line = match result {
+        let mut line = match result {
             Ok(value) => proto::answer_ok(value),
             Err(error) => proto::answer_err(&error),
         };
+        // Never more than a command reads (proto::MAX_ANSWER), which would
+        // take an answer cut short for no viewer at all.
+        if line.len() > proto::MAX_ANSWER {
+            line = proto::answer_err(&Error::new(
+                "TOO_LONG",
+                format!(
+                    "the answer would be {} MB: {} MB at most",
+                    line.len() >> 20,
+                    proto::MAX_ANSWER >> 20
+                ),
+            ));
+        }
         let mut stream = self.stream;
         std::thread::spawn(move || {
             let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -183,6 +208,9 @@ struct New {
     owner: Option<String>,
     edit: Option<edit::Timeline>,
     live: Option<live::Live>,
+    /// Whether what the target names is followed: a remote address's, or
+    /// the viewer's own EDL of `edit` ([`Player::load`]).
+    references: bool,
 }
 
 impl Source {
@@ -402,39 +430,58 @@ pub fn run(options: Options) -> Result<()> {
     let id = std::process::id().to_string();
     let socket = proto::socket_path(&dir, &id);
     let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket).map_err(|e| {
+    // Under umask 177 (no thread makes files yet): the socket is the
+    // user's only (0600) from the start, whatever their umask.
+    let listener = sys::with_umask(0o177, || UnixListener::bind(&socket)).map_err(|e| {
         Error::new(
             "FAILED",
             format!("cannot listen at {}: {e}", socket.display()),
         )
     })?;
-    let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
 
     let project = match options.project {
         Some(p) => std::path::absolute(p),
         None => std::env::current_dir(),
     }
     .map_err(|e| Error::new("FAILED", format!("the project folder: {e}")))?;
-    // Not one a project came with that leads elsewhere.
-    let events_file = files::pepper_dir(&project, &[])
-        .map(|d| d.join("events.jsonl"))
-        .ok()
-        .filter(|f| files::plain_or_none(f))
-        .unwrap_or_else(|| dir.join(format!("{id}.events.jsonl")));
-    let shots = dir.join(format!("{id}-shots"));
-    files::private_dir(&shots)
-        .map_err(|e| Error::new("FAILED", format!("{}: {e}", shots.display())))?;
+    // The project's .pepper, held open: the human's events and points'
+    // pictures are written through it, never by its path again (it could
+    // become a link), into files this viewer makes (never one a project
+    // came with, which git may track).
+    let pepper = files::pepper_dir(&project, &[]).and_then(|top| files::Dir::open(&top));
+    let (events_file, events_out) =
+        match pepper.as_ref().map(|top| files::new_events_file(top, &id)) {
+            Ok(Ok((path, file))) => (path, Some(file)),
+            _ => (dir.join(format!("{id}.events.jsonl")), None),
+        };
+    // What it writes (snapshots, recordings, a difference, points'
+    // pictures without a project) goes in a folder of its own outside the
+    // temp folder, which a sandboxed agent's commands may be let write
+    // (proto.rs): no link planted there leads mpv or ffmpeg elsewhere. The
+    // FIFOs of `pipe new`, which the agent's programs write, stay in it.
+    let outputs = proto::outputs_path()
+        .ok_or_else(|| Error::new("FAILED", "this user has no home folder"))?;
+    files::own_dir(&outputs).map_err(|e| Error::new("FAILED", e.to_string()))?;
+    let shots = fresh_dir(&proto::shots_dir(&outputs, &id))?;
+    let pipes = fresh_dir(&dir.join(format!("{id}-pipes")))?;
     let log = options.debug.then(|| dir.join(format!("{id}.log")));
-    let points_dir = files::pepper_dir(&project, &["points"])
-        .unwrap_or_else(|_| dir.join(format!("{id}-points")));
-    files::private_dir(&points_dir)
-        .map_err(|e| Error::new("FAILED", format!("{}: {e}", points_dir.display())))?;
+    let points = match pepper.and_then(|top| top.sub("points")) {
+        Ok(points) => points,
+        Err(_) => {
+            let fallback = outputs.join(format!("{id}-points"));
+            files::own_dir(&fallback)
+                .and_then(|_| files::Dir::open(&fallback))
+                .map_err(|e| Error::new("FAILED", format!("{}: {e}", fallback.display())))?
+        }
+    };
 
     sys::catch_signals();
     let fd = tty.as_raw_fd();
     let mode =
         sys::raw_mode(fd).map_err(|e| Error::new("FAILED", format!("the terminal's mode: {e}")))?;
     let _ = SAVED_MODE.set((fd, mode));
+    let raw =
+        sys::mode(fd).map_err(|e| Error::new("FAILED", format!("the terminal's mode: {e}")))?;
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         give_terminal_back();
@@ -454,22 +501,43 @@ pub fn run(options: Options) -> Result<()> {
         std::thread::spawn(move || read_keys(reader, tx));
     }
     // The viewer's own Mach client, for the boxes it draws into itself (web
-    // pages): Pepper's reports of their sizes come to it.
-    let pepper = match pepper::Client::connect(&port) {
-        Ok(client) => {
-            let tx = tx.clone();
-            let reports = client.reports();
-            std::thread::spawn(move || {
-                while let Some((token, size)) = reports.next() {
-                    if tx.send(Msg::BoxSize(token, size)).is_err() {
-                        return;
+    // pages): Pepper's reports of their sizes come to it. Asked for on a
+    // thread of its own, again each second until Pepper answers (it may be
+    // busy as the viewer starts), so the viewer never waits on it.
+    {
+        let tx = tx.clone();
+        let port = port.clone();
+        std::thread::spawn(move || {
+            let mut told = false;
+            let client = loop {
+                match pepper::Client::connect(&port) {
+                    Ok(client) => break Arc::new(client),
+                    Err(e) => {
+                        if !std::mem::replace(&mut told, true)
+                            && tx.send(Msg::PepperNot(e)).is_err()
+                        {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
                     }
                 }
-            });
-            Some(Arc::new(client))
-        }
-        Err(_) => None,
-    };
+            };
+            let reports = client.reports();
+            if tx.send(Msg::Pepper(client)).is_err() {
+                return;
+            }
+            while let Some(report) = reports.next_report() {
+                let msg = match report {
+                    pepper::Report::Size(token, size) => Msg::BoxSize(token, size),
+                    pepper::Report::Refused(token) => Msg::BoxRefused(token),
+                };
+                if tx.send(msg).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+    let pepper = None;
     let screen = Screen::enter(
         tty.try_clone()
             .map_err(|e| Error::new("FAILED", e.to_string()))?,
@@ -481,7 +549,9 @@ pub fn run(options: Options) -> Result<()> {
         dir: dir.clone(),
         project,
         events_file,
+        events_out,
         shots: shots.clone(),
+        pipes: pipes.clone(),
         pepper_port: port,
         play,
         log,
@@ -490,6 +560,8 @@ pub fn run(options: Options) -> Result<()> {
         screen,
         size: sys::WinSize::default(),
         input: Input::default(),
+        raw,
+        focus_seen: None,
         sources: Vec::new(),
         next_sid: 1,
         focus: None,
@@ -520,7 +592,7 @@ pub fn run(options: Options) -> Result<()> {
         finished: Vec::new(),
         auto_stops: Vec::new(),
         compare: None,
-        points_dir,
+        points_dir: Arc::new(points),
         quit: false,
         dirty: true,
         record_dirty: true,
@@ -541,7 +613,25 @@ pub fn run(options: Options) -> Result<()> {
     let _ = std::fs::remove_file(&socket);
     let _ = std::fs::remove_file(proto::record_path(&dir, &id));
     let _ = std::fs::remove_dir_all(&shots);
+    let _ = std::fs::remove_dir_all(&pipes);
     Ok(())
+}
+
+/// A new, empty folder of the viewer's own at `path`: whatever had the
+/// name (left by a viewer that had the same pid, or put there) goes first.
+fn fresh_dir(path: &Path) -> Result<PathBuf> {
+    let fail = |e: std::io::Error| Error::new("FAILED", format!("{}: {e}", path.display()));
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(path).map_err(fail)?,
+        Ok(_) => std::fs::remove_file(path).map_err(fail)?,
+        Err(_) => {}
+    }
+    // Not made if something has the name again: refused, not shared.
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(path)
+        .map_err(fail)?;
+    Ok(path.to_owned())
 }
 
 fn give_terminal_back() {
@@ -555,13 +645,14 @@ fn give_terminal_back() {
 }
 
 /// Takes connections from this user only, reads each one's request, and
-/// hands the allowed ones to the viewer.
+/// hands the allowed ones to the viewer, with who sent it: whether a
+/// sandbox confines it decides what it may ask (Viewer::sandboxed).
 fn listen(listener: UnixListener, tx: Sender<Msg>) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        if sys::peer_uid(stream.as_raw_fd()) != Some(sys::uid()) {
+        let Some(peer) = sys::peer(stream.as_raw_fd()).filter(|p| p.uid == sys::uid()) else {
             continue;
-        }
+        };
         let tx = tx.clone();
         std::thread::spawn(move || {
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -576,7 +667,12 @@ fn listen(listener: UnixListener, tx: Sender<Msg>) {
             };
             match parsed {
                 Ok((cmd, args)) => {
-                    let _ = tx.send(Msg::Request(Request { stream, cmd, args }));
+                    let _ = tx.send(Msg::Request(Request {
+                        stream,
+                        cmd,
+                        args,
+                        peer,
+                    }));
                 }
                 Err(error) => {
                     let mut stream = stream;
@@ -594,7 +690,10 @@ fn read_keys(mut tty: File, tx: Sender<Msg>) {
         match tty.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
-                if tx.send(Msg::Input(buf[..n].to_vec())).is_err() {
+                if tx
+                    .send(Msg::Input(buf[..n].to_vec(), Instant::now()))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -610,8 +709,13 @@ struct Viewer {
     started: f64,
     dir: PathBuf,
     project: PathBuf,
+    /// Where the human's events go, and the file this viewer made there
+    /// (in its run folder, by path, when there's none).
     events_file: PathBuf,
+    events_out: Option<File>,
     shots: PathBuf,
+    /// The FIFOs of `pipe new`.
+    pipes: PathBuf,
     pepper_port: String,
     play: PathBuf,
     log: Option<PathBuf>,
@@ -620,6 +724,11 @@ struct Viewer {
     screen: Screen,
     size: sys::WinSize,
     input: Input,
+    /// The terminal's raw mode, kept (keep_raw).
+    raw: sys::Termios,
+    /// The focused source as last drawn, its target, and since when: what
+    /// the human has seen, which y and x act on.
+    focus_seen: Option<(u64, String, Instant)>,
     sources: Vec<Source>,
     next_sid: u64,
     focus: Option<usize>,
@@ -663,8 +772,9 @@ struct Viewer {
     auto_stops: Vec<(u64, u64)>,
     /// Two sources side by side, before and after.
     compare: Option<compare::Compare>,
-    /// Where points' pictures go: `.pepper/points/` in the project.
-    points_dir: PathBuf,
+    /// Where points' pictures go: `.pepper/points/` in the project, held
+    /// open.
+    points_dir: Arc<files::Dir>,
     quit: bool,
     dirty: bool,
     record_dirty: bool,
@@ -692,6 +802,12 @@ impl Viewer {
             } else {
                 LOOK_EVERY
             };
+            // A lone ESC waits only a little to be the Esc key.
+            let timeout = if self.input.waiting() {
+                timeout.min(input::ESC_WAIT)
+            } else {
+                timeout
+            };
             match rx.recv_timeout(timeout.max(Duration::from_millis(1))) {
                 Ok(msg) => self.on(msg),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -702,9 +818,16 @@ impl Viewer {
             {
                 self.on(msg);
             }
+            if let Some(key) = self.input.flush(Instant::now()) {
+                self.on_key(key);
+            }
             if sys::RESIZED.swap(false, Ordering::Relaxed) || looked.elapsed() >= LOOK_EVERY {
                 looked = Instant::now();
                 self.look_at_size();
+                self.keep_raw();
+            }
+            if self.screen.stale() {
+                self.dirty = true;
             }
             self.expire_waits();
             self.expire_points();
@@ -730,9 +853,20 @@ impl Viewer {
 
     fn on(&mut self, msg: Msg) {
         match msg {
-            Msg::Input(bytes) => {
-                for key in self.input.feed(&bytes) {
+            Msg::Input(bytes, at) => {
+                if let Some(key) = self.input.flush(at) {
                     self.on_key(key);
+                }
+                let keys = self.input.feed_at(&bytes, at);
+                // Keys that came together, as no one types them: a
+                // terminal's reply, tmux's commands, not the human.
+                let burst = input::burst(&keys);
+                for key in keys {
+                    if burst && !matches!(key, Key::Mouse(_) | Key::Paste(_)) {
+                        self.on_burst_key(key);
+                    } else {
+                        self.on_key(key);
+                    }
                 }
             }
             Msg::TtyClosed => self.quit = true,
@@ -742,6 +876,9 @@ impl Viewer {
             Msg::WebOpened(sid, page) => self.on_web_opened(sid, page),
             Msg::Job(job, result) => self.on_job(job, result),
             Msg::BoxSize(token, size) => self.on_box_size(&token, size),
+            Msg::BoxRefused(token) => self.on_box_refused(&token),
+            Msg::Pepper(client) => self.on_pepper(client),
+            Msg::PepperNot(why) => self.note(&format!("Pepper: {why}; asked again each second")),
             Msg::Watch(sid) => {
                 if !self.on_watch_live(sid) {
                     self.on_watch(sid);
@@ -751,6 +888,17 @@ impl Viewer {
     }
 
     // The pane.
+
+    /// Raw mode again if something changed the terminal's mode (anything
+    /// that can open the pane's terminal can): keys one at a time, ^C a
+    /// key, as the viewer reads them.
+    fn keep_raw(&mut self) {
+        let fd = self.tty.as_raw_fd();
+        if sys::mode(fd).is_ok_and(|mode| mode != self.raw) {
+            let _ = sys::set_mode(fd, &self.raw);
+            self.note("the terminal's mode was changed: raw again");
+        }
+    }
 
     fn look_at_size(&mut self) {
         if let Some(size) = sys::win_size(self.tty.as_raw_fd())
@@ -1028,6 +1176,14 @@ impl Viewer {
                 screen::DIM,
             );
         }
+        // What the human sees in focus, and since when (verdict).
+        let seen = self.focus_seen.as_ref().map(|(s, t, _)| (*s, t.as_str()));
+        let shown = self
+            .focused()
+            .map(|i| (self.sources[i].sid, self.sources[i].target.as_str()));
+        if seen != shown {
+            self.focus_seen = shown.map(|(s, t)| (s, t.to_owned(), Instant::now()));
+        }
         self.screen.draw(out, cols);
         self.dirty = false;
         self.last_draw = Instant::now();
@@ -1042,6 +1198,14 @@ impl Viewer {
 
     fn focused(&self) -> Option<usize> {
         self.focus.filter(|&i| i < self.sources.len())
+    }
+
+    /// A key that came in a burst (`input::burst`): it may add to a note
+    /// being typed, but it never acts (sends the note, approves, quits).
+    fn on_burst_key(&mut self, key: Key) {
+        if self.prompt.is_some() && matches!(key, Key::Char(_)) {
+            self.on_prompt_key(key);
+        }
     }
 
     fn on_key(&mut self, key: Key) {
@@ -1188,7 +1352,27 @@ impl Viewer {
             self.flash("Nothing to approve: no source is open.");
             return;
         };
+        // Only what the human has had in focus a moment: an agent's open
+        // or focus just before the key doesn't take their verdict.
         let source = &self.sources[i];
+        let seen = self
+            .focus_seen
+            .as_ref()
+            .is_some_and(|(sid, target, since)| {
+                *sid == source.sid && *target == source.target && since.elapsed() >= SEEN_FOR
+            });
+        if !seen {
+            let (key, does) = if approve {
+                ("y", "approves")
+            } else {
+                ("x", "rejects")
+            };
+            self.flash(format!(
+                "{} has just come into focus: {key} again {does} it.",
+                source.name
+            ));
+            return;
+        }
         let name = source.name.clone();
         let mut event = Value::obj()
             .with("type", if approve { "approve" } else { "reject" })
@@ -1336,7 +1520,7 @@ impl Viewer {
                 }
             }
         }
-        if let Err(e) = files::append_line(&self.events_file, &full.to_line()) {
+        if let Err(e) = self.write_event(&full.to_line()) {
             self.note(&format!("events file: {e}"));
         }
         self.note(&format!("event {}", full.to_line()));
@@ -1347,47 +1531,24 @@ impl Viewer {
         self.answer_event_waits(false);
     }
 
-    /// Events after `since`, of the types and source asked for; with `until`,
-    /// up to the first of those types (which are always included), and
-    /// whether one came.
-    fn matching(&self, what: &WaitFor) -> (Vec<Value>, bool) {
-        let WaitFor::Events {
-            since,
-            types,
-            source,
-            until,
-            owner,
-        } = what
-        else {
-            return (Vec::new(), false);
-        };
-        let mut out = Vec::new();
-        let mut reached = false;
-        for event in &self.events {
-            let id = event.get_num("id").unwrap_or(0.0) as u64;
-            // A mark the human deleted: the delete event says so.
-            if id <= *since || self.deleted.contains(&id) {
-                continue;
+    /// Adds an event's line to the events file this viewer made. Once that
+    /// file is gone or has another name (its folder replaced, a hard link
+    /// made to it), they go on in the viewer's own folder.
+    fn write_event(&mut self, line: &str) -> std::io::Result<()> {
+        if let Some(file) = &mut self.events_out {
+            if files::alone(file).is_ok() {
+                return file.write_all(format!("{line}\n").as_bytes());
             }
-            let kind = event.get_str("type").unwrap_or("");
-            let is_until = until.iter().any(|u| u == kind);
-            let wanted = is_until
-                || ((types.is_empty() || types.iter().any(|t| t == kind))
-                    && source
-                        .as_deref()
-                        .is_none_or(|s| event.get_str("source") == Some(s))
-                    && owner
-                        .as_deref()
-                        .is_none_or(|o| event.get_str("owner") == Some(o)));
-            if wanted && out.len() < MAX_EVENTS_ANSWERED {
-                out.push(event.clone());
-            }
-            if is_until {
-                reached = true;
-                break;
-            }
+            self.events_out = None;
+            self.events_file = self.dir.join(format!("{}.events.jsonl", self.id));
+            self.note("events file: gone or linked; on in the viewer's folder");
         }
-        (out, reached)
+        files::append_line(&self.events_file, line)
+    }
+
+    /// The events a wait asks for (`matching`), of this viewer's.
+    fn matching(&self, what: &WaitFor) -> (Vec<Value>, bool) {
+        matching(&self.events, &self.deleted, what)
     }
 
     fn events_answer(&self, events: Vec<Value>, since: u64, until: Option<bool>) -> Value {
@@ -1737,8 +1898,97 @@ impl Viewer {
 
     // Requests.
 
-    fn on_request(&mut self, req: Request) {
-        self.note(&format!("request {} {}", req.cmd, req.args.to_line()));
+    /// A request from an agent whose commands run in a sandbox, while the
+    /// viewer runs outside any: nothing its sandbox keeps from it is
+    /// reached through the viewer (`sandboxed_reach`). The files it may
+    /// read are named by their real paths from then on. A page it looks at
+    /// or drives (or snapshots, or records) mustn't show a file it may not
+    /// read: one from a file can go to another (a link, a script).
+    fn sandboxed(&self, req: &mut Request) -> Result<()> {
+        let peer = req.peer;
+        let may_read = |path: &Path| peer.may_read(path);
+        let mut remote_page = false;
+        for i in self.pages_asked(&req.cmd, &req.args) {
+            let Some(web) = &self.sources[i].web else {
+                continue;
+            };
+            remote_page |= web.allow_remote;
+            // A page from a file is served with its folders (serve.rs): all
+            // it may load, whatever its address says now (pushState).
+            let roots = web
+                .page
+                .as_ref()
+                .map(|p| p.served_roots())
+                .unwrap_or_default();
+            let refused =
+                |what: &str| Error::new("SANDBOXED", format!("{} {what}", self.sources[i].name));
+            for root in &roots {
+                if !may_read(root) {
+                    return Err(refused("shows a folder your sandbox keeps from you"));
+                }
+                readable_dir(root, &may_read)?;
+            }
+            if !roots.is_empty() && req.cmd == "record.start" {
+                return Err(refused(
+                    "is a page from a file, which may go to another file while it's recorded: serve it (localhost) to record it",
+                ));
+            }
+        }
+        // A video another agent opened, of a file this one may not read.
+        if matches!(req.cmd.as_str(), "snapshot" | "record.start")
+            && let Ok(i) = self.pick(&req.args)
+        {
+            let s = &self.sources[i];
+            if s.web.is_none() && s.target.starts_with('/') && !may_read(Path::new(&s.target)) {
+                return Err(Error::new(
+                    "SANDBOXED",
+                    format!("{} shows a file your sandbox keeps from you", s.name),
+                ));
+            }
+        }
+        sandboxed_reach(&req.cmd, &mut req.args, &may_read, remote_page)
+    }
+
+    /// The sources a request may act on as pages (pick_web's choice, or
+    /// all it may be): for a web command, a snapshot or a recording.
+    fn pages_asked(&self, cmd: &str, args: &Value) -> Vec<usize> {
+        let pages = |i: &usize| self.sources[*i].web.is_some();
+        if matches!(cmd, "snapshot" | "record.start") {
+            return self.pick(args).into_iter().filter(pages).collect();
+        }
+        if !cmd.starts_with("web.") || cmd == "web.open" {
+            return Vec::new();
+        }
+        if let Some(i) = self.own_source(args, |i| self.sources[i].web.is_some()) {
+            return vec![i];
+        }
+        if let Some(name) = args.get_str("source") {
+            return (0..self.sources.len())
+                .filter(|&i| self.sources[i].name == name)
+                .collect();
+        }
+        match self.focused_web() {
+            Some(i) => vec![i],
+            None => (0..self.sources.len()).filter(pages).collect(),
+        }
+    }
+
+    fn on_request(&mut self, mut req: Request) {
+        // Not in the log: what's typed into a page (a password, maybe), nor
+        // a session's token.
+        let mut logged = req.args.clone();
+        if logged.get("session").is_some() {
+            logged.set("session", "***");
+        }
+        if req.cmd == "web.type" {
+            logged.set("text", "***");
+        }
+        self.note(&format!("request {} {}", req.cmd, logged.to_line()));
+        if req.peer.sandboxed
+            && let Err(e) = self.sandboxed(&mut req)
+        {
+            return req.answer(Err(e));
+        }
         let args = req.args.clone();
         // A session this viewer never gave (or gave before it started
         // again); a new one may still be asked for.
@@ -1948,18 +2198,25 @@ impl Viewer {
                 ));
             }
         };
-        check_target(target)?;
-        let (session, owner) = self.claim(args)?;
+        let mut target = check_target(target, &self.project)?;
         let edit = args
             .get("edit")
             .map(edit::Timeline::from_json)
             .transpose()?;
+        // An edit's preview: the one file whose references are followed, an
+        // EDL the viewer writes itself.
+        let own_edl = args.get_bool("edl") == Some(true);
+        if own_edl {
+            target = self.own_edl(edit.as_ref())?;
+        }
+        let (session, owner) = self.claim(args)?;
         let stream = kind == "stream";
         self.add_source(
             args,
             New {
                 kind,
-                target: target.to_owned(),
+                references: own_edl || player::remote(&target),
+                target,
                 // A stream is live: it plays.
                 play: stream || args.get_bool("play").unwrap_or(false),
                 session,
@@ -1968,6 +2225,51 @@ impl Viewer {
                 live: stream.then(|| live::Live::Stream(live::Streamed::new())),
             },
         )
+    }
+
+    /// An edit preview's EDL (`edl` in an open request) is the viewer's own,
+    /// written in its folder from the timeline sent with it, each clip at
+    /// its real path: a file [`check_target`] takes, that reads as a sound
+    /// or a video by itself (probed: not a playlist, a list or an EDL by
+    /// another name, whose own references mpv would follow too). So what
+    /// mpv opens through it is the clips the answers name, never what a file
+    /// names, and the EDL the command wrote is never read.
+    fn own_edl(&mut self, edit: Option<&edit::Timeline>) -> Result<String> {
+        const O_NOFOLLOW: i32 = 0x0100;
+        let refuse = |why: String| Error::new("BAD_ARGS", format!("an edit preview's EDL: {why}"));
+        let mut own = edit
+            .ok_or_else(|| refuse("no timeline with it".into()))?
+            .clone();
+        for src in &mut own.srcs {
+            if !src.starts_with('/') {
+                return Err(refuse("a clip that isn't a file".into()));
+            }
+            let real = check_target(src, &self.project)?;
+            // A picture or a sound (media::probe's `video`, `audio`).
+            let plain = crate::media::probe(&self.shots, Path::new(&real)).is_ok_and(|p| {
+                p.json.get("video").is_some_and(|v| !v.is_null())
+                    || p.json
+                        .get("audio")
+                        .and_then(Value::arr)
+                        .is_some_and(|a| !a.is_empty())
+            });
+            if !plain {
+                return Err(refuse(format!(
+                    "the clip {} isn't a sound or a video by itself",
+                    text::inert(src, 300)
+                )));
+            }
+            *src = real;
+        }
+        let path = self.output("edit", "edl")?;
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .custom_flags(O_NOFOLLOW)
+            .open(&path)
+            .and_then(|mut f| f.write_all(own.edl().as_bytes()))
+            .map_err(|e| Error::new("FAILED", format!("{}: {e}", path.display())))?;
+        Ok(path.display().to_string())
     }
 
     /// A source with a player, named as the request says: in the box of
@@ -2008,7 +2310,7 @@ impl Viewer {
                 player.set("ab-loop-a", "no");
                 player.set("ab-loop-b", "no");
                 player.set("pause", !new.play);
-                player.command(&["loadfile", &new.target, "replace"]);
+                player.load(&new.target, new.references, None);
             }
             let sid = source.sid;
             self.focus = Some(i);
@@ -2049,7 +2351,7 @@ impl Viewer {
         if new.play {
             player.set("pause", false);
         }
-        player.command(&["loadfile", &load, "replace"]);
+        player.load(&load, new.references, None);
         self.sources.push(Source {
             sid,
             name,
@@ -2227,6 +2529,27 @@ impl Viewer {
         Ok(Value::obj().with("say", self.say.as_deref()))
     }
 
+    /// A new file for a program to write into by name (mpv's snapshot,
+    /// ffmpeg's recording or difference), in the viewer's folder for them:
+    /// `<what>-<n>-<random>.<ext>`, a name no one can guess, made here new
+    /// and empty (never through a link, never over a file) beforehand.
+    fn output(&mut self, what: &str, ext: &str) -> Result<PathBuf> {
+        const O_NOFOLLOW: i32 = 0x0100;
+        self.shot_count += 1;
+        let hex = sys::random_hex().map_err(|e| Error::new("FAILED", format!("a name: {e}")))?;
+        let path = self
+            .shots
+            .join(format!("{what}-{}-{}.{ext}", self.shot_count, &hex[..12]));
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(O_NOFOLLOW)
+            .open(&path)
+            .map_err(|e| Error::new("FAILED", format!("{}: {e}", path.display())))?;
+        Ok(path)
+    }
+
     fn snapshot(&mut self, req: Request) {
         if let Ok(i) = self.pick(&req.args)
             && self.sources[i].web.is_some()
@@ -2241,10 +2564,8 @@ impl Viewer {
                     format!("{} has no picture (sound only)", self.sources[i].name),
                 ));
             }
-            self.shot_count += 1;
-            let path = self
-                .shots
-                .join(format!("{}-{}.png", self.sources[i].sid, self.shot_count));
+            let sid = self.sources[i].sid;
+            let path = self.output(&sid.to_string(), "png")?;
             let source = &mut self.sources[i];
             let mut result = Value::obj()
                 .with("raw", path.display().to_string())
@@ -2662,22 +2983,25 @@ fn clamp_time(t: f64, duration: Option<f64>) -> f64 {
     }
 }
 
-/// What may be loaded: an absolute path to a file, an http(s) address, or
-/// a stream's (rtsp, rtmp, srt, udp). Nothing else reaches mpv's `loadfile`
+/// What may be loaded, and what to load: an absolute path to a file (the
+/// file itself, links resolved; one in `project` that leads out of it is
+/// refused, as `media::real_file` says), an http(s) address, or a
+/// stream's (rtsp, rtmp, srt, udp). Nothing else reaches mpv's `loadfile`
 /// (which would take its own protocols, `av://`, `edl://` and the rest).
-fn check_target(target: &str) -> Result<()> {
+fn check_target(target: &str, project: &Path) -> Result<String> {
     if target.len() > 4096 {
         return Err(Error::new("BAD_ARGS", "the target is too long"));
     }
     // A file's name may hold anything but NUL; it's never shown raw.
     if target.starts_with('/') {
-        if !target.contains('\0') && Path::new(target).is_file() {
-            return Ok(());
+        if target.contains('\0') {
+            return Err(Error::new(
+                "NOT_FOUND",
+                format!("no file at {}", text::inert(target, 300)),
+            ));
         }
-        return Err(Error::new(
-            "NOT_FOUND",
-            format!("no file at {}", text::inert(target, 300)),
-        ));
+        let real = crate::media::real_file(project, Path::new(target))?;
+        return Ok(real.to_string_lossy().into_owned());
     }
     if target.starts_with("https://") || target.starts_with("http://") || live::is_stream(target) {
         if target.chars().any(|c| c.is_control() || c == ' ') {
@@ -2686,12 +3010,298 @@ fn check_target(target: &str) -> Result<()> {
                 "an address holds no spaces or control characters",
             ));
         }
-        return Ok(());
+        return Ok(target.to_owned());
     }
     Err(Error::new(
         "BAD_ARGS",
         "the target must be an absolute path, an http(s) address or a stream's (rtsp, rtmp, srt, udp)",
     ))
+}
+
+/// The web commands that only look at a page; the others drive it.
+const LOOKING: &[&str] = &[
+    "web.shot",
+    "web.console",
+    "web.errors",
+    "web.dom",
+    "web.a11y",
+];
+
+/// What a sandboxed agent may ask of the viewer, which runs outside any
+/// sandbox (mpv and the viewer's Chrome fetch and read for it). A file
+/// only if `may_read` (its sandbox's word) says it may read it as named
+/// and as it really is, links followed, and then by that real path. No
+/// address off this machine, no stream, and no page let reach the network
+/// (`--allow-remote`), opened or driven (`remote_page`: one the request
+/// may drive is).
+fn sandboxed_reach(
+    cmd: &str,
+    args: &mut Value,
+    may_read: &dyn Fn(&Path) -> bool,
+    remote_page: bool,
+) -> Result<()> {
+    let refused = |what: String| Error::new("SANDBOXED", what);
+    let file = |given: &Path| -> Result<PathBuf> {
+        let real = std::fs::canonicalize(given).unwrap_or_else(|_| given.to_owned());
+        if may_read(given) && may_read(&real) {
+            return Ok(real);
+        }
+        Err(refused(format!(
+            "{} is a file your sandbox keeps from you",
+            text::inert(&given.display().to_string(), 300)
+        )))
+    };
+    if cmd.starts_with("web.") && cmd != "web.open" && !LOOKING.contains(&cmd) && remote_page {
+        return Err(refused(
+            "that page may reach the network (--allow-remote): only an agent outside a sandbox drives it"
+                .into(),
+        ));
+    }
+    // An edit's preview: every clip of its timeline plays through its EDL.
+    if cmd == "open" && args.get_bool("edl") == Some(true) {
+        let srcs = args
+            .get("edit")
+            .and_then(|e| e.get("srcs"))
+            .and_then(Value::arr)
+            .unwrap_or(&[]);
+        for src in srcs.iter().filter_map(Value::str) {
+            file(Path::new(src))?;
+        }
+    }
+    let key = match cmd {
+        "open" | "watch" | "web.open" => "target",
+        "web.goto" => "url",
+        _ => return Ok(()),
+    };
+    let page = matches!(cmd, "web.open" | "web.goto") || args.get_str("kind") == Some("web");
+    // A page, by `web open` or `open` (its kind web).
+    if matches!(cmd, "open" | "web.open") {
+        if args.get_bool("allow_remote") == Some(true) {
+            return Err(refused(
+                "--allow-remote would let the page reach the network".into(),
+            ));
+        }
+        if let Some(dir) = args.get_str("watch") {
+            let real = file(Path::new(dir))?;
+            args.set("watch", real.display().to_string());
+        }
+    }
+    let Some(target) = args.get_str(key).map(str::to_owned) else {
+        return Ok(());
+    };
+    if target.starts_with('/') {
+        let real = file(Path::new(&target))?;
+        if page || is_page(&real) {
+            readable_folder(&real, may_read)?;
+        }
+        args.set(key, real.display().to_string());
+    } else if let Some((path, after)) = file_url(&target) {
+        let real = file(&path)?;
+        if page || is_page(&real) {
+            readable_folder(&real, may_read)?;
+        }
+        args.set(key, format!("file://{}{after}", url_path(&real)));
+    } else if live::is_stream(&target) {
+        return Err(refused("a stream comes from the network".into()));
+    } else if target != "about:blank" && !on_this_machine(&target) {
+        return Err(refused(format!(
+            "{} isn't on this machine",
+            text::inert(&text::redact_url(&target), 200)
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a file opens as a page (main.rs's `open_target`).
+fn is_page(file: &Path) -> bool {
+    file.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| ["html", "htm", "xhtml", "svg"].contains(&e.to_ascii_lowercase().as_str()))
+}
+
+/// A page from a file is served with its whole folder (serve.rs): a
+/// sandboxed agent may have one shown only if its sandbox lets it read
+/// every file there. Dot-files aren't served, nor links out of the folder
+/// (a link in it is served as the file it leads to, which is checked).
+fn readable_folder(page: &Path, may_read: &dyn Fn(&Path) -> bool) -> Result<()> {
+    match page.parent() {
+        Some(root) => readable_dir(root, may_read),
+        None => Ok(()),
+    }
+}
+
+/// Every file below `root` readable (`readable_folder`), within MOST
+/// entries, folders counted too.
+fn readable_dir(root: &Path, may_read: &dyn Fn(&Path) -> bool) -> Result<()> {
+    const MOST: usize = 4096;
+    let refused = |what: String| Error::new("SANDBOXED", what);
+    let mut left = vec![root.to_owned()];
+    let mut seen = 0;
+    while let Some(dir) = left.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name().as_bytes().starts_with(b".") {
+                continue;
+            }
+            let (path, Ok(kind)) = (entry.path(), entry.file_type()) else {
+                continue;
+            };
+            seen += 1;
+            if seen > MOST {
+                return Err(refused(format!(
+                    "the page's folder has over {MOST} files to check: serve it yourself (localhost) to show it"
+                )));
+            }
+            if kind.is_dir() {
+                left.push(path);
+            } else if kind.is_file() && !may_read(&path) {
+                return Err(refused(format!(
+                    "the page's folder holds {}, a file your sandbox keeps from you",
+                    text::inert(&path.display().to_string(), 300)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A `file://` address of this machine's: its path, read as a browser
+/// reads it (percent-decoded, `\` as `/`, `.` and `..` taken out), and what
+/// follows the path (`?…`, `#…`).
+fn file_url(url: &str) -> Option<(PathBuf, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let slash = rest.find('/')?;
+    let host = &rest[..slash];
+    if !(host.is_empty() || host.eq_ignore_ascii_case("localhost")) {
+        return None;
+    }
+    let rest = &rest[slash..];
+    let end = rest.find(['?', '#']).unwrap_or(rest.len());
+    let (path, after) = rest.split_at(end);
+    let mut bytes = Vec::with_capacity(path.len());
+    let raw = path.as_bytes();
+    let mut i = 0;
+    while i < raw.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            raw[i],
+            raw.get(i + 1).copied().and_then(hex),
+            raw.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(hi), Some(lo)) => {
+                bytes.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            (b'\\', _, _) => {
+                bytes.push(b'/');
+                i += 1;
+            }
+            (b, _, _) => {
+                bytes.push(b);
+                i += 1;
+            }
+        }
+    }
+    let mut parts: Vec<&[u8]> = Vec::new();
+    for part in bytes.split(|&b| b == b'/') {
+        match part {
+            b"" | b"." => {}
+            b".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    let mut out = PathBuf::from("/");
+    for part in parts {
+        out.push(std::ffi::OsStr::from_bytes(part));
+    }
+    Some((out, after))
+}
+
+/// A path as a `file://` address's, every byte but letters, digits and
+/// `/ - . _ ~` percent-encoded.
+pub(crate) fn url_path(path: &Path) -> String {
+    path.as_os_str()
+        .as_bytes()
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// Whether an http(s) address is of this machine, both as Chrome reads its
+/// host (web::is_local) and as ffmpeg does (up to `/ ? #`, so no `\`).
+fn on_this_machine(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // `*.localhost` is this machine to Chrome, but mpv and ffmpeg ask DNS.
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
+        && !authority.contains('\\')
+        && !name.to_ascii_lowercase().ends_with(".localhost")
+        && web::is_local(url)
+}
+
+/// Events after `since` (none the human deleted), of the types, source and
+/// owner asked for; with `until`, up to the first of those types (which is
+/// in, whatever `types`), and whether one came. What ends a wait is of the
+/// source and owner asked for too, when it's about a source: another
+/// agent's approval doesn't end this one's wait. One about none (`done`,
+/// from Enter) is everyone's.
+fn matching(events: &[Value], deleted: &HashSet<u64>, what: &WaitFor) -> (Vec<Value>, bool) {
+    let WaitFor::Events {
+        since,
+        types,
+        source,
+        until,
+        owner,
+    } = what
+    else {
+        return (Vec::new(), false);
+    };
+    let mut out = Vec::new();
+    let mut reached = false;
+    for event in events {
+        let id = event.get_num("id").unwrap_or(0.0) as u64;
+        // A mark the human deleted: the delete event says so.
+        if id <= *since || deleted.contains(&id) {
+            continue;
+        }
+        let kind = event.get_str("type").unwrap_or("");
+        let theirs = source
+            .as_deref()
+            .is_none_or(|s| event.get_str("source") == Some(s))
+            && owner
+                .as_deref()
+                .is_none_or(|o| event.get_str("owner") == Some(o));
+        let is_until = until.iter().any(|u| u == kind) && (event.get("source").is_none() || theirs);
+        let wanted = is_until || ((types.is_empty() || types.iter().any(|t| t == kind)) && theirs);
+        if wanted && out.len() < MAX_EVENTS_ANSWERED {
+            out.push(event.clone());
+        }
+        if is_until {
+            reached = true;
+            break;
+        }
+    }
+    (out, reached)
 }
 
 /// A source's name: 1 to 64 of A-Z a-z 0-9 . _ / -, from a letter or digit.
@@ -2721,8 +3331,13 @@ mod tests {
 
     #[test]
     fn targets() {
-        assert!(check_target("https://example.com/v").is_ok());
-        assert_eq!(check_target("/no/such/file").unwrap_err().code, "NOT_FOUND");
+        let project = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let check = |target: &str| check_target(target, project);
+        assert_eq!(
+            check("https://example.com/v").unwrap(),
+            "https://example.com/v"
+        );
+        assert_eq!(check("/no/such/file").unwrap_err().code, "NOT_FOUND");
         for bad in [
             "av://lavfi:testsrc",
             "edl://x",
@@ -2730,10 +3345,25 @@ mod tests {
             "fd://3",
             "https://a\nb",
         ] {
-            assert_eq!(check_target(bad).unwrap_err().code, "BAD_ARGS", "{bad}");
+            assert_eq!(check(bad).unwrap_err().code, "BAD_ARGS", "{bad}");
         }
-        assert!(check_target(env!("CARGO_MANIFEST_DIR")).is_err());
-        assert!(check_target(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).is_ok());
+        assert!(check(env!("CARGO_MANIFEST_DIR")).is_err());
+        // The file itself is what's loaded.
+        let manifest = project.join("Cargo.toml").canonicalize().unwrap();
+        let roundabout = concat!(env!("CARGO_MANIFEST_DIR"), "/src/../Cargo.toml");
+        assert_eq!(check(roundabout).unwrap(), manifest.display().to_string());
+
+        // A project's link that leads out of it is refused.
+        let dir =
+            std::env::temp_dir().join(format!("pepper-viewer-targets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("project")).unwrap();
+        std::fs::write(dir.join("secret.mp4"), "x").unwrap();
+        std::os::unix::fs::symlink(dir.join("secret.mp4"), dir.join("project/demo.mp4")).unwrap();
+        let linked = dir.join("project/demo.mp4").display().to_string();
+        let e = check_target(&linked, &dir.join("project")).unwrap_err();
+        assert_eq!(e.code, "ORIGIN_BLOCKED");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2744,11 +3374,213 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_too_long_to_read_is_an_error() {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let req = Request {
+            stream: ours,
+            cmd: "web.dom".into(),
+            args: Value::obj(),
+            peer: sys::Peer::of(sys::uid(), std::process::id(), false),
+        };
+        req.answer(Ok(Value::obj().with("html", "x".repeat(proto::MAX_ANSWER))));
+        let line = proto::read_line(&mut BufReader::new(&theirs), proto::MAX_ANSWER)
+            .unwrap()
+            .unwrap();
+        let answer = crate::json::parse(&line).unwrap();
+        let error = Error::from_json(answer.get("error").unwrap());
+        assert_eq!(error.code, "TOO_LONG", "{}", &line[..line.len().min(200)]);
+    }
+
+    #[test]
+    fn a_wait_ends_on_its_own_agents_events_only() {
+        let event = |id: u64, kind: &str, source: Option<(&str, &str)>| {
+            let mut e = Value::obj().with("id", id).with("type", kind);
+            if let Some((name, owner)) = source {
+                e.set("source", name);
+                e.set("owner", owner);
+            }
+            e
+        };
+        let events = vec![
+            event(1, "approve", Some(("a-app", "alice"))),
+            event(2, "mark", Some(("b", "agent-2"))),
+            event(3, "approve", Some(("b-rec", "agent-2"))),
+            event(4, "done", None),
+        ];
+        let ids = |(got, reached): (Vec<Value>, bool)| {
+            let ids: Vec<u64> = got
+                .iter()
+                .filter_map(|e| e.get_num("id"))
+                .map(|n| n as u64)
+                .collect();
+            (ids, reached)
+        };
+        let wait = |since: u64, until: &[&str], source: Option<&str>, owner: Option<&str>| {
+            WaitFor::Events {
+                since,
+                types: Vec::new(),
+                source: source.map(str::to_owned),
+                until: until.iter().map(|u| (*u).to_owned()).collect(),
+                owner: owner.map(str::to_owned),
+            }
+        };
+        let none = HashSet::new();
+        let at = |what: WaitFor| ids(matching(&events, &none, &what));
+        // Alice's approval doesn't end agent-2's wait; agent-2's does.
+        assert_eq!(
+            at(wait(0, &["approve", "reject"], None, Some("agent-2"))),
+            (vec![2, 3], true)
+        );
+        assert_eq!(
+            at(wait(3, &["approve"], None, Some("agent-2"))),
+            (vec![], false)
+        );
+        assert_eq!(
+            at(wait(0, &["approve"], Some("b-rec"), None)),
+            (vec![3], true)
+        );
+        // Enter's done, about no source, ends anyone's.
+        assert_eq!(
+            at(wait(0, &["done"], None, Some("agent-2"))),
+            (vec![2, 3, 4], true)
+        );
+        assert_eq!(at(wait(0, &["approve"], None, None)), (vec![1], true));
+        // With --type, what ends the wait is in too.
+        let typed = WaitFor::Events {
+            since: 0,
+            types: vec!["mark".into()],
+            source: None,
+            until: vec!["done".into()],
+            owner: None,
+        };
+        assert_eq!(at(typed), (vec![2, 4], true));
+        let deleted = HashSet::from([2]);
+        let what = wait(0, &["done"], None, Some("agent-2"));
+        assert_eq!(ids(matching(&events, &deleted, &what)), (vec![3, 4], true));
+    }
+
+    #[test]
     fn keys_passed_on() {
         assert_eq!(mpv_key(&Key::Char(' ')), Some("SPACE"));
         for kept in ['q', 'Q', '`', 's', 'S', ':', 'm', 'n', 'z', 'l', 'L'] {
             assert_eq!(mpv_key(&Key::Char(kept)), None, "{kept}");
         }
         assert_eq!(mpv_key(&Key::Ctrl('s')), None);
+    }
+
+    #[test]
+    fn a_sandboxed_agent_reaches_no_further_through_the_viewer() {
+        let dir = std::env::temp_dir().join(format!("pepper-sandboxed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (ok, secret) = (dir.join("ok"), dir.join("secret"));
+        std::fs::create_dir_all(&ok).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(ok.join("a.mp4"), "x").unwrap();
+        std::fs::write(ok.join("p.html"), "x").unwrap();
+        std::fs::write(secret.join("s.mp4"), "x").unwrap();
+        std::os::unix::fs::symlink(secret.join("s.mp4"), ok.join("link.mp4")).unwrap();
+        let ok = ok.canonicalize().unwrap();
+        let secret = secret.canonicalize().unwrap();
+        // Its sandbox keeps `secret` from it.
+        let may_read = |p: &Path| !p.starts_with(&secret) && !p.ends_with("hidden.txt");
+        let ask = |cmd: &str, args: Value, remote_page: bool| {
+            let mut args = args;
+            sandboxed_reach(cmd, &mut args, &may_read, remote_page).map(|()| args)
+        };
+        let target = |t: &str| Value::obj().with("target", t);
+        let refused = |r: Result<Value>| r.is_err_and(|e| e.code == "SANDBOXED");
+
+        // Files: by their real paths, links followed.
+        let a = ok.join("a.mp4").display().to_string();
+        assert_eq!(
+            ask("open", target(&a), false).unwrap().get_str("target"),
+            Some(a.as_str())
+        );
+        assert!(refused(ask(
+            "open",
+            target(&secret.join("s.mp4").display().to_string()),
+            false
+        )));
+        assert!(refused(ask(
+            "open",
+            target(&ok.join("link.mp4").display().to_string()),
+            false
+        )));
+        assert!(refused(ask(
+            "watch",
+            target(&ok.join("link.mp4").display().to_string()),
+            false
+        )));
+        let page = format!("file://{}", ok.join("p.html").display());
+        let opened = ask("web.open", target(&page), false).unwrap();
+        assert_eq!(opened.get_str("target"), Some(page.as_str()));
+        let sneaky = format!("file://{}/%2E%2E\\secret/s.mp4#x", ok.display());
+        assert!(refused(ask("web.open", target(&sneaky), false)));
+        let watching = target(&page).with("watch", secret.display().to_string());
+        assert!(refused(ask("web.open", watching, false)));
+        // A page's whole folder is served: all of it must be readable.
+        let mixed = dir.join("mixed");
+        std::fs::create_dir_all(mixed.join("sub")).unwrap();
+        std::fs::write(mixed.join("p.html"), "x").unwrap();
+        std::fs::write(mixed.join("sub").join("hidden.txt"), "x").unwrap();
+        let mixed_page = mixed.canonicalize().unwrap().join("p.html");
+        let mixed_page = mixed_page.display().to_string();
+        assert!(refused(ask("web.open", target(&mixed_page), false)));
+        assert!(refused(ask("open", target(&mixed_page), false)));
+        assert!(ask("open", target(&a), false).is_ok());
+        // An edit's preview: its clips are files it names.
+        let edl = |srcs: Vec<String>| {
+            target(&a)
+                .with("edl", true)
+                .with("edit", Value::obj().with("srcs", srcs))
+        };
+        let s = secret.join("s.mp4").display().to_string();
+        assert!(refused(ask("open", edl(vec![a.clone(), s]), false)));
+        assert!(ask("open", edl(vec![a.clone()]), false).is_ok());
+        // Nothing off this machine.
+        for far in [
+            "https://example.com/v.mp4",
+            "http://127.0.0.1\\@example.com/v.mp4",
+            "http://localhost.example.com/",
+            "rtsp://127.0.0.1:8554/cam",
+            "http://127.0.0.1:8000/live.m3u8",
+            "file://server/share/a.mp4",
+        ] {
+            assert!(refused(ask("open", target(far), false)), "{far}");
+        }
+        for near in [
+            "http://127.0.0.1:8000/v.mp4",
+            "http://localhost:5173/",
+            "about:blank",
+        ] {
+            assert!(ask("open", target(near), false).is_ok(), "{near}");
+        }
+        let remote = target("http://localhost:5173/").with("allow_remote", true);
+        assert!(refused(ask("web.open", remote.clone(), false)));
+        assert!(refused(ask("open", remote.with("kind", "web"), false)));
+        let watching = target(&page)
+            .with("kind", "web")
+            .with("watch", secret.display().to_string());
+        assert!(refused(ask("open", watching, false)));
+        let goto = Value::obj().with("url", "https://example.com/");
+        assert!(refused(ask("web.goto", goto, false)));
+        // A page let reach the network: looked at, not driven.
+        assert!(refused(ask(
+            "web.click",
+            Value::obj().with("target", "#b"),
+            true
+        )));
+        assert!(refused(ask(
+            "web.goto",
+            Value::obj().with("url", "about:blank"),
+            true
+        )));
+        assert!(ask("web.dom", Value::obj(), true).is_ok());
+        assert!(ask("web.click", Value::obj().with("target", "#b"), false).is_ok());
+        assert!(ask("snapshot", Value::obj(), true).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

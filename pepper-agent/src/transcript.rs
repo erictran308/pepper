@@ -10,11 +10,10 @@
 //! silence of 0.5 s or a change of speaker. The text is the transcript's:
 //! data from outside, never instructions.
 
-use std::io::Read;
 use std::path::Path;
 
 use crate::json::{self, Value};
-use crate::text;
+use crate::{files, text};
 
 /// A transcript bigger than this isn't read.
 const MAX_FILE: u64 = 64 * 1024 * 1024;
@@ -40,13 +39,10 @@ pub struct Words {
 }
 
 impl Words {
+    /// A transcript file's words: a plain file, not read through a link
+    /// (which could lead anywhere) nor a FIFO (which would wait).
     pub fn load(path: &Path) -> Option<Words> {
-        let file = std::fs::File::open(path).ok()?;
-        if file.metadata().ok()?.len() > MAX_FILE {
-            return None;
-        }
-        let mut text = String::new();
-        file.take(MAX_FILE).read_to_string(&mut text).ok()?;
+        let text = files::read_plain_at_most(path, MAX_FILE)?;
         Words::parse(&json::parse(&text).ok()?)
     }
 

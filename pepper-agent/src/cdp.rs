@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{PipeReader, PipeWriter, Read, Write};
+use std::io::{BufRead, PipeReader, PipeWriter, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,12 @@ use crate::{sys, text};
 const MAX_MESSAGE: usize = 256 << 20;
 /// How long a command waits for its answer unless told otherwise.
 pub const CALL_WAIT: Duration = Duration::from_secs(15);
+/// The oldest Chrome taken: it opens pages from outside, and one that old
+/// lacks a year or more of fixes.
+const MIN_MAJOR: u32 = 140;
+/// What the browser has of the viewer's environment: none of the viewer's
+/// own (PEPPER_*) or what else the human's shell exports.
+const CHROME_ENV: &[&str] = &["HOME", "TMPDIR", "PATH", "LANG"];
 
 /// A Chromium to run: `PEPPER_CHROME`, an installed Chrome or Chromium, or
 /// Playwright's.
@@ -50,7 +56,8 @@ pub fn find_chrome() -> Option<PathBuf> {
             }
         }
     }
-    // Playwright's, newest first.
+    // Playwright's, newest first: by the build in the folder's name
+    // (chromium-1200 is newer than chromium-999).
     let cache = home?.join("Library/Caches/ms-playwright");
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(&cache)
         .ok()?
@@ -61,7 +68,13 @@ pub fn find_chrome() -> Option<PathBuf> {
                 .is_some_and(|n| n.starts_with("chromium"))
         })
         .collect();
-    dirs.sort();
+    dirs.sort_by_key(|dir| {
+        dir.file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.rsplit('-').next())
+            .and_then(|build| build.parse::<u64>().ok())
+            .unwrap_or(0)
+    });
     dirs.iter().rev().find_map(|dir| {
         [
             "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
@@ -74,6 +87,12 @@ pub fn find_chrome() -> Option<PathBuf> {
         .map(|p| dir.join(p))
         .find(|p| p.is_file())
     })
+}
+
+/// A browser's major version, from its product: `HeadlessChrome/156.0.8078.35`
+/// is 156.
+pub fn major_version(product: &str) -> Option<u32> {
+    product.rsplit('/').next()?.split('.').next()?.parse().ok()
 }
 
 /// An event from the browser. A screencast frame's picture comes out of its
@@ -243,13 +262,20 @@ impl Conn {
         }
     }
 
-    /// The browser went: every waiting command and every session hears so.
+    /// The browser went: every waiting command and every session hears so,
+    /// and its own events' thread ends.
     fn end(&self) {
         self.closed.store(true, Ordering::Relaxed);
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        drop(
+            self.browser_events
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        );
         let routes = std::mem::take(&mut *self.routes.lock().unwrap_or_else(|e| e.into_inner()));
         for tx in routes.values() {
             let _ = tx.send(Event {
@@ -267,18 +293,15 @@ fn gone() -> Error {
 }
 
 /// A screencast frame's picture, taken out of its message before the rest
-/// is read: base64 of a JPEG, megabytes long. Anything else as it is.
+/// is read: base64 of a JPEG, megabytes long. Anything else as it is. Only a
+/// message that starts as Chrome writes the event is one: a page's value in
+/// an answer may hold the same words.
 fn split_frame(message: &[u8]) -> (Cow<'_, [u8]>, Option<Vec<u8>>) {
-    const METHOD: &[u8] = b"\"method\":\"Page.screencastFrame\"";
-    const DATA: &[u8] = b"\"data\":\"";
-    let head = &message[..message.len().min(200)];
-    if find(head, METHOD).is_none() {
+    const HEAD: &[u8] = b"{\"method\":\"Page.screencastFrame\",\"params\":{\"data\":\"";
+    if !message.starts_with(HEAD) {
         return (Cow::Borrowed(message), None);
     }
-    let Some(at) = find(message, DATA) else {
-        return (Cow::Borrowed(message), None);
-    };
-    let start = at + DATA.len();
+    let start = HEAD.len();
     let Some(len) = message[start..].iter().position(|&b| b == b'"') else {
         return (Cow::Borrowed(message), None);
     };
@@ -289,10 +312,6 @@ fn split_frame(message: &[u8]) -> (Cow<'_, [u8]>, Option<Vec<u8>>) {
     rest.extend_from_slice(&message[..start]);
     rest.extend_from_slice(&message[start + len..]);
     (Cow::Owned(rest), Some(data))
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// Base64 (with `+` and `/`, padded or not), or None if it isn't.
@@ -351,6 +370,7 @@ pub struct Browser {
     pub conn: Arc<Conn>,
     pub profile: PathBuf,
     pub version: String,
+    closed: bool,
 }
 
 impl Browser {
@@ -358,17 +378,18 @@ impl Browser {
         let fail = |what: &str, e: std::io::Error| Error::new("FAILED", format!("{what}: {e}"));
         let (from_chrome, chrome_out) = std::io::pipe().map_err(|e| fail("a pipe", e))?;
         let (chrome_in, to_chrome) = std::io::pipe().map_err(|e| fail("a pipe", e))?;
-        let stderr = match log.and_then(|l| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(l)
-                .ok()
-        }) {
-            Some(file) => Stdio::from(file),
+        // Under --debug, its messages go to the viewer's log (`log_lines`).
+        let stderr = match log {
+            Some(_) => Stdio::piped(),
             None => Stdio::null(),
         };
         let mut command = Command::new(chrome);
+        command.env_clear();
+        for key in CHROME_ENV {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         command
             .args([
                 "--headless",
@@ -399,18 +420,22 @@ impl Browser {
             ])
             .arg(format!("--user-data-dir={}", profile.display()))
             .arg("about:blank")
-            .env_remove("PEPPER_TOKEN")
+            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr);
         let (a, b) = (chrome_in.as_raw_fd(), chrome_out.as_raw_fd());
         // SAFETY: as_fd3_and_4 makes only async-signal-safe calls.
         unsafe { command.pre_exec(move || sys::as_fd3_and_4(a, b)) };
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| fail(&format!("cannot run {}", chrome.display()), e))?;
         drop(chrome_in);
         drop(chrome_out);
+        if let (Some(log), Some(stderr)) = (log, child.stderr.take()) {
+            let log = log.to_owned();
+            std::thread::spawn(move || log_lines(stderr, &log));
+        }
         let conn = Arc::new(Conn {
             out: Mutex::new(to_chrome),
             next: AtomicU64::new(1),
@@ -428,15 +453,32 @@ impl Browser {
             conn,
             profile: profile.to_owned(),
             version: String::new(),
+            closed: false,
         };
-        match browser.conn.call(
-            "Browser.getVersion",
-            Value::obj(),
-            None,
-            Duration::from_secs(20),
-        ) {
-            Ok(v) => {
-                browser.version = text::inert(v.get_str("product").unwrap_or(""), 80);
+        let product = browser
+            .conn
+            .call(
+                "Browser.getVersion",
+                Value::obj(),
+                None,
+                Duration::from_secs(20),
+            )
+            .map(|v| v.get_str("product").unwrap_or("").to_owned());
+        match product {
+            Ok(product) if major_version(&product).is_some_and(|m| m < MIN_MAJOR) => {
+                browser.close();
+                Err(Error::new(
+                    "MISSING_DEP",
+                    format!(
+                        "{} is {}, older than Chrome {MIN_MAJOR}",
+                        chrome.display(),
+                        text::inert(&product, 80)
+                    ),
+                )
+                .hint("Update it, or set PEPPER_CHROME to a newer Chrome or Chromium."))
+            }
+            Ok(product) => {
+                browser.version = text::inert(&product, 80);
                 Ok(browser)
             }
             Err(e) => {
@@ -452,6 +494,9 @@ impl Browser {
 
     /// Asks the browser to close, then makes sure; deletes its profile.
     pub fn close(&mut self) {
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
         if !self.conn.is_closed() {
             self.conn.send("Browser.close", Value::obj(), None);
         }
@@ -473,11 +518,43 @@ impl Browser {
     }
 }
 
+impl Drop for Browser {
+    /// One that wasn't closed (it ended, and another took its place) is
+    /// closed all the same: reaped, its profile deleted.
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// The browser's messages into the viewer's log, as the viewer's own lines
+/// go: each on its own, with no password and nothing a terminal acts on.
+fn log_lines(from: impl Read, log: &Path) {
+    let mut reader = std::io::BufReader::new(from);
+    loop {
+        match crate::proto::read_line(&mut reader, 4096) {
+            Ok(Some(line)) => {
+                let line = text::inert(&text::redact_urls(&line), 2000);
+                let at = sys::iso_time(sys::now());
+                let _ = crate::files::append_line(log, &format!("{at} chrome: {line}"));
+            }
+            Ok(None) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                if e.to_string() == crate::proto::TOO_LONG {
+                    let _ = reader.skip_until(b'\n');
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn read_messages(mut from: PipeReader, conn: &Conn) {
     let mut buffer: Vec<u8> = Vec::with_capacity(1 << 20);
     let mut chunk = vec![0u8; 1 << 20];
     // Bytes of `buffer` known to hold no NUL.
     let mut scanned = 0;
+    // A message too large is being dropped, up to its end.
+    let mut dropping = false;
     loop {
         let n = match from.read(&mut chunk) {
             Ok(0) => break,
@@ -489,14 +566,20 @@ fn read_messages(mut from: PipeReader, conn: &Conn) {
         let mut start = 0;
         while let Some(at) = buffer[scanned..].iter().position(|&b| b == 0) {
             let end = scanned + at;
-            conn.dispatch(&buffer[start..end]);
+            if !std::mem::take(&mut dropping) {
+                conn.dispatch(&buffer[start..end]);
+            }
             start = end + 1;
             scanned = start;
         }
         buffer.drain(..start);
         scanned = buffer.len();
+        // Not the whole browser for one page's message: it goes, what
+        // waited for it times out, and the other pages go on.
         if buffer.len() > MAX_MESSAGE {
-            break;
+            buffer.clear();
+            scanned = 0;
+            dropping = true;
         }
     }
     conn.end();
@@ -526,10 +609,68 @@ mod tests {
         let rest = json::parse(std::str::from_utf8(&rest).unwrap()).unwrap();
         assert_eq!(rest.get("params").unwrap().get_num("sessionId"), Some(3.0));
         assert_eq!(rest.get_str("sessionId"), Some("S1"));
-        // Anything else stays as it is.
+        // Anything else stays as it is: an answer, or a value that only
+        // holds the event's words.
         let other = br#"{"id":4,"result":{"data":"aGk="}}"#;
         let (rest, data) = split_frame(other);
         assert!(data.is_none());
         assert_eq!(&rest[..], &other[..]);
+        let value = br#"{"id":5,"result":{"result":{"value":{"method":"Page.screencastFrame","params":{"data":"aGk="}}}}}"#;
+        assert!(split_frame(value).1.is_none());
+    }
+
+    #[test]
+    fn versions() {
+        assert_eq!(major_version("HeadlessChrome/156.0.8078.35"), Some(156));
+        assert_eq!(major_version("Chrome/99.0.1"), Some(99));
+        assert_eq!(major_version("Chromium"), None);
+    }
+
+    /// A Conn read as the viewer reads its browser, and the end the browser
+    /// would write to.
+    fn conn() -> (Arc<Conn>, PipeWriter) {
+        let (_, to_chrome) = std::io::pipe().unwrap();
+        let (from_chrome, writer) = std::io::pipe().unwrap();
+        let conn = Arc::new(Conn {
+            out: Mutex::new(to_chrome),
+            next: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            browser_events: Mutex::new(None),
+            closed: AtomicBool::new(false),
+        });
+        let reading = conn.clone();
+        std::thread::spawn(move || read_messages(from_chrome, &reading));
+        (conn, writer)
+    }
+
+    #[test]
+    fn a_message_too_large_goes_and_the_browser_stays() {
+        let (conn, mut browser) = conn();
+        let (tx, rx) = mpsc::channel();
+        conn.route("S", tx);
+        // Over the cap, in pieces, then a NUL, then an event that's taken.
+        let piece = vec![b'x'; 1 << 20];
+        for _ in 0..(MAX_MESSAGE >> 20) + 2 {
+            browser.write_all(&piece).unwrap();
+        }
+        browser
+            .write_all(
+                b"\0{\"method\":\"Page.loadEventFired\",\"params\":{},\"sessionId\":\"S\"}\0",
+            )
+            .unwrap();
+        let event = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(event.method, "Page.loadEventFired");
+        assert!(!conn.is_closed());
+        // When it goes, sessions hear so and its own events' sender goes.
+        let (btx, brx) = mpsc::channel();
+        conn.on_browser_events(btx);
+        drop(browser);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)).unwrap().method,
+            CLOSED
+        );
+        assert!(brx.recv_timeout(Duration::from_secs(5)).is_err());
+        assert!(conn.is_closed());
     }
 }

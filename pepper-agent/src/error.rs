@@ -85,6 +85,8 @@ pub const CODES: &[&str] = &[
     "NOT_FOUND",
     "NOT_IN_PEPPER",
     "LOAD_FAILED",
+    "SANDBOXED",
+    "TOO_LONG",
     "FAILED",
 ];
 
@@ -124,6 +126,15 @@ fn hint(code: &str) -> &'static str {
         }
         "LOAD_FAILED" => {
             "Check the file with `pepper-agent probe <file>`; for a web address, that yt-dlp is installed."
+        }
+        "SANDBOXED" => {
+            "Your commands run in a sandbox, and the viewer runs outside it: it doesn't open for you \
+             what your sandbox keeps from you (files it can't read, addresses off this machine). Ask \
+             the user to open it, or to run the command outside the sandbox."
+        }
+        "TOO_LONG" => {
+            "The answer would be too long to send: ask for less (a selector that matches fewer \
+             elements, --since for fewer events, --type or --source to filter)."
         }
         _ => "Run `pepper-agent status` to see what's there.",
     }

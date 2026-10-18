@@ -14,7 +14,8 @@
           "enum": [
             "NO_VIEWER", "NO_SOURCE", "NOT_PLAYABLE", "LIMIT_REACHED", "MISSING_DEP", "UNSUPPORTED",
             "PERMISSION_NEEDED", "ORIGIN_BLOCKED", "NOT_OWNER", "INVALID_PROJECT", "TIMEOUT", "BAD_TIME",
-            "BAD_ARGS", "BAD_REQUEST", "NOT_FOUND", "NOT_IN_PEPPER", "LOAD_FAILED", "FAILED"
+            "BAD_ARGS", "BAD_REQUEST", "NOT_FOUND", "NOT_IN_PEPPER", "LOAD_FAILED", "SANDBOXED", "TOO_LONG",
+            "FAILED"
           ]
         },
         "message": {"type": "string", "description": "What happened."},

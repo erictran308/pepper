@@ -111,21 +111,24 @@ class _Client:
         self.rtp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.rtp.bind(("127.0.0.1", 0))
         port = self.rtp.getsockname()[1]
-        sdp_file = tempfile.mktemp(suffix=".sdp")
         rate = self.server.rate
-        self.ffmpeg = subprocess.Popen(
-            ["ffmpeg", "-v", "error", "-re", "-f", "lavfi", "-i",
-             f"testsrc2=size={self.server.size}:rate={rate}", "-c:v", "libx264",
-             "-preset", "ultrafast", "-tune", "zerolatency", "-g", str(rate),
-             "-pix_fmt", "yuv420p", "-f", "rtp", "-sdp_file", sdp_file,
-             f"rtp://127.0.0.1:{port}?rtcpport={port}"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        for _ in range(100):
-            if os.path.exists(sdp_file) and os.path.getsize(sdp_file) > 0:
-                break
-            time.sleep(0.05)
-        sdp = open(sdp_file).read()
-        os.unlink(sdp_file)
+        # ffmpeg writes the SDP by name: in a new folder of our own, not at a
+        # name in the shared temp folder anyone could take first.
+        with tempfile.TemporaryDirectory(prefix="pepper-rtsp-") as tmp:
+            sdp_file = os.path.join(tmp, "stream.sdp")
+            self.ffmpeg = subprocess.Popen(
+                ["ffmpeg", "-v", "error", "-re", "-f", "lavfi", "-i",
+                 f"testsrc2=size={self.server.size}:rate={rate}", "-c:v", "libx264",
+                 "-preset", "ultrafast", "-tune", "zerolatency", "-g", str(rate),
+                 "-pix_fmt", "yuv420p", "-f", "rtp", "-sdp_file", sdp_file,
+                 f"rtp://127.0.0.1:{port}?rtcpport={port}"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            for _ in range(100):
+                if os.path.exists(sdp_file) and os.path.getsize(sdp_file) > 0:
+                    break
+                time.sleep(0.05)
+            with open(sdp_file) as f:
+                sdp = f.read()
         lines = []
         for line in sdp.strip().splitlines():
             if line.startswith("c="):

@@ -22,7 +22,7 @@
 use std::io::{BufRead, BufReader, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Instant;
 
 use crate::error::{Error, Result};
@@ -350,9 +350,10 @@ pub fn transcript_for(project: Option<&Path>, src: &Path) -> Option<PathBuf> {
         dirs.push(dir.join("edit").join("transcripts"));
         dirs.push(dir.join("transcripts"));
     }
+    // Not one that's a link: it could read a file anywhere.
     dirs.iter()
         .flat_map(|d| names.iter().map(move |n| d.join(format!("{n}.json"))))
-        .find(|p| p.is_file())
+        .find(|p| files::is_plain(p))
 }
 
 /// The name a video-use EDL at `project` gives the file `src`, if it is one.
@@ -711,17 +712,15 @@ fn clip(
     let src = match item.get("src") {
         Some(Value::Str(s)) if !s.is_empty() && s.len() <= MAX_PATH && !s.contains('\0') => {
             let path = tidy(&base.join(s));
-            if path.is_file() {
-                Some(path)
-            } else {
-                problems.push(problem(
-                    &at("src"),
-                    format!(
-                        "no file at {}",
-                        text::inert(&path.display().to_string(), 300)
-                    ),
-                ));
-                None
+            // A file in the project (the current folder) that leads out of
+            // it, through a link, isn't footage the project names.
+            let here = std::env::current_dir().unwrap_or_else(|_| base.to_owned());
+            match media::real_file(&here, &path) {
+                Ok(_) => Some(path),
+                Err(e) => {
+                    problems.push(problem(&at("src"), e.message));
+                    None
+                }
             }
         }
         Some(_) => {
@@ -1066,20 +1065,10 @@ pub fn table(project: &Project) -> Vec<Value> {
 }
 
 /// The cut as an mpv EDL: each clip's file and span, played one after the
-/// other with nothing rendered. Paths are length-prefixed (`%N%`), so no
-/// character in them is read as syntax.
+/// other with nothing rendered. The viewer makes the same of the timeline
+/// it's sent, to know the EDL names only those files.
 pub fn edl(project: &Project) -> String {
-    let mut out = String::from("# mpv EDL v0\n");
-    for clip in &project.clips {
-        let path = clip.src.display().to_string();
-        out += &format!(
-            "%{}%{path},start={:.6},length={:.6}\n",
-            path.len(),
-            clip.start,
-            clip.length()
-        );
-    }
-    out
+    Timeline::of(project).edl()
 }
 
 /// Where each clip lands in the output: the map between the output's time
@@ -1131,6 +1120,22 @@ impl Timeline {
             srcs,
             cuts,
         }
+    }
+
+    /// The cut as an mpv EDL ([`edl`]). Paths are length-prefixed (`%N%`),
+    /// so no character in them is read as syntax.
+    pub fn edl(&self) -> String {
+        let mut out = String::from("# mpv EDL v0\n");
+        for cut in &self.cuts {
+            let path = &self.srcs[cut.src];
+            out += &format!(
+                "%{}%{path},start={:.6},length={:.6}\n",
+                path.len(),
+                cut.start,
+                cut.end - cut.start
+            );
+        }
+        out
     }
 
     /// As it goes to the viewer: each file once, the clips by number.
@@ -1352,9 +1357,8 @@ pub fn render_args(
             format!("{:.6}", clip.length()),
             "-hwaccel".into(),
             "videotoolbox".into(),
-            "-i".into(),
-            format!("file:{}", clip.src.display()),
         ]);
+        args.extend(media::input(&clip.src));
     }
     let o = &project.output;
     let (w, h) = (o.width, o.height);
@@ -1442,38 +1446,47 @@ pub fn render_args(
 /// `<project>.draft.mp4`). Never one of the project's files; a file that
 /// exists outside `.pepper/` only with --overwrite.
 fn render_path(work: &Path, project: &Project, ask: &RenderAsk) -> Result<PathBuf> {
-    let Some(given) = &ask.out else {
-        let dir =
-            files::sub_dir(work, &["renders"]).map_err(|e| Error::new("FAILED", e.to_string()))?;
-        let draft = if ask.quality == Quality::Draft {
-            ".draft"
-        } else {
-            ""
-        };
-        return Ok(dir.join(format!("{}{draft}.mp4", project.stem())));
+    let (out, inside) = match &ask.out {
+        None => {
+            let dir = files::sub_dir(work, &["renders"])
+                .map_err(|e| Error::new("FAILED", e.to_string()))?;
+            let draft = if ask.quality == Quality::Draft {
+                ".draft"
+            } else {
+                ""
+            };
+            (dir.join(format!("{}{draft}.mp4", project.stem())), true)
+        }
+        Some(given) => {
+            let out = std::path::absolute(given)
+                .map_err(|e| Error::new("BAD_ARGS", format!("-o: {e}")))?;
+            let shown = text::inert(&out.display().to_string(), 300);
+            let ext = out
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default();
+            if !["mp4", "m4v", "mov"].contains(&ext.as_str()) {
+                return Err(Error::new(
+                    "BAD_ARGS",
+                    format!("-o {shown}: a .mp4, .m4v or .mov file"),
+                ));
+            }
+            // Its folder as it is (no `..`, no links): `.pepper/../x.mp4`
+            // is outside.
+            let (Some(folder), Some(name)) = (
+                out.parent().and_then(|p| p.canonicalize().ok()),
+                out.file_name(),
+            ) else {
+                return Err(Error::new("NOT_FOUND", format!("no folder for {shown}")));
+            };
+            let out = folder.join(name);
+            let inside = work.canonicalize().is_ok_and(|w| out.starts_with(w));
+            (out, inside)
+        }
     };
-    let out = std::path::absolute(given).map_err(|e| Error::new("BAD_ARGS", format!("-o: {e}")))?;
     let shown = text::inert(&out.display().to_string(), 300);
-    let ext = out
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    if !["mp4", "m4v", "mov"].contains(&ext.as_str()) {
-        return Err(Error::new(
-            "BAD_ARGS",
-            format!("-o {shown}: a .mp4, .m4v or .mov file"),
-        ));
-    }
-    // Its folder as it is (no `..`, no links): `.pepper/../x.mp4` is outside.
-    let (Some(folder), Some(name)) = (
-        out.parent().and_then(|p| p.canonicalize().ok()),
-        out.file_name(),
-    ) else {
-        return Err(Error::new("NOT_FOUND", format!("no folder for {shown}")));
-    };
-    let out = folder.join(name);
-    let inside = work.canonicalize().is_ok_and(|w| out.starts_with(w));
+    // Its own render's name too: a link there to a clip isn't written over.
     if let Ok(meta) = std::fs::metadata(&out) {
         if meta.is_dir() {
             return Err(Error::new("BAD_ARGS", format!("{shown} is a folder")));
@@ -1546,7 +1559,7 @@ pub fn render(work: &Path, project: &Project, ask: &RenderAsk) -> Result<Value> 
     let args = render_args(project, &part, format, ask.quality, ask.codec);
     let total = project.duration();
     let started = Instant::now();
-    let mut child = Command::new(&ffmpeg)
+    let mut child = media::command(&ffmpeg)
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2010,6 +2023,17 @@ mod tests {
         );
         assert!(args.contains(&"file:/m/b.mp4".to_string()));
         assert_eq!(args.last().unwrap(), "file:/o/x.mp4");
+        // Each clip read only as a format that reads that file alone.
+        let inputs: Vec<usize> = (0..args.len()).filter(|&i| args[i] == "-i").collect();
+        assert_eq!(inputs.len(), 2);
+        for i in inputs {
+            assert_eq!(args[i - 2], "-format_whitelist");
+            assert!(!args[i - 1].split(',').any(|f| f == "concat" || f == "hls"));
+        }
+        // The viewer's own EDL of the timeline it's sent is the preview's.
+        let back = Timeline::from_json(&Timeline::of(&p).to_json()).unwrap();
+        assert_eq!(back.edl(), edl(&p));
+        assert!(edl(&p).starts_with("# mpv EDL v0\n%8%/m/a.mp4,start=2.000000,length=3.000000\n"));
         // No sound anywhere: none in the output.
         let p = project(vec![cut("/m/b.mp4", 5.0, 9.0, false)]);
         let args = render_args(

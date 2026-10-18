@@ -4,12 +4,14 @@
 
 /// Unicode format characters that change how a line reads without being
 /// seen: bidi embeddings, overrides and isolates, zero-width ones, the soft
-/// hyphen, the byte-order mark.
+/// hyphen, the byte-order mark, Hangul fillers, tag characters and the
+/// supplementary variation selectors.
 pub fn invisible(c: char) -> bool {
     matches!(c,
-        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
+        '\u{00AD}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{180E}' | '\u{200B}'..='\u{200F}'
             | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
+            | '\u{2066}'..='\u{206F}' | '\u{3164}' | '\u{FEFF}' | '\u{FFA0}'
+            | '\u{FFF9}'..='\u{FFFB}' | '\u{E0000}'..='\u{E007F}' | '\u{E0100}'..='\u{E01EF}')
 }
 
 /// `text` on one line, safe to print to a terminal: control characters (C0,
@@ -43,34 +45,40 @@ pub fn typed(text: &str, max: usize) -> String {
 }
 
 /// A URL without a user and password in it: `rtsp://user:pw@host/x` is
-/// shown `rtsp://***@host/x`. Anything else as it is.
+/// shown `rtsp://***@host/x`, and a secret in its query too
+/// (`?passphrase=***`). Anything else as it is.
 pub fn redact_url(url: &str) -> String {
     if let Some((scheme, rest)) = url.split_once("://")
         && !scheme.contains('/')
     {
         let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        if let Some(at) = rest[..end].rfind('@') {
-            return format!("{scheme}://***@{}", &rest[at + 1..]);
-        }
+        let host = match rest[..end].rfind('@') {
+            Some(at) => format!("***@{}", &rest[at + 1..end]),
+            None => rest[..end].to_owned(),
+        };
+        return format!("{scheme}://{host}{}", redact_query(&rest[end..]));
     }
     url.to_owned()
 }
 
 /// `text` with no password in it: every address's user and password
-/// (`scheme://user:pw@host`) shown as `***`, and anything after an HTTP
-/// `Authorization:`. For what other programs say (mpv's and ffmpeg's
-/// messages), which may quote the address they were given.
+/// (`scheme://user:pw@host`) shown as `***`, a secret in its query too, and
+/// anything after an HTTP `Authorization:`. For what other programs say
+/// (mpv's and ffmpeg's messages), which may quote the address they were
+/// given.
 pub fn redact_urls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("://") {
         let (head, tail) = rest.split_at(at + 3);
         out.push_str(head);
-        // Up to where an address's host part surely ends: a password may
-        // hold , ; ) ' and the like as they are.
-        let end = tail
-            .find(|c: char| c.is_whitespace() || "/?#\"<>".contains(c))
-            .unwrap_or(tail.len());
+        // Where another address begins: at its scheme, before its `://`.
+        let next = tail
+            .find("://")
+            .map_or(tail.len(), |n| scheme_start(&tail[..n]));
+        // The host part ends where programs end it, at / ? # (a password
+        // may hold spaces, quotes, , ; ) and the like as they are).
+        let end = tail[..next].find(['/', '?', '#']).unwrap_or(next);
         match tail[..end].rfind('@') {
             Some(user) => {
                 out.push_str("***");
@@ -78,13 +86,77 @@ pub fn redact_urls(text: &str) -> String {
             }
             None => out.push_str(&tail[..end]),
         }
-        rest = &tail[end..];
+        // Its path and query, to a space or a quote.
+        let stop = tail[end..next]
+            .find(|c: char| c.is_whitespace() || "\"'<>".contains(c))
+            .map_or(next, |n| end + n);
+        out.push_str(&redact_query(&tail[end..stop]));
+        rest = &tail[stop..];
     }
     out.push_str(rest);
     match out.to_ascii_lowercase().find("authorization:") {
         Some(at) => format!("{}authorization: ***", &out[..at]),
         None => out,
     }
+}
+
+/// Where the scheme ending `before` begins (`rtsp` in `… rtsp`).
+fn scheme_start(before: &str) -> usize {
+    let mut start = before.len();
+    for (i, c) in before.char_indices().rev() {
+        if !(c.is_ascii_alphanumeric() || "+.-".contains(c)) {
+            break;
+        }
+        start = i;
+    }
+    start
+}
+
+/// Query keys whose values are secrets (an SRT passphrase, a token in an
+/// HLS address, a signed URL's signature).
+const SECRET_KEYS: &[&str] = &[
+    "passphrase",
+    "password",
+    "passwd",
+    "pass",
+    "pwd",
+    "secret",
+    "token",
+    "access_token",
+    "auth",
+    "key",
+    "api_key",
+    "apikey",
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+];
+
+/// An address's path and query (from its host on) with the values of
+/// SECRET_KEYS shown as `***`.
+fn redact_query(path: &str) -> String {
+    let Some((before, query)) = path.split_once('?') else {
+        return path.to_owned();
+    };
+    let (query, fragment) = match query.find('#') {
+        Some(at) => query.split_at(at),
+        None => (query, ""),
+    };
+    let query: String = query
+        .split_inclusive(['&', ';'])
+        .map(|pair| {
+            let body = pair.trim_end_matches(['&', ';']);
+            match body.split_once('=') {
+                Some((key, _)) if SECRET_KEYS.contains(&key.to_ascii_lowercase().as_str()) => {
+                    format!("{key}=***{}", &pair[body.len()..])
+                }
+                _ => pair.to_owned(),
+            }
+        })
+        .collect();
+    format!("{before}?{query}{fragment}")
 }
 
 /// `url` with `credentials` (`user:password`, from an environment
@@ -268,8 +340,31 @@ mod tests {
         );
         assert_eq!(
             redact_urls("a http://u:p@h/x and srt://h:1?passphrase=x \"udp://x:y@z\""),
-            "a http://***@h/x and srt://h:1?passphrase=x \"udp://***@z\""
+            "a http://***@h/x and srt://h:1?passphrase=*** \"udp://***@z\""
         );
+        // A password as it is, spaces and quotes in it, ends at / ? # only;
+        // and no address hides inside another's.
+        for password in ["pa ss", "pa\u{a0}ss", "pa\"ss", "pa<ss>"] {
+            let said = redact_urls(&format!("Failed to open rtsp://cam:{password}@10.0.0.5/s."));
+            assert_eq!(said, "Failed to open rtsp://***@10.0.0.5/s.", "{password}");
+        }
+        assert_eq!(
+            redact_urls("a rtsp://cam1 and rtsp://u:p@cam2/s"),
+            "a rtsp://cam1 and rtsp://***@cam2/s"
+        );
+        assert_eq!(
+            redact_urls("http://a/?u=http://u:p@b/ ok"),
+            "http://a/?u=http://***@b/ ok"
+        );
+        assert_eq!(
+            redact_urls("loading https://h/live.m3u8?Token=abc&x=1#t now"),
+            "loading https://h/live.m3u8?Token=***&x=1#t now"
+        );
+        assert_eq!(
+            redact_url("srt://h:9000?mode=caller;passphrase=s3cret"),
+            "srt://h:9000?mode=caller;passphrase=***"
+        );
+        assert_eq!(redact_url("https://h/p?q=1"), "https://h/p?q=1");
         assert_eq!(redact_urls("no address, a@b"), "no address, a@b");
         for password in ["pa;ss", "pa,ss", "pa)ss", "pa'ss", "pa]ss", "pa}ss"] {
             let said = redact_urls(&format!("Failed to open rtsp://cam:{password}@10.0.0.5/s."));
@@ -302,6 +397,8 @@ mod tests {
     fn inert_text() {
         assert_eq!(inert("a\x1b]2;x\x07b", 100), "a\\u{1b}]2;x\\u{7}b");
         assert_eq!(inert("evil\u{202e}txt", 100), "evil\\u{202e}txt");
+        // A Hangul filler (a blank that isn't a space) and a tag character.
+        assert_eq!(inert("a\u{3164}b\u{e0041}", 100), "a\\u{3164}b\\u{e0041}");
         assert_eq!(inert("abcdef", 3), "abc…");
         assert!(inert("\u{9b}31m\r\n", 10).chars().all(|c| !c.is_control()));
         assert_eq!(typed("a\x1b[31mb\u{200b}c\td", 100), "a[31mbcd");

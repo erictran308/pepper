@@ -9,7 +9,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread::JoinHandle;
@@ -153,7 +153,8 @@ fn write_frames(
     drop(stdin);
     let status = child.wait();
     let errors = errors.and_then(|e| e.join().ok()).unwrap_or_default();
-    if !status.is_ok_and(|s| s.success()) || !path.is_file() {
+    // Made empty beforehand (Viewer::output): written, and still its own.
+    if !status.is_ok_and(|s| s.success()) || !crate::proto::lone_file(path) {
         let tail = errors.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         return Err(Error::new(
             "FAILED",
@@ -186,7 +187,7 @@ fn spawn(
     path: &Path,
     (w, h): (u32, u32),
 ) -> Result<(Child, ChildStdin, JoinHandle<String>)> {
-    let mut child = Command::new(ffmpeg)
+    let mut child = media::command(ffmpeg)
         .args(["-nostdin", "-v", "error", "-y", "-f", "image2pipe", "-framerate"])
         .arg(FPS.to_string())
         .args(["-c:v", "mjpeg", "-i", "pipe:0", "-vf"])
@@ -264,10 +265,7 @@ impl Viewer {
                 .and_then(|w| w.page.clone())
                 .ok_or_else(|| Error::new("TIMEOUT", "the page is still loading"))?;
             let ffmpeg = media::tool("ffmpeg")?;
-            self.shot_count += 1;
-            let path = self
-                .shots
-                .join(format!("rec-{sid}-{}.mp4", self.shot_count));
+            let path = self.output(&format!("rec-{sid}"), "mp4")?;
             let recorder = WebRecorder::start(ffmpeg, path, page.last_frame());
             page.record_to(Some(recorder.sender()));
             Recording {
@@ -284,10 +282,7 @@ impl Viewer {
             .is_some_and(|l| l.records_as_it_comes())
         {
             // What comes is all there is: mpv writes it as it gets it.
-            self.shot_count += 1;
-            let path = self
-                .shots
-                .join(format!("rec-{sid}-{}.mkv", self.shot_count));
+            let path = self.output(&format!("rec-{sid}"), "mkv")?;
             if let Some(player) = &mut self.sources[i].player {
                 player.set("stream-record", path.display().to_string());
             }
@@ -528,6 +523,7 @@ enum Finished {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn a_still_page_records_as_a_still_picture() {

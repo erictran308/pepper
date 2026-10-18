@@ -5,6 +5,7 @@
 //! styles), and the note the human writes in the prompt that opens. The
 //! event goes once both are in.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::input::Mouse;
@@ -222,10 +223,23 @@ impl Viewer {
         if let Some(web) = &source.web {
             pending.event.set("viewport", web.device.to_json());
             if let Some(page) = web.page.clone() {
-                let dir = self.points_dir.clone();
+                let points = self.points_dir.clone();
                 let job = self.spawn_job(move || {
                     let region = region.map(|r| r.map(|n| n.max(0.0)));
-                    page.capture(x, y, region, &dir, &stem)
+                    // The page writes its pictures by path: into a folder
+                    // made in the held points folder, whose path leads
+                    // nowhere if `.pepper` became a link; then moved in.
+                    let fail = |e: std::io::Error| Error::new("FAILED", format!("points: {e}"));
+                    let (name, stage) = points.stage().map_err(fail)?;
+                    let made = page
+                        .capture(x, y, region, stage.path(), &stem)
+                        .and_then(|got| keep(&points, &stage, got).map_err(fail));
+                    for part in ["full", "crop"] {
+                        let _ = stage.remove(&format!("{stem}-{part}.png"));
+                        let _ = stage.remove(&format!("{stem}-{part}.small.png"));
+                    }
+                    let _ = points.remove_dir(&name);
+                    made
                 });
                 self.point_jobs.insert(job, id);
             }
@@ -244,18 +258,22 @@ impl Viewer {
                 None => [x - AROUND.0 / 2.0, y - AROUND.1 / 2.0, AROUND.0, AROUND.1],
             };
             let crop = clamp_crop(near, size);
-            self.shot_count += 1;
-            let raw = self
-                .shots
-                .join(format!("point-{}-{}.png", source.sid, self.shot_count));
-            let path = raw.display().to_string();
-            let request = self.sources[i]
-                .player
-                .as_mut()
-                .map(|p| p.command(&["screenshot-to-file", &path, "video"]));
-            match request {
-                Some(request) => pending.shot = Some((request, raw, crop)),
-                None => pending.capture = Some(Err(Error::new("FAILED", "its player ended"))),
+            let sid = source.sid;
+            match self.output(&format!("point-{sid}"), "png") {
+                Ok(raw) => {
+                    let path = raw.display().to_string();
+                    let request = self.sources[i]
+                        .player
+                        .as_mut()
+                        .map(|p| p.command(&["screenshot-to-file", &path, "video"]));
+                    match request {
+                        Some(request) => pending.shot = Some((request, raw, crop)),
+                        None => {
+                            pending.capture = Some(Err(Error::new("FAILED", "its player ended")))
+                        }
+                    }
+                }
+                Err(e) => pending.capture = Some(Err(e)),
             }
         }
         let resume = pause_for_note(&mut self.sources[i]);
@@ -300,23 +318,39 @@ impl Viewer {
             self.finish_point(id);
             return true;
         }
+        // Only the file made for the player, nothing put in its place.
+        if !crate::proto::lone_file(&raw) {
+            self.points[k].capture = Some(Err(Error::new(
+                "FAILED",
+                "the snapshot isn't the viewer's own file",
+            )));
+            self.finish_point(id);
+            return true;
+        }
         let stem = raw.with_extension("");
         let name = stem
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("point")
             .to_owned();
-        let dir = self.points_dir.clone();
+        let points = self.points_dir.clone();
         let job = self.spawn_job(move || {
-            let full = dir.join(format!("{name}-full.png"));
-            let near = dir.join(format!("{name}-crop.png"));
-            let made = media::shrink_png(&raw, &full, None, media::MAX_SIDE)
-                .and_then(|_| media::shrink_png(&raw, &near, Some(crop), media::MAX_SIDE));
+            let (full, near) = (format!("{name}-full.png"), format!("{name}-crop.png"));
+            // Made as bytes, written through the held points folder: never
+            // where its path may lead now.
+            let made = media::shrunk_png(&raw, None, media::MAX_SIDE).and_then(|(whole, _)| {
+                let (part, shrunk) = media::shrunk_png(&raw, Some(crop), media::MAX_SIDE)?;
+                points
+                    .write(&full, &whole)
+                    .and_then(|_| points.write(&near, &part))
+                    .map_err(|e| Error::new("FAILED", format!("points: {e}")))?;
+                Ok(shrunk)
+            });
             let _ = std::fs::remove_file(&raw);
             let shrunk = made?;
             Ok(Value::obj()
-                .with("snapshot", full.display().to_string())
-                .with("crop", near.display().to_string())
+                .with("snapshot", points.path().join(&full).display().to_string())
+                .with("crop", points.path().join(&near).display().to_string())
                 .with(
                     "crop_rect",
                     shrunk
@@ -403,6 +437,24 @@ impl Viewer {
             self.captured(id, Err(Error::new("NO_SOURCE", "the source was closed")));
         }
     }
+}
+
+/// A web point's capture, its pictures made in `stage`: moved into
+/// `points`, and named there.
+fn keep(points: &files::Dir, stage: &files::Dir, mut got: Value) -> std::io::Result<Value> {
+    for key in ["snapshot", "crop"] {
+        let Some(name) = got
+            .get_str(key)
+            .and_then(|p| Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            .map(str::to_owned)
+        else {
+            continue;
+        };
+        points.adopt(stage, &name, &name)?;
+        got.set(key, points.path().join(&name).display().to_string());
+    }
+    Ok(got)
 }
 
 /// A crop inside a source of `size`, at least 16 pixels each way, in whole

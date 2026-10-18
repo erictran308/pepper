@@ -3,14 +3,17 @@
 //! agent's `web` commands, and pointed at by the human.
 //!
 //! Each page has a browser context of its own (cookies, storage, cache).
-//! By default it reaches only this machine: the context's proxy is a port
-//! that answers nothing, bypassed only for localhost, 127.0.0.1 and ::1, so
-//! neither the page nor anything it loads reaches the network unless it was
-//! opened with --allow-remote. What the page says (its title, console,
-//! errors, element text) is the page's: it's escaped wherever it's shown.
+//! By default it reaches only this machine: the context's proxy is a dead
+//! end the viewer holds (`serve.rs`), bypassed only for localhost,
+//! 127.0.0.1 and ::1, so neither the page nor anything it loads reaches the
+//! network unless it was opened with --allow-remote. A page from a file is
+//! its folder, served on 127.0.0.1: the browser never loads `file:`. What
+//! the page says (its title, console, errors, element text) is the page's:
+//! it's clipped where it's kept, and escaped wherever it's shown.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
@@ -18,13 +21,33 @@ use std::time::{Duration, Instant};
 use super::Msg;
 use super::frames::FrameMsg;
 use super::record::RecMsg;
+use super::serve::{self, DeadEnd, FileServer};
 use crate::cdp::{self, Browser, CALL_WAIT, Conn, Event};
 use crate::error::{Error, Result};
 use crate::json::Value;
 use crate::{files, media, text};
 
-/// A proxy that answers nothing: everything not bypassed fails to connect.
-const NO_PROXY: &str = "http://127.0.0.1:9";
+/// What of itself a page has kept or answered, at most: its title, a
+/// request's method and address, its address.
+const MAX_TITLE: usize = 300;
+const MAX_METHOD: usize = 40;
+const MAX_URL: usize = 2000;
+/// The deepest indent of `web a11y`'s lines.
+const MAX_INDENT: usize = 40;
+/// None of the user's devices or clipboard for a page, whatever the
+/// browser's defaults.
+const DENIED: &[&str] = &[
+    "camera",
+    "microphone",
+    "geolocation",
+    "notifications",
+    "clipboard-read",
+    "clipboard-write",
+    "display-capture",
+];
+/// The page's title, from pepper-agent's world (the page's script can't
+/// change what runs there), not too long to keep.
+const TITLE_JS: &str = "function() { return String(document.title).slice(0, 300); }";
 /// What a page without --allow-remote reaches: this machine. `<-loopback>`
 /// takes away Chrome's own bypass, which would add link-local addresses
 /// (169.254/16, fe80::/10), out on the network; it goes first, as rules are
@@ -129,9 +152,10 @@ impl Device {
 }
 
 /// Whether `url` may be opened without --allow-remote: a page on this
-/// machine (localhost, a name under .localhost, 127.x.x.x, ::1), a file,
-/// or a blank page. Read as Chrome reads it: `\` ends the host as `/`
-/// does, and 127.1 is 127.0.0.1.
+/// machine (localhost, a name under .localhost, 127.x.x.x, ::1) or a blank
+/// page. A file isn't an address the browser loads: it's served from
+/// 127.0.0.1 (`Page::navigate`). Read as Chrome reads it: `\` ends the host
+/// as `/` does, and 127.1 is 127.0.0.1.
 pub fn is_local(url: &str) -> bool {
     if url == "about:blank" {
         return true;
@@ -140,7 +164,6 @@ pub fn is_local(url: &str) -> bool {
         return false;
     };
     match scheme.to_ascii_lowercase().as_str() {
-        "file" => true,
         "http" | "https" => {
             let authority = rest.split(['/', '\\', '?', '#']).next().unwrap_or("");
             let host = authority.rsplit('@').next().unwrap_or("");
@@ -157,6 +180,18 @@ pub fn is_local(url: &str) -> bool {
                     .is_ok_and(|ip| ip.is_loopback())
                 || ipv4(&host).is_some_and(|ip| ip.is_loopback())
         }
+        _ => false,
+    }
+}
+
+/// Whether a request for `url` goes to the dead end when its page is kept
+/// to this machine: a web address that isn't on it.
+fn off_machine(url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "http" | "https" | "ws" | "wss" => !is_local(&format!("http://{rest}")),
         _ => false,
     }
 }
@@ -228,13 +263,19 @@ pub struct Host {
     user_agent: String,
     /// Whether its screencasts keep one frame out at a time (FRAME_GAP).
     one_in_flight: bool,
+    /// The proxy of pages kept to this machine: held while the browser runs.
+    dead_end: DeadEnd,
 }
 
 impl Host {
     pub fn launch(chrome: &Path, profile: &Path, log: Option<&Path>) -> Result<Arc<Host>> {
+        let dead_end =
+            DeadEnd::start().map_err(|e| Error::new("FAILED", format!("the pages' proxy: {e}")))?;
         files::private_dir(profile)
             .map_err(|e| Error::new("FAILED", format!("{}: {e}", profile.display())))?;
-        let mut browser = Browser::launch(chrome, profile, log)?;
+        let mut browser = Browser::launch(chrome, profile, log).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(profile);
+        })?;
         let conn = browser.conn.clone();
         let version = conn.call("Browser.getVersion", Value::obj(), None, CALL_WAIT);
         let user_agent = version
@@ -248,9 +289,7 @@ impl Host {
             .as_ref()
             .ok()
             .and_then(|v| v.get_str("product"))
-            .and_then(|p| p.rsplit('/').next())
-            .and_then(|v| v.split('.').next())
-            .and_then(|major| major.parse::<u32>().ok())
+            .and_then(cdp::major_version)
             .is_some_and(|major| major >= ONE_IN_FLIGHT_FROM);
         if let Err(e) = conn.call(
             "Target.setDiscoverTargets",
@@ -267,6 +306,7 @@ impl Host {
             pages: Mutex::new(HashMap::new()),
             user_agent,
             one_in_flight,
+            dead_end,
         });
         let (tx, rx) = mpsc::channel();
         conn.on_browser_events(tx);
@@ -384,6 +424,8 @@ pub struct Page {
     /// When its screencast's last frame was acked, and its size.
     acked: Mutex<Instant>,
     cast: Mutex<Option<(u32, u32)>>,
+    /// The folders of the files it shows, served (made with the first).
+    served: Mutex<Option<FileServer>>,
 }
 
 /// What `open` asks for.
@@ -408,7 +450,7 @@ pub fn open(
     let conn = host.conn.clone();
     let mut params = Value::obj().with("disposeOnDetach", true);
     if !ask.allow_remote {
-        params.set("proxyServer", NO_PROXY);
+        params.set("proxyServer", host.dead_end.proxy());
         params.set("proxyBypassList", LOCAL_ONLY);
     }
     let context = conn
@@ -417,14 +459,27 @@ pub fn open(
         .unwrap_or("")
         .to_owned();
     let made = (|| {
-        let _ = conn.call(
+        // No downloads, and none of the user's devices or clipboard: if the
+        // browser can't promise that, no page.
+        conn.call(
             "Browser.setDownloadBehavior",
             Value::obj()
                 .with("behavior", "deny")
                 .with("browserContextId", context.as_str()),
             None,
             CALL_WAIT,
-        );
+        )?;
+        for name in DENIED {
+            conn.call(
+                "Browser.setPermission",
+                Value::obj()
+                    .with("permission", Value::obj().with("name", *name))
+                    .with("setting", "denied")
+                    .with("browserContextId", context.as_str()),
+                None,
+                CALL_WAIT,
+            )?;
+        }
         let target = conn
             .call(
                 "Target.createTarget",
@@ -495,6 +550,7 @@ pub fn open(
         recorder: Mutex::new(None),
         acked: Mutex::new(Instant::now()),
         cast: Mutex::new(None),
+        served: Mutex::new(None),
     });
     lock(&host.pages).insert(target, Arc::downgrade(&page));
     {
@@ -609,6 +665,8 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                     let mut state = page.state();
                     state.main_frame = frame.get_str("id").map(str::to_owned);
                     state.world = None;
+                    // A new document: the last one's requests are over.
+                    state.requests.clear();
                     if let Some(url) = frame.get_str("url") {
                         state.url = format!("{url}{}", frame.get_str("urlFragment").unwrap_or(""));
                     }
@@ -665,7 +723,8 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                     .with("level", params.get_str("type").unwrap_or("log"))
                     .with("text", clip(&args.join(" "), 2000));
                 if let Some(frame) = first_frame(params.get("stackTrace")) {
-                    entry.set("url", clip(frame.get_str("url").unwrap_or(""), 500));
+                    let url = page.shown(frame.get_str("url").unwrap_or(""));
+                    entry.set("url", clip(&url, 500));
                     entry.set("line", frame.get_num("lineNumber").map(|l| l + 1.0));
                 }
                 page.console(entry);
@@ -677,7 +736,7 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                     .with("text", clip(entry.get_str("text").unwrap_or(""), 2000))
                     .with("from", entry.get_str("source").unwrap_or(""));
                 if let Some(url) = entry.get_str("url") {
-                    out.set("url", clip(url, 500));
+                    out.set("url", clip(&page.shown(url), 500));
                 }
                 page.console(out);
             }
@@ -692,7 +751,7 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                     .with("kind", "exception")
                     .with("text", clip(text, 2000));
                 if let Some(url) = details.get_str("url") {
-                    error.set("url", clip(url, 500));
+                    error.set("url", clip(&page.shown(url), 500));
                     error.set("line", details.get_num("lineNumber").map(|l| l + 1.0));
                     error.set("column", details.get_num("columnNumber").map(|c| c + 1.0));
                 }
@@ -708,13 +767,10 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                     let request = params.get("request").unwrap_or(&Value::Null);
                     let mut state = page.state();
                     if state.requests.len() < REQUESTS_KEPT {
-                        state.requests.insert(
-                            id.to_owned(),
-                            (
-                                request.get_str("method").unwrap_or("GET").to_owned(),
-                                request.get_str("url").unwrap_or("").to_owned(),
-                            ),
-                        );
+                        // Only what an error says of it, clipped: a page chooses both.
+                        let method = clip(request.get_str("method").unwrap_or("GET"), MAX_METHOD);
+                        let url = clip(request.get_str("url").unwrap_or(""), 500);
+                        state.requests.insert(id.to_owned(), (method, url));
                     }
                     state.last_request = Instant::now();
                 }
@@ -733,7 +789,10 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                             .with("kind", "http")
                             .with("status", status)
                             .with("method", method)
-                            .with("url", clip(response.get_str("url").unwrap_or(""), 500)),
+                            .with(
+                                "url",
+                                clip(&page.shown(response.get_str("url").unwrap_or("")), 500),
+                            ),
                     );
                 }
             }
@@ -756,12 +815,15 @@ fn page_events(page: &Arc<Page>, rx: Receiver<Event>, frames: &Sender<FrameMsg>)
                         .with("kind", "network")
                         .with("text", clip(params.get_str("errorText").unwrap_or(""), 300))
                         .with("method", method)
-                        .with("url", clip(&url, 500));
+                        .with("url", clip(&page.shown(&url), 500));
                     if let Some(reason) = params.get_str("blockedReason") {
                         error.set("blocked", reason);
                     }
+                    // It went to the dead end (`serve.rs`), which cuts it off.
                     if !page.allow_remote
-                        && params.get_str("errorText") == Some("net::ERR_PROXY_CONNECTION_FAILED")
+                        && (off_machine(&url)
+                            || params.get_str("errorText")
+                                == Some("net::ERR_PROXY_CONNECTION_FAILED"))
                     {
                         error.set("note", "not on this machine: open the page with --allow-remote to let it reach the network");
                     }
@@ -859,10 +921,13 @@ impl Page {
         }
         let page = self.clone();
         std::thread::spawn(move || {
-            let title = page.run("function() { return document.title; }", Vec::new());
+            let title = match page.run(TITLE_JS, Vec::new()) {
+                Ok(Value::Str(title)) => Some(clip(&title, MAX_TITLE)),
+                _ => None,
+            };
             let mut state = page.state();
             state.title_asked = false;
-            if let Ok(Value::Str(title)) = title
+            if let Some(title) = title
                 && state.title != title
             {
                 state.title = title;
@@ -909,7 +974,7 @@ impl Page {
         }
     }
 
-    /// Closes the page and its context.
+    /// Closes the page and its context, and stops serving its files.
     pub fn close(&self) {
         self.conn.send(
             "Target.closeTarget",
@@ -918,6 +983,42 @@ impl Page {
         );
         dispose(&self.conn, &self.context);
         self.conn.unroute(&self.session);
+        let served = lock(&self.served).take();
+        drop(served);
+    }
+
+    /// The folders its files are served from (serve.rs), if it's a page
+    /// from a file: all it may load.
+    pub fn served_roots(&self) -> Vec<PathBuf> {
+        lock(&self.served)
+            .as_ref()
+            .map(FileServer::roots)
+            .unwrap_or_default()
+    }
+
+    /// An address as answers and the label show it: a file it serves as
+    /// that file's `file:` address, no password in it, and not too long.
+    pub fn shown(&self, url: &str) -> String {
+        let url = lock(&self.served)
+            .as_ref()
+            .and_then(|s| s.file_url(url))
+            .unwrap_or_else(|| text::redact_url(url));
+        clip(&url, MAX_URL)
+    }
+
+    /// A file: address as the browser gets it: the file in its folder,
+    /// served on 127.0.0.1 by the page's own server (made with its first).
+    fn served_url(&self, url: &str) -> Result<String> {
+        let (file, rest) = serve::file_path(url).ok_or_else(serve::not_a_path)?;
+        let mut served = lock(&self.served);
+        let server = match served.as_mut() {
+            Some(server) => server,
+            None => served
+                .insert(FileServer::start().map_err(|e| {
+                    Error::new("FAILED", format!("serving the page's folder: {e}"))
+                })?),
+        };
+        Ok(server.url(&file)? + &rest)
     }
 
     pub fn emulate(&self, device: &Device, dark: bool, desktop_ua: &str) -> Result<()> {
@@ -999,6 +1100,13 @@ impl Page {
 
     fn check_origin(&self, url: &str) -> Result<()> {
         check_url(url)?;
+        // A file is served (`navigate`): the browser never loads one itself.
+        if serve::is_file_url(url) {
+            return Err(Error::new(
+                "ORIGIN_BLOCKED",
+                "the browser doesn't load file: addresses: open the file itself (`pepper-agent web open <file>`)",
+            ));
+        }
         if !self.allow_remote && !is_local(url) {
             return Err(Error::new(
                 "ORIGIN_BLOCKED",
@@ -1035,14 +1143,13 @@ impl Page {
         }
         // The title, for the answer: the page's own.
         drop(state);
-        if let Ok(Value::Str(title)) = self.run("function() { return document.title; }", Vec::new())
-        {
-            self.state().title = title;
+        if let Ok(Value::Str(title)) = self.run(TITLE_JS, Vec::new()) {
+            self.state().title = clip(&title, MAX_TITLE);
         }
         let state = self.state();
         let mut answer = Value::obj()
-            .with("url", text::redact_url(&state.url))
-            .with("title", clip(&state.title, 300));
+            .with("url", self.shown(&state.url))
+            .with("title", clip(&state.title, MAX_TITLE));
         if !loaded {
             answer.set(
                 "note",
@@ -1053,6 +1160,17 @@ impl Page {
     }
 
     pub fn navigate(&self, url: &str) -> Result<Value> {
+        // A file never goes to the browser as file:, where it could show any
+        // other file of the user's: its folder is served, and the page is
+        // that.
+        check_url(url)?;
+        let served;
+        let url = if serve::is_file_url(url) {
+            served = self.served_url(url)?;
+            served.as_str()
+        } else {
+            url
+        };
         self.check_origin(url)?;
         self.and_wait_for_load(|| {
             let answer = self.call("Page.navigate", Value::obj().with("url", url))?;
@@ -1061,6 +1179,8 @@ impl Page {
                     "It isn't on this machine: open it with --allow-remote if the user wants that."
                 } else if error == "net::ERR_CONNECTION_REFUSED" {
                     "Nothing answers there: is the dev server running, on that port?"
+                } else if error == "net::ERR_CONNECTION_RESET" && !self.allow_remote {
+                    "If it led off this machine (a redirect), that's cut off: open it with --allow-remote if the user wants that. If not, check the server."
                 } else {
                     "Check the address, and that the server is running."
                 };
@@ -1068,7 +1188,7 @@ impl Page {
                     "LOAD_FAILED",
                     format!(
                         "{}: {}",
-                        text::inert(&text::redact_url(url), 200),
+                        text::inert(&self.shown(url), 200),
                         text::inert(error, 100)
                     ),
                 )
@@ -1226,7 +1346,7 @@ impl Page {
             .with("x", round1(x))
             .with("y", round1(y))
             .with("element", element)
-            .with("url", text::redact_url(&state.url))
+            .with("url", self.shown(&state.url))
     }
 
     pub fn type_text(&self, selector: &str, typed: &str, clear: bool) -> Result<Value> {
@@ -1236,9 +1356,13 @@ impl Page {
         }
         self.mark_input();
         self.call("Input.insertText", Value::obj().with("text", typed))?;
-        Ok(Value::obj()
-            .with("typed", typed.chars().count())
-            .with("element", found))
+        Ok(Value::obj().with("typed", typed.chars().count()).with(
+            "element",
+            Value::obj()
+                .with("tag", found.get_str("tag").map(|t| clip(t, 100)))
+                .with("type", found.get_str("type").map(|t| clip(t, 40)))
+                .with("focused", found.get_bool("focused")),
+        ))
     }
 
     pub fn press(&self, key: &str) -> Result<Value> {
@@ -1380,13 +1504,18 @@ impl Page {
         } else if full_page {
             let metrics = self.call("Page.getLayoutMetrics", Value::obj())?;
             let size = metrics.get("cssContentSize").unwrap_or(&Value::Null);
-            let width = size.get_num("width").unwrap_or(device.width as f64);
-            // Chrome draws at most 16384 device pixels down, at its own
-            // scale of 2 or the page's, the larger.
+            // Chrome draws at most 16384 device pixels each way, at its own
+            // scale of 2 or the page's, the larger; a page as wide as it likes
+            // is cut at that too, not a picture too large to take.
+            let most = 16384.0 / device.dpr.max(2.0);
+            let width = size
+                .get_num("width")
+                .unwrap_or(device.width as f64)
+                .min(most);
             let height = size
                 .get_num("height")
                 .unwrap_or(device.height as f64)
-                .min(16384.0 / device.dpr.max(2.0));
+                .min(most);
             clip_rect = Some((0.0, 0.0, width, height));
         }
         if let Some((x, y, w, h)) = clip_rect {
@@ -1408,8 +1537,8 @@ impl Page {
         let state = self.state();
         let mut answer = Value::obj()
             .with("raw", path.display().to_string())
-            .with("url", text::redact_url(&state.url))
-            .with("title", clip(&state.title, 300))
+            .with("url", self.shown(&state.url))
+            .with("title", clip(&state.title, MAX_TITLE))
             .with("viewport", state.device.to_json());
         if let Some((x, y, w, h)) = clip_rect {
             answer.set("clip", vec![round1(x), round1(y), round1(w), round1(h)]);
@@ -1462,7 +1591,7 @@ impl Page {
         Value::obj()
             .with("errors", errors)
             .with("last_id", state.next_error - 1)
-            .with("url", text::redact_url(&state.url))
+            .with("url", self.shown(&state.url))
     }
 
     pub fn dom(&self, selector: &str, max: usize) -> Result<Value> {
@@ -1509,7 +1638,7 @@ impl Page {
         };
         let mut lines = Vec::new();
         let mut truncated = false;
-        a11y_lines(root, &by_id, 0, "", max, &mut lines, &mut truncated);
+        a11y_lines(root, &by_id, max, &mut lines, &mut truncated);
         Ok(Value::obj()
             .with("tree", lines.join("\n"))
             .with("lines", lines.len())
@@ -1548,7 +1677,7 @@ impl Page {
                 "ORIGIN_BLOCKED",
                 format!(
                     "eval runs only on pages on this machine, not {}",
-                    text::inert(&text::redact_url(&url), 200)
+                    text::inert(&self.shown(&url), 200)
                 ),
             ));
         }
@@ -1616,7 +1745,7 @@ impl Page {
                         .with("returnByValue", true),
                 )?,
             )?;
-            let mut info = info;
+            let mut info = element_fields(&info);
             let backend = self
                 .call(
                     "DOM.describeNode",
@@ -1633,7 +1762,7 @@ impl Page {
                 ) && let Some(node) =
                     ax.get("nodes").and_then(Value::arr).and_then(|n| n.first())
                 {
-                    info.set("role", ax_text(node.get("role")));
+                    info.set("role", clip(&ax_text(node.get("role")), 100));
                     info.set("name", clip(&ax_text(node.get("name")), 200));
                 }
                 if is_local(&self.state().url)
@@ -1796,49 +1925,106 @@ fn ax_text(value: Option<&Value>) -> String {
     }
 }
 
+/// The tree as lines, depth first: with a stack of its own, as the page
+/// decides how deep it goes, and no more steps than it has nodes.
 fn a11y_lines(
-    node: &Value,
+    root: &Value,
     by_id: &HashMap<&str, &Value>,
-    depth: usize,
-    parent_name: &str,
     max: usize,
     out: &mut Vec<String>,
     truncated: &mut bool,
 ) {
-    if out.len() >= max {
-        *truncated = true;
-        return;
-    }
-    let role = ax_text(node.get("role"));
-    let name = ax_text(node.get("name"));
-    // Text boxes repeat their text's.
-    if role == "InlineTextBox" {
-        return;
-    }
-    let ignored = node.get_bool("ignored") == Some(true);
-    // Nodes with nothing to say are left out, and text that only repeats
-    // its parent's name; their children move up.
-    let plain = ignored
-        || (name.is_empty() && matches!(role.as_str(), "generic" | "none" | "LineBreak" | ""))
-        || (role == "StaticText" && name == parent_name);
-    let child_depth = if plain { depth } else { depth + 1 };
-    if !plain {
-        let mut line = format!("{}{role}", "  ".repeat(depth));
-        if !name.is_empty() {
-            line += &format!(" {:?}", clip(&name, 120));
+    // Each node with its depth and its parent's name.
+    let mut stack: Vec<(&Value, usize, Rc<str>)> = vec![(root, 0, Rc::from(""))];
+    let mut steps = by_id.len() + 1;
+    while let Some((node, depth, parent_name)) = stack.pop() {
+        if out.len() >= max || steps == 0 {
+            *truncated = true;
+            return;
         }
-        let value = ax_text(node.get("value"));
-        if !value.is_empty() {
-            line += &format!(" = {:?}", clip(&value, 80));
+        steps -= 1;
+        let role = ax_text(node.get("role"));
+        let name = ax_text(node.get("name"));
+        // Text boxes repeat their text's.
+        if role == "InlineTextBox" {
+            continue;
         }
-        out.push(line);
-    }
-    let name_below = if plain { parent_name } else { &name };
-    for child in node.get("childIds").and_then(Value::arr).unwrap_or(&[]) {
-        if let Some(child) = child.str().and_then(|id| by_id.get(id)) {
-            a11y_lines(child, by_id, child_depth, name_below, max, out, truncated);
+        let ignored = node.get_bool("ignored") == Some(true);
+        // Nodes with nothing to say are left out, and text that only repeats
+        // its parent's name; their children move up.
+        let plain = ignored
+            || (name.is_empty() && matches!(role.as_str(), "generic" | "none" | "LineBreak" | ""))
+            || (role == "StaticText" && *name == *parent_name);
+        let child_depth = if plain { depth } else { depth + 1 };
+        if !plain {
+            let mut line = format!("{}{}", "  ".repeat(depth.min(MAX_INDENT)), clip(&role, 60));
+            if !name.is_empty() {
+                line += &format!(" {:?}", clip(&name, 120));
+            }
+            let value = ax_text(node.get("value"));
+            if !value.is_empty() {
+                line += &format!(" = {:?}", clip(&value, 80));
+            }
+            out.push(line);
+        }
+        let name_below = if plain { parent_name } else { Rc::from(name) };
+        let children = node.get("childIds").and_then(Value::arr).unwrap_or(&[]);
+        for child in children.iter().rev() {
+            if let Some(child) = child.str().and_then(|id| by_id.get(id)) {
+                stack.push((child, child_depth, name_below.clone()));
+            }
         }
     }
+}
+
+/// What DESCRIBE_JS says of an element, made again here: its fields only,
+/// each clipped. It runs in pepper-agent's world, but what it reads (an
+/// id, classes, href, a tag's name) is the page's, of any length.
+fn element_fields(info: &Value) -> Value {
+    let text = |v: &Value, key: &str, max: usize| v.get_str(key).map(|s| clip(s, max));
+    let rect = |r: Option<&Value>| {
+        r.filter(|r| !r.is_null()).map(|r| {
+            let n = |key: &str| r.get_num(key).unwrap_or(0.0);
+            Value::obj()
+                .with("x", n("x"))
+                .with("y", n("y"))
+                .with("width", n("width"))
+                .with("height", n("height"))
+        })
+    };
+    let styles = match info.get("styles") {
+        Some(Value::Obj(members)) => Value::Obj(
+            members
+                .iter()
+                .take(30)
+                .filter_map(|(k, v)| Some((clip(k, 40), Value::from(clip(v.str()?, 120)))))
+                .collect(),
+        ),
+        _ => Value::obj(),
+    };
+    let classes: Vec<String> = info
+        .get("classes")
+        .and_then(Value::arr)
+        .unwrap_or(&[])
+        .iter()
+        .take(20)
+        .filter_map(|c| c.str().map(|c| clip(c, 100)))
+        .collect();
+    let parent = info.get("parent").filter(|p| !p.is_null()).map(|p| {
+        Value::obj()
+            .with("selector", text(p, "selector", 500))
+            .with("rect", rect(p.get("rect")))
+    });
+    Value::obj()
+        .with("selector", text(info, "selector", 500))
+        .with("tag", text(info, "tag", 100))
+        .with("id", text(info, "id", 200))
+        .with("classes", classes)
+        .with("text", text(info, "text", 200))
+        .with("rect", rect(info.get("rect")))
+        .with("styles", styles)
+        .with("parent", parent)
+        .with("href", text(info, "href", 500))
 }
 
 /// The value of a Runtime call's answer, or its exception as an error.
@@ -1899,8 +2085,8 @@ fn element_center(selector: &str, found: Value) -> Result<(f64, f64, Value)> {
         ));
     }
     let element = Value::obj()
-        .with("tag", found.get_str("tag").unwrap_or(""))
-        .with("text", found.get_str("text").unwrap_or(""))
+        .with("tag", clip(found.get_str("tag").unwrap_or(""), 100))
+        .with("text", clip(found.get_str("text").unwrap_or(""), 80))
         .with("matches", found.get_num("matches").unwrap_or(1.0));
     Ok((x + w / 2.0, y + h / 2.0, element))
 }
@@ -2022,7 +2208,7 @@ const FIND_JS: &str = r#"function(selector, scroll) {
   if (scroll) el.scrollIntoView({block: 'center', inline: 'center', behavior: 'instant'});
   const r = el.getBoundingClientRect();
   return {
-    tag: el.localName,
+    tag: el.localName.slice(0, 100),
     text: (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80),
     matches: document.querySelectorAll(selector).length,
     view: {x: r.x, y: r.y, width: r.width, height: r.height},
@@ -2041,7 +2227,7 @@ const FOCUS_JS: &str = r#"function(selector, clear) {
     if (typeof el.select === 'function') el.select();
     else { const range = document.createRange(); range.selectNodeContents(el); const s = getSelection(); s.removeAllRanges(); s.addRange(range); }
   }
-  return {tag: el.localName, type: el.getAttribute('type'), focused: document.activeElement === el};
+  return {tag: el.localName.slice(0, 100), type: (el.getAttribute('type') || '').slice(0, 40) || null, focused: document.activeElement === el};
 }"#;
 
 /// `(to)`: scrolls to the top or the bottom (or not at all); where it is.
@@ -2120,14 +2306,14 @@ const DESCRIBE_JS: &str = r#"function() {
   const parent = el.parentElement;
   return {
     selector: selector(el).slice(0, 500),
-    tag: el.localName,
-    id: el.id || null,
-    classes: [...el.classList].slice(0, 20),
+    tag: el.localName.slice(0, 100),
+    id: el.id ? el.id.slice(0, 200) : null,
+    classes: Array.prototype.slice.call(el.classList, 0, 20).map((c) => c.slice(0, 100)),
     text: (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 200),
     rect: box(el),
     styles,
     parent: parent && parent !== document.documentElement ? {selector: selector(parent).slice(0, 500), rect: box(parent)} : null,
-    href: el.getAttribute('href'),
+    href: el.hasAttribute('href') ? el.getAttribute('href').slice(0, 500) : null,
   };
 }"#;
 
@@ -2160,7 +2346,7 @@ const SOURCE_JS: &str = r#"function() {
     const svelte = el.__svelte_meta;
     if (svelte && svelte.loc) return out(svelte.loc.file, svelte.loc.line, svelte.loc.column, 'svelte');
     for (const a of el.attributes) {
-      if (/^data-(inspector-relative-path|source|loc|locator-id|component-path)/.test(a.name)) return out(a.value, null, null, a.name);
+      if (/^data-(inspector-relative-path|source|loc|locator-id|component-path)$/.test(a.name)) return out(a.value, null, null, a.name);
     }
   }
   return null;
@@ -2201,7 +2387,6 @@ mod tests {
             "http://2130706433/",
             "http://0177.0.0.1/",
             "http://[0:0:0:0:0:0:0:1]/",
-            "file:///Users/me/site/index.html",
             "about:blank",
         ] {
             assert!(is_local(local), "{local}");
@@ -2223,8 +2408,28 @@ mod tests {
             "ftp://localhost/",
             "javascript:alert(1)",
             "localhost:3000",
+            "file:///Users/me/site/index.html",
         ] {
             assert!(!is_local(remote), "{remote}");
+        }
+        // What goes to the dead end of a page kept to this machine.
+        for off in [
+            "https://example.com/x",
+            "ws://192.168.1.2/",
+            "WSS://evil.com",
+            "http://169.254.77.77/x",
+        ] {
+            assert!(off_machine(off), "{off}");
+        }
+        for on in [
+            "http://127.0.0.1:8000/a",
+            "ws://localhost:5173/",
+            "data:text/html,x",
+            "blob:x",
+            "file:///x",
+            "",
+        ] {
+            assert!(!off_machine(on), "{on}");
         }
     }
 
@@ -2293,5 +2498,98 @@ mod tests {
         assert_eq!(parse_xy(" 1 , 2 "), Some((1.0, 2.0)));
         assert_eq!(parse_xy("#a,#b"), None);
         assert_eq!(parse_xy("nan,1"), None);
+    }
+
+    /// A node of a synthetic `getFullAXTree`, with its child.
+    fn ax(id: usize, role: &str, name: &str, child: Option<usize>) -> Value {
+        let mut node = Value::obj()
+            .with("nodeId", id.to_string())
+            .with("role", Value::obj().with("value", role))
+            .with("name", Value::obj().with("value", name));
+        if let Some(child) = child {
+            node.set("childIds", vec![child.to_string()]);
+        }
+        node
+    }
+
+    fn lines(nodes: &[Value], max: usize) -> (Vec<String>, bool) {
+        let by_id: HashMap<&str, &Value> = nodes
+            .iter()
+            .filter_map(|n| Some((n.get_str("nodeId")?, n)))
+            .collect();
+        let (mut out, mut truncated) = (Vec::new(), false);
+        a11y_lines(&nodes[0], &by_id, max, &mut out, &mut truncated);
+        (out, truncated)
+    }
+
+    #[test]
+    fn a_tree_as_deep_as_a_page_makes_it() {
+        // 100,000 levels, a named one every 1000: on a small stack, where a
+        // walk by recursion would overflow.
+        const DEPTH: usize = 100_000;
+        let nodes: Vec<Value> = (0..DEPTH)
+            .map(|i| {
+                let child = (i + 1 < DEPTH).then_some(i + 1);
+                match i % 1000 {
+                    0 => ax(i, "group", &format!("g{i}"), child),
+                    _ => ax(i, "generic", "", child),
+                }
+            })
+            .collect();
+        let (out, truncated) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || lines(&nodes, 5000))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(out.len(), 100);
+        assert!(!truncated);
+        assert_eq!(out[0], "group \"g0\"");
+        // The indent stops growing.
+        assert!(out[99].starts_with(&format!("{}group", "  ".repeat(MAX_INDENT))));
+        // A cycle ends too.
+        let cycle = [ax(0, "group", "a", Some(1)), ax(1, "generic", "", Some(0))];
+        let (out, truncated) = lines(&cycle, 400);
+        assert!(truncated && out.len() <= 3, "{out:?}");
+        let (out, truncated) = lines(
+            &[ax(0, "group", "a", Some(1)), ax(1, "group", "b", None)],
+            1,
+        );
+        assert!(truncated && out.len() == 1);
+    }
+
+    #[test]
+    fn an_element_is_clipped_and_only_its_fields() {
+        let long = "x".repeat(100_000);
+        let info = Value::obj()
+            .with("selector", long.as_str())
+            .with("tag", long.as_str())
+            .with("id", long.as_str())
+            .with("classes", vec![long.as_str(); 50])
+            .with("text", "hi")
+            .with("rect", Value::obj().with("x", 1.0).with("width", 2.0))
+            .with("styles", Value::obj().with("margin", long.as_str()))
+            .with("parent", Value::Null)
+            .with("href", long.as_str())
+            .with("extra", long.as_str());
+        let element = element_fields(&info);
+        let line = element.to_line();
+        assert!(line.len() < 5000, "{}", line.len());
+        assert_eq!(
+            element
+                .get("classes")
+                .and_then(Value::arr)
+                .map(<[Value]>::len),
+            Some(20)
+        );
+        assert!(
+            element.get("extra").is_none() && element.get("parent").is_some_and(Value::is_null)
+        );
+        assert_eq!(element.get_str("text"), Some("hi"));
+        assert_eq!(
+            element.get("rect").and_then(|r| r.get_num("width")),
+            Some(2.0)
+        );
+        assert_eq!(element.get_str("tag").map(|t| t.chars().count()), Some(101));
     }
 }
