@@ -4,8 +4,11 @@
 //!
 //! Written text is safe to print to a terminal as it is: besides what JSON
 //! must escape, DEL, the C1 controls and the invisible format characters
-//! (bidi controls, zero-width ones) are written as `\uXXXX`.
+//! (bidi controls, zero-width ones) are written as `\uXXXX`, and so are
+//! the line and paragraph separators, which some readers take for a new
+//! line.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,6 +24,9 @@ pub enum Value {
 
 /// Nesting deeper than this is refused when reading.
 const MAX_DEPTH: usize = 64;
+/// An object with more members than this finds a name's earlier member
+/// through a map, not by looking through them all.
+const LOOK_THROUGH: usize = 32;
 
 impl Value {
     pub fn obj() -> Value {
@@ -255,7 +261,10 @@ fn write_str(out: &mut String, s: &str) {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if c.is_control() || crate::text::invisible(c) => {
+            c if c.is_control()
+                || crate::text::invisible(c)
+                || matches!(c, '\u{2028}' | '\u{2029}') =>
+            {
                 let mut units = [0u16; 2];
                 for unit in c.encode_utf16(&mut units) {
                     let _ = write!(out, "\\u{unit:04x}");
@@ -327,11 +336,13 @@ impl Reader<'_> {
         match self.peek() {
             Some(b'{') => {
                 self.at += 1;
-                let mut members = Vec::new();
+                // A member that came again is None where it was.
+                let mut members: Vec<Option<(String, Value)>> = Vec::new();
+                let mut index: Option<HashMap<String, usize>> = None;
                 self.space();
                 if self.peek() == Some(b'}') {
                     self.at += 1;
-                    return Ok(Value::Obj(members));
+                    return Ok(Value::Obj(Vec::new()));
                 }
                 loop {
                     self.space();
@@ -339,15 +350,33 @@ impl Reader<'_> {
                     self.space();
                     self.eat(b':')?;
                     let value = self.value(depth + 1)?;
-                    // The last of a name wins, as most readers do.
-                    members.retain(|(k, _)| *k != key);
-                    members.push((key, value));
+                    // The last of a name wins, as most readers do, where it
+                    // came last.
+                    let earlier = match &mut index {
+                        Some(index) => index.insert(key.clone(), members.len()),
+                        None => members
+                            .iter()
+                            .position(|m| m.as_ref().is_some_and(|(k, _)| *k == key)),
+                    };
+                    if let Some(at) = earlier {
+                        members[at] = None;
+                    }
+                    members.push(Some((key, value)));
+                    if index.is_none() && members.len() > LOOK_THROUGH {
+                        index = Some(
+                            members
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, m)| Some((m.as_ref()?.0.clone(), i)))
+                                .collect(),
+                        );
+                    }
                     self.space();
                     match self.peek() {
                         Some(b',') => self.at += 1,
                         Some(b'}') => {
                             self.at += 1;
-                            return Ok(Value::Obj(members));
+                            return Ok(Value::Obj(members.into_iter().flatten().collect()));
                         }
                         _ => return Err(self.fail("expected ',' or '}'")),
                     }
@@ -520,9 +549,13 @@ mod tests {
 
     #[test]
     fn text_is_inert_on_a_terminal() {
-        let s = Value::from("a\x1b]2;x\x07b\u{9b}c\u{7f}\u{202e}d\u{200b}");
+        let s = Value::from("a\x1b]2;x\x07b\u{9b}c\u{7f}\u{202e}d\u{200b}e\u{2028}f\u{2029}");
         let line = s.to_line();
-        assert_eq!(line, r#""a\u001b]2;x\u0007b\u009bc\u007f\u202ed\u200b""#);
+        let escaped = ["a", "u001b]2;x", "u0007b", "u009bc", "u007f", "u202ed"];
+        let escaped = [&escaped[..], &["u200be", "u2028f", "u2029"]]
+            .concat()
+            .join("\\");
+        assert_eq!(line, format!("\"{escaped}\""));
         assert!(line.chars().all(|c| !c.is_control()));
         assert_eq!(parse(&line).unwrap(), s);
     }
@@ -537,6 +570,41 @@ mod tests {
         assert_eq!(a[5].num(), Some(-0.5));
         assert_eq!(parse(r#"{"k":1,"k":2}"#).unwrap().get_num("k"), Some(2.0));
         assert_eq!(parse(r#""\ud800""#).unwrap().str(), Some("\u{FFFD}"));
+    }
+
+    #[test]
+    fn many_members_and_names_again() {
+        let names = |v: &Value| match v {
+            Value::Obj(members) => members.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+        // The last of a name wins, where it came last, in a small object
+        // and a large one alike.
+        for n in [3, 100] {
+            let mut text: Vec<String> = (0..n).map(|i| format!("\"k{i}\":{i}")).collect();
+            text.push("\"k1\":-1".into());
+            let v = parse(&format!("{{{}}}", text.join(","))).unwrap();
+            let mut want: Vec<String> = (0..n)
+                .filter(|&i| i != 1)
+                .map(|i| format!("k{i}"))
+                .collect();
+            want.push("k1".into());
+            assert_eq!(names(&v), want);
+            assert_eq!(v.get_num("k1"), Some(-1.0));
+            assert_eq!(v.get_num("k2"), Some(2.0));
+        }
+        assert_eq!(
+            parse(r#"{"k":1,"k":2}"#).unwrap(),
+            Value::obj().with("k", 2.0)
+        );
+        // 100,000 names: at once, not in quadratic time.
+        let text: Vec<String> = (0..100_000).map(|i| format!("\"key{i:06}\":{i}")).collect();
+        let started = std::time::Instant::now();
+        let v = parse(&format!("{{{}}}", text.join(","))).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!(names(&v).len(), 100_000);
+        assert_eq!(names(&v)[99_999], "key099999");
+        assert_eq!(v.get_num("key000007"), Some(7.0));
     }
 
     #[test]

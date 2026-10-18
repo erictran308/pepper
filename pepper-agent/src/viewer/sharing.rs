@@ -28,13 +28,35 @@ impl Viewer {
                 )
                 .hint("1 to 32 of A-Z a-z 0-9 . _ / -, from a letter or digit: agent-2."));
             }
-            None => format!("agent-{}", self.sessions.len() + 1),
+            // The first agent-N no session has.
+            None => (self.sessions.len() + 1..)
+                .map(|n| format!("agent-{n}"))
+                .find(|name| !self.sessions.iter().any(|(_, o)| o == name))
+                .unwrap_or_else(|| "agent".into()),
         };
         if self.sessions.len() >= MAX_SESSIONS {
-            return Err(Error::new(
-                "LIMIT_REACHED",
-                format!("this viewer has {MAX_SESSIONS} sessions already"),
-            ));
+            // The oldest with no source open and no wait (an agent waiting
+            // for the human's events) makes room: its token is then
+            // refused, with how to take another.
+            let idle = self.sessions.iter().position(|(token, _)| {
+                let mine = |s: Option<&str>| s == Some(token.as_str());
+                !self.sources.iter().any(|s| mine(s.session.as_deref()))
+                    && !self
+                        .waits
+                        .iter()
+                        .any(|w| mine(w.req.args.get_str("session")))
+            });
+            match idle {
+                Some(k) => {
+                    self.sessions.remove(k);
+                }
+                None => {
+                    return Err(Error::new(
+                        "LIMIT_REACHED",
+                        format!("this viewer has {MAX_SESSIONS} sessions already"),
+                    ));
+                }
+            }
         }
         // The viewer's id first: the session's commands go to it, whichever
         // viewer is newest.
@@ -68,18 +90,29 @@ impl Viewer {
             Some(_) => return Err(no_session()),
             None => None,
         };
+        let theirs = session.as_deref().and_then(|s| self.session_owner(s));
         let owner = match args.get_str("owner") {
-            Some(owner) if super::valid_name(owner) && owner.len() <= 32 => Some(owner.to_owned()),
-            Some(owner) => {
+            Some(owner) if !(super::valid_name(owner) && owner.len() <= 32) => {
                 return Err(Error::new(
                     "BAD_ARGS",
                     format!("{:?} isn't an owner's name", text::inert(owner, 40)),
                 ));
             }
-            None => session
-                .as_deref()
-                .and_then(|s| self.session_owner(s))
-                .map(str::to_owned),
+            // A session's sources have its owner's name, not another
+            // agent's.
+            Some(owner) if theirs.is_some_and(|o| o != owner) => {
+                return Err(Error::new(
+                    "BAD_ARGS",
+                    format!(
+                        "this session's sources are {}'s, not {}'s",
+                        theirs.unwrap_or_default(),
+                        text::inert(owner, 40)
+                    ),
+                )
+                .hint("Leave --owner out: a session's sources have its owner's name."));
+            }
+            Some(owner) => Some(owner.to_owned()),
+            None => theirs.map(str::to_owned),
         };
         Ok((session, owner))
     }

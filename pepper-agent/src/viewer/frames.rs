@@ -37,6 +37,11 @@ pub enum FrameMsg {
     Frame(Vec<u8>, Done),
     /// The box, as Pepper says: nothing is drawn while it isn't shown.
     Size(BoxSize),
+    /// Pepper didn't take the surfaces (too many streams): offered again
+    /// ATTACH_AGAIN later, as pepper-play does.
+    Refused,
+    /// Pepper answered after this started: frames go to it from now on.
+    Client(Arc<pepper::Client>),
     Stop,
 }
 
@@ -96,7 +101,7 @@ impl Presenter {
 
 fn run(
     rx: Receiver<FrameMsg>,
-    client: Option<Arc<pepper::Client>>,
+    mut client: Option<Arc<pepper::Client>>,
     token: String,
     stats: Arc<Mutex<Stats>>,
     log: Option<PathBuf>,
@@ -133,11 +138,27 @@ fn run(
                     ));
                     visible = s.visible;
                 }
+                FrameMsg::Refused => {
+                    note("Pepper didn't take the surfaces".into());
+                    attached = false;
+                    refused = Some(Instant::now());
+                    ring.clear();
+                }
+                FrameMsg::Client(late) => {
+                    note("Pepper answered".into());
+                    client = Some(late);
+                    attached = false;
+                    refused = None;
+                    ring.clear();
+                }
                 FrameMsg::Stop => {
                     if let Some((_, done)) = frame {
                         done(false);
                     }
-                    if let (Some(client), true) = (&client, attached) {
+                    // Whatever this side thinks (an attach whose answer
+                    // timed out, a refusal of an older one): Pepper drops
+                    // a stream it has, and ignores one it hasn't.
+                    if let Some(client) = &client {
                         client.detach(&token);
                     }
                     return;

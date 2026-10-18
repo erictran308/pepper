@@ -5,10 +5,10 @@
 //! place of the after one (`d`): black where they're the same.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
-use super::Viewer;
+use super::{Viewer, player};
 use crate::error::{Error, Result};
 use crate::json::Value;
 use crate::{media, text};
@@ -54,6 +54,10 @@ impl Viewer {
                 })
         };
         let (ia, ib) = (find("a")?, find("b")?);
+        // Another agent's sources are paired (and their verdicts so named,
+        // their playback locked) only if the user asked (--force).
+        self.check_owner(ia, args)?;
+        self.check_owner(ib, args)?;
         if ia == ib {
             return Err(Error::new("BAD_ARGS", "compare: two different sources"));
         }
@@ -141,9 +145,9 @@ impl Viewer {
         let Some(c) = self.compare.take() else { return };
         if c.diff.is_some()
             && let Some(source) = self.sources.iter_mut().find(|s| s.sid == c.b)
-            && let Some(player) = &mut source.player
+            && let Some(p) = &mut source.player
         {
-            player.command(&["loadfile", &source.target, "replace"]);
+            p.load(&source.target, player::remote(&source.target), None);
         }
     }
 
@@ -217,11 +221,13 @@ impl Viewer {
         }
     }
 
-    /// Whether the two compared are pictures (files of a picture's kind).
+    /// Whether the two compared are pictures (files of a picture's kind on
+    /// this machine: only those go to ffmpeg for their difference).
     pub(super) fn comparing_pictures(&self) -> bool {
         let picture = |i: usize| {
             let s = &self.sources[i];
             s.web.is_none()
+                && s.target.starts_with('/')
                 && Path::new(&s.target)
                     .extension()
                     .and_then(|e| e.to_str())
@@ -243,8 +249,8 @@ impl Viewer {
                 c.diff = None;
             }
             let source = &mut self.sources[ib];
-            if let Some(player) = &mut source.player {
-                player.command(&["loadfile", &source.target, "replace"]);
+            if let Some(p) = &mut source.player {
+                p.load(&source.target, player::remote(&source.target), None);
             }
             self.flash("The after picture again: d for their difference.");
             return;
@@ -257,10 +263,13 @@ impl Viewer {
             PathBuf::from(&self.sources[ia].target),
             PathBuf::from(&self.sources[ib].target),
         );
-        self.shot_count += 1;
-        let out = self
-            .shots
-            .join(format!("difference-{}.png", self.shot_count));
+        let out = match self.output("difference", "png") {
+            Ok(out) => out,
+            Err(e) => {
+                self.flash(format!("No difference: {}", text::inert(&e.message, 100)));
+                return;
+            }
+        };
         let job = self.spawn_job(move || difference(&ffmpeg, &a, &b, &out));
         if let Some(c) = &mut self.compare {
             c.diff_job = Some(job);
@@ -285,8 +294,8 @@ impl Viewer {
             }
         };
         if let (Some(path), Some((_, ib))) = (path, self.compare_pair()) {
-            if let Some(player) = &mut self.sources[ib].player {
-                player.command(&["loadfile", &path.display().to_string(), "replace"]);
+            if let Some(p) = &mut self.sources[ib].player {
+                p.load(&path.display().to_string(), false, None);
             }
             if let Some(c) = &mut self.compare {
                 c.diff = Some(path);
@@ -306,11 +315,11 @@ impl Viewer {
 /// The difference of two pictures, b scaled to a's size, made brighter so
 /// small changes show.
 fn difference(ffmpeg: &Path, a: &Path, b: &Path, out: &Path) -> Result<Value> {
-    let made = Command::new(ffmpeg)
-        .args(["-nostdin", "-v", "error", "-y", "-i"])
-        .arg(format!("file:{}", a.display()))
-        .arg("-i")
-        .arg(format!("file:{}", b.display()))
+    // Each read only as itself (a playlist names others), from `/`.
+    let made = media::command(ffmpeg)
+        .args(["-nostdin", "-v", "error", "-y"])
+        .args(media::input(a))
+        .args(media::input(b))
         .args([
             "-filter_complex",
             "[0:v]format=rgb24[a];[1:v]format=rgb24[b];[b][a]scale2ref=flags=bicubic[b2][a2];\
@@ -324,9 +333,13 @@ fn difference(ffmpeg: &Path, a: &Path, b: &Path, out: &Path) -> Result<Value> {
         .stdin(Stdio::null())
         .output()
         .map_err(|e| Error::new("FAILED", format!("cannot run ffmpeg: {e}")))?;
-    if !made.status.success() || !out.is_file() {
+    // Made empty beforehand (Viewer::output): written, and still its own.
+    if !made.status.success() || !crate::proto::lone_file(out) {
         let err = String::from_utf8_lossy(&made.stderr);
-        return Err(Error::new("FAILED", text::inert(err.trim(), 200)));
+        return Err(Error::new(
+            "FAILED",
+            text::inert(&text::redact_urls(err.trim()), 200),
+        ));
     }
     Ok(Value::obj().with("path", out.display().to_string()))
 }

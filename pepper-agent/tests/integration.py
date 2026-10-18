@@ -148,6 +148,54 @@ setTimeout(() => { const d = document.createElement("p"); d.id = "late"; d.textC
 </script></body></html>"""
 
 
+def raw_request(sock_path, payload):
+    """A request sent to the viewer's socket as is; its answer."""
+    c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    c.settimeout(30)
+    c.connect(sock_path)
+    c.sendall(json.dumps(payload).encode() + b"\n")
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = c.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    c.close()
+    return json.loads(data) if data else {}
+
+
+def tls_serve(root):
+    """An HTTPS server on 127.0.0.1, on a thread, with a certificate of its
+    own that nothing trusts. It counts the requests it gets, and those with
+    a password; its certificate's folder."""
+    import http.server
+    import ssl
+    certs = tempfile.mkdtemp(prefix="pepper-agent-it-tls-")
+    key, cert = os.path.join(certs, "key.pem"), os.path.join(certs, "cert.pem")
+    subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key, "-out", cert,
+                    "-days", "1", "-subj", "/CN=127.0.0.1"], check=True, capture_output=True)
+    seen = {"requests": 0, "auth": 0}
+
+    class Counting(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, directory=root, **kwargs)
+
+        def do_GET(self):
+            seen["requests"] += 1
+            seen["auth"] += bool(self.headers.get("Authorization"))
+            super().do_GET()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Counting)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(cert, key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, seen, certs
+
+
 def serve(root):
     """A static server on 127.0.0.1, on a thread; its port."""
     import functools
@@ -190,7 +238,7 @@ def frame_numbers(path):
     return [sum((row[20 + 40 * k] > 128) << k for k in range(8)) for row in rows]
 
 
-def edit_checks(cli, viewer, work, project, clip, hostile):
+def edit_checks(cli, viewer, work, project, clip, hostile, sock_path):
     frames = frames_clip(work)
     cut = os.path.join(project, "cut.json")
     rel = lambda p: os.path.relpath(p, project)
@@ -282,6 +330,33 @@ def edit_checks(cli, viewer, work, project, clip, hostile):
     viewer.keys(b"<")
     check("< goes back", viewer.wait_for(b"No mark before this one"))
     cli("close", "cut")
+
+    # Only an edit preview's EDL's references are followed: not a project's
+    # playlist or EDL (under a video's name). A preview plays an EDL the
+    # viewer writes from its timeline, never the file the request names, and
+    # a clip must be a sound or a video by itself.
+    planted = os.path.join(project, "playlist.mp4")
+    with open(planted, "w") as f:
+        f.write(f"#EXTM3U\n{clip}\n")
+    ref = os.path.join(project, "ref.mp4")
+    with open(ref, "w") as f:
+        f.write(f"# mpv EDL v0\n%{len(clip.encode())}%{clip},start=0,length=1\n")
+    for name, planted_file in (("planted", planted), ("ref", ref)):
+        got = cli("open", planted_file, "--name", name, ok=False)
+        check(f"a project's {name} file names nothing that's played", got.get("error", {}).get("code") == "LOAD_FAILED", got)
+        cli("close", name, ok=False)
+    nested = {"project": cut, "srcs": [ref], "clips": [{"src": 0, "in": 0, "out": 1}]}
+    forged = raw_request(sock_path, {"v": 1, "cmd": "open", "args": {
+        "target": p.get("edl", ""), "kind": "media", "name": "forged", "edl": True, "edit": nested}})
+    check("a preview's clip that is an EDL by another name is refused", forged.get("error", {}).get("code") == "BAD_ARGS"
+          and "clip" in forged.get("error", {}).get("message", ""), forged)
+    other = {"project": cut, "srcs": [clip], "clips": [{"src": 0, "in": 0, "out": 1}]}
+    elsewhere = raw_request(sock_path, {"v": 1, "cmd": "open", "args": {
+        "target": ref, "kind": "media", "name": "forged", "edl": True, "edit": other}})
+    src = (elsewhere.get("result") or {}).get("source") or {}
+    check("a preview plays the viewer's own EDL of its timeline, not the file it names",
+          src.get("name") == "forged" and src.get("target") != ref and abs((src.get("duration") or 0) - 1) < 0.1, elsewhere)
+    cli("close", "forged", ok=False)
 
     r = subprocess.run([viewer.agent, "edit", "render", cut], capture_output=True, text=True, cwd=project, env=viewer.env)
     out = json.loads(r.stdout or "{}")
@@ -557,6 +632,8 @@ def sharing_checks(cli, viewer, work, project, clip):
     mine = cli("open", clip, "--name", "a-clip", "--session", a).get("source", {})
     check("a session's source is its owner's", mine.get("owner") == "alice", mine)
     check("its label says whose", viewer.wait_for(b"a-clip (alice)"))
+    taken = cli("open", clip, "--name", "b-clip", "--session", a, "--owner", "bob", ok=False).get("error", {})
+    check("a session's source has its owner's name only", taken.get("code") == "BAD_ARGS", taken)
     cli("open", clip, "--name", "free")
     taken = cli("seek", "3", "--source", "a-clip", "--session", b, ok=False).get("error", {})
     check("another agent can't drive it: NOT_OWNER", taken.get("code") == "NOT_OWNER" and "alice" in taken.get("message", ""), taken)
@@ -687,15 +764,35 @@ def sharing_checks(cli, viewer, work, project, clip):
         check("play shows a recording, playing",
               shown.get("kind") == "recording" and shown.get("status") == "playing" and shown.get("owner") == "agent-2", shown)
         since = cli("events").get("last_id", 0)
+        cli("focus", "a-app")
         cli("focus", shown.get("name", ""))
+        viewer.keys(b"y")
+        check("y just as an agent moves the focus asks again", viewer.wait_for(b"has just come into focus"))
+        time.sleep(0.3)
         viewer.keys(b"y")
         ev = (cli("events", "--since", str(since), "--until", "approve", "--wait", "5", "--owner", "agent-2")
               .get("events") or [{}])[-1]
         check("the human approves the demo with y",
               ev.get("type") == "approve" and ev.get("kind") == "recording" and ev.get("file") == run.get("path"), ev)
+        # Another agent's verdict doesn't end this one's wait.
+        since = cli("events").get("last_id", 0)
+        cli("focus", "a-app")
+        time.sleep(0.6)
+        viewer.keys(b"y")
+        other = cli("events", "--since", str(since), "--until", "approve,reject", "--wait", "0", "--owner", "agent-2")
+        check("--owner holds for the event that ends a wait",
+              other.get("until_reached") is False and not other.get("events"), other)
+        hers = cli("events", "--since", str(since), "--until", "approve", "--wait", "0", "--owner", "alice")
+        check("which ends that agent's", hers.get("until_reached") is True, hers)
         for name, s in (("a-app", a), ("b-app", b), (shown.get("name", ""), b)):
             cli("close", name, "--session", s)
         server.shutdown()
+
+    # Sessions past the most: the oldest with no source open makes room.
+    made = [cli("session", "new").get("session") for _ in range(70)]
+    check("sessions never run out", all(made) and len(set(made)) == 70, made[-3:])
+    gone = cli("where", "--session", made[0], ok=False).get("error", {})
+    check("the oldest made room", gone.get("code") == "BAD_ARGS" and "session new" in gone.get("hint", ""), gone)
 
     # Before and after.
     clip2 = os.path.join(work, "clip2.mp4")
@@ -837,12 +934,23 @@ def live_checks(cli, viewer, work, env, run_dir):
 
     # A stream behind a password: from the environment, never shown.
     server = RtspServer(user="cam", password="s3cret-Pw")
-    env["PEPPER_AGENT_TEST_CAM"] = "cam:s3cret-Pw"
-    o = cli("open", server.address, "--credentials-env", "PEPPER_AGENT_TEST_CAM", "--name", "cam")
+    env["PEPPER_CREDENTIALS_TEST_CAM"] = "cam:s3cret-Pw@127.0.0.1"
+    o = cli("open", server.address, "--credentials-env", "PEPPER_CREDENTIALS_TEST_CAM", "--name", "cam")
     src = o.get("source", {})
     check("open rtsp:// is a stream, playing", src.get("kind") == "stream" and src.get("status") == "playing", o)
     check("its address is shown without the password", src.get("target") == server.address.replace("rtsp://", "rtsp://***@"), src)
     check("the password reached the camera", server.auth_seen and server.auth_seen[-1] == "cam:s3cret-Pw", server.auth_seen)
+    check("with a word that rtsp:// isn't encrypted", "rtsps://" in o.get("warning", ""), o)
+    env["PEPPER_AGENT_TEST_DB"] = "u:db-Pw"
+    other = cli("open", server.address, "--credentials-env", "PEPPER_AGENT_TEST_DB", "--name", "cam4", ok=False)
+    check("only a PEPPER_CREDENTIALS_ variable is read: BAD_ARGS", other.get("error", {}).get("code") == "BAD_ARGS"
+          and "PEPPER_CREDENTIALS_" in other.get("error", {}).get("hint", ""), other)
+    env.pop("PEPPER_AGENT_TEST_DB", None)
+    env["PEPPER_CREDENTIALS_TEST_ELSEWHERE"] = "cam:s3cret-Pw@cam.example"
+    far = cli("open", server.address, "--credentials-env", "PEPPER_CREDENTIALS_TEST_ELSEWHERE", "--name", "cam5", ok=False)
+    check("credentials for another host aren't sent: BAD_ARGS", far.get("error", {}).get("code") == "BAD_ARGS"
+          and "s3cret" not in json.dumps(far), far)
+    env.pop("PEPPER_CREDENTIALS_TEST_ELSEWHERE", None)
     shot = cli("snapshot", "cam")
     check("a snapshot of a stream", shot.get("width") == 640, shot)
     since = cli("events").get("last_id", 0)
@@ -860,8 +968,8 @@ def live_checks(cli, viewer, work, env, run_dir):
     # From the next keyframe (one a second here) on.
     check("a stream's recording, its packets as they came", os.path.isfile(rec.get("path", ""))
           and 1.8 < (rec.get("duration") or 0) < 3.5, rec)
-    env["PEPPER_AGENT_TEST_CAM"] = "cam:wrong-Pw"
-    wrong = cli("open", server.address, "--credentials-env", "PEPPER_AGENT_TEST_CAM", "--name", "cam2", ok=False)
+    env["PEPPER_CREDENTIALS_TEST_CAM"] = "cam:wrong-Pw@127.0.0.1"
+    wrong = cli("open", server.address, "--credentials-env", "PEPPER_CREDENTIALS_TEST_CAM", "--name", "cam2", ok=False)
     check("wrong credentials: LOAD_FAILED, tried again", wrong.get("error", {}).get("code") == "LOAD_FAILED"
           and "tried again" in wrong.get("error", {}).get("hint", ""), wrong)
     plain = cli("open", server.address.replace("rtsp://", "rtsp://cam:s3cret-Pw@"), "--name", "cam3")
@@ -878,7 +986,28 @@ def live_checks(cli, viewer, work, env, run_dir):
     for name in ("cam", "cam2", "cam3"):
         cli("close", name)
     server.close()
-    env.pop("PEPPER_AGENT_TEST_CAM", None)
+    env.pop("PEPPER_CREDENTIALS_TEST_CAM", None)
+
+    # HLS: an address that names its segments, which are followed.
+    hls = os.path.join(work, "hls")
+    os.makedirs(hls)
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=25", "-t", "3",
+                    "-g", "25", "-pix_fmt", "yuv420p", "-f", "hls", "-hls_time", "1", "-hls_playlist_type", "vod",
+                    os.path.join(hls, "live.m3u8")], check=True)
+    plain = serve(hls)
+    h = cli("open", f"http://127.0.0.1:{plain.server_address[1]}/live.m3u8", "--name", "hls")
+    check("an HLS stream plays, its segments followed", h.get("source", {}).get("status") == "playing", h)
+    cli("close", "hls")
+    plain.shutdown()
+    # A server whose certificate nothing trusts: refused before it's asked
+    # anything, so a password in the address never reaches it.
+    tls, seen, certs = tls_serve(hls)
+    bad = cli("open", f"https://cam:tls-Pw@127.0.0.1:{tls.server_address[1]}/live.m3u8", "--name", "tls", ok=False)
+    check("an https server whose certificate isn't trusted is refused", bad.get("error", {}).get("code") == "LOAD_FAILED", bad)
+    check("before any request: no password reaches it", seen == {"requests": 0, "auth": 0}, seen)
+    cli("close", "tls", ok=False)
+    tls.shutdown()
+    shutil.rmtree(certs, ignore_errors=True)
 
 
 
@@ -919,10 +1048,12 @@ def web_checks(cli, viewer, work, run_dir):
     errors = cli("web", "errors").get("errors", [])
     kinds = {e.get("kind") for e in errors}
     check("web errors has the exception", any("boom" in e.get("text", "") for e in errors), errors)
-    check("and the remote request that was stopped",
-          any(e.get("kind") == "network" and "example.com" in e.get("url", "") for e in errors), errors)
+    check("and the remote request that was stopped, as not on this machine",
+          any(e.get("kind") == "network" and "example.com" in e.get("url", "")
+              and e.get("note", "").startswith("not on this machine") for e in errors), errors)
     check("a link-local address is off this machine too",
-          any("169.254.77.77" in e.get("url", "") and "PROXY" in e.get("text", "") for e in errors),
+          any("169.254.77.77" in e.get("url", "") and e.get("note", "").startswith("not on this machine")
+              for e in errors),
           [e for e in errors if "169.254" in e.get("url", "")])
     check("and the 404", any(e.get("status") == 404 for e in errors), kinds)
 
@@ -954,7 +1085,8 @@ def web_checks(cli, viewer, work, run_dir):
     x, y = press_at(viewer, app["box"], app["viewport"], (rect["x"] + 30, rect["y"] + rect["height"] / 2))
     viewer.keys(f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
     check("a click opens the note prompt", viewer.wait_for(b"note on the point"))
-    viewer.keys(b"align with the header\r")
+    viewer.keys(b"align with the header")
+    viewer.keys(b"\r")
     got = cli("events", "--since", str(since), "--wait", "10")
     point = (got.get("events") or [{}])[0]
     element = point.get("element") or {}
@@ -996,6 +1128,8 @@ def web_checks(cli, viewer, work, run_dir):
         time.sleep(0.2)
     check("--watch reloads on a change", cli("where", "w").get("title") == "two")
 
+    file_page_checks(cli, work)
+
     chrome = lambda: subprocess.run(["pgrep", "-f", f"user-data-dir={run_dir}/{viewer.pid}-chrome"],
                                     capture_output=True, text=True).stdout.split()
     check("the browser runs while pages are open", chrome())
@@ -1009,6 +1143,85 @@ def web_checks(cli, viewer, work, run_dir):
     check("and its profile is deleted", not profiles, profiles)
     server.shutdown()
 
+
+def file_page_checks(cli, work):
+    """A page from a file: its folder is served on 127.0.0.1, under a token,
+    and nothing else is (the browser never loads file:)."""
+    import http.client
+    from urllib.parse import urlsplit
+    files, outside, elsewhere = (os.path.join(work, d) for d in ("file-site", "file-outside", "file-elsewhere"))
+    for d in (files, outside, elsewhere):
+        os.makedirs(d)
+
+    def write(path, text):
+        with open(path, "w") as f:
+            f.write(text)
+
+    write(os.path.join(outside, "marker.txt"), "PEPPER-MARKER")
+    write(os.path.join(files, "index.html"),
+          f'<title>Files</title><p id="mark">files</p><iframe src="file://{outside}/marker.txt"></iframe>')
+    write(os.path.join(files, "ok.txt"), "ok")
+    write(os.path.join(files, ".env"), "SECRET")
+    write(os.path.join(files, "long.html"), "<script>document.title = 'T'.repeat(1000000)</script>")
+    write(os.path.join(elsewhere, "page.html"), "<title>Elsewhere</title>")
+    os.symlink(os.path.join(outside, "marker.txt"), os.path.join(files, "out.txt"))
+
+    opened = cli("web", "open", os.path.join(files, "index.html"), "--name", "f").get("source", {})
+    check("a file page opens, shown as its file",
+          opened.get("status") == "ready" and opened.get("url", "").startswith("file://")
+          and opened.get("url", "").endswith("/file-site/index.html") and opened.get("title") == "Files", opened)
+    href = cli("web", "eval", "location.href").get("value", "")
+    served = urlsplit(href)
+    check("the browser has it from 127.0.0.1, not file:", served.scheme == "http" and served.hostname == "127.0.0.1", href)
+    token = served.path.split("/")[1] if served.path.count("/") >= 2 else ""
+    statuses = cli("web", "eval", "Promise.all(['ok.txt', '.env', 'out.txt', '%2e%2e/outside/marker.txt', "
+                   "'../outside/marker.txt'].map(p => fetch(p).then(r => r.status, () => 0)))").get("value")
+    check("the page gets its folder's files, not a dot-file, a link out or ../", statuses == [200, 404, 404, 404, 404],
+          statuses)
+    console = cli("web", "console").get("entries", [])
+    check("nor a file: frame of another file",
+          any("Not allowed to load local resource" in e.get("text", "") for e in console), console)
+    check("web shot, dom and a11y work on it", os.path.isfile(cli("web", "shot").get("path", ""))
+          and cli("web", "dom", "#mark").get("matches") == 1 and "files" in cli("web", "a11y").get("tree", ""))
+
+    def raw(method, path):
+        c = http.client.HTTPConnection("127.0.0.1", served.port, timeout=5)
+        try:
+            c.request(method, path)
+            r = c.getresponse()
+            return r.status, r.read()
+        finally:
+            c.close()
+
+    check("its server answers with the token", raw("GET", f"/{token}/ok.txt") == (200, b"ok"))
+    wrong = token[:-1] + ("0" if token[-1:] != "0" else "1")
+    nothing = {path: raw("GET", path) for path in [
+        "/ok.txt", "/index.html", f"/{wrong}/ok.txt", f"/{token}/../outside/marker.txt",
+        f"/{token}/%2e%2e/outside/marker.txt", f"/{token}/.env", f"/{token}/out.txt", f"/{token}/"]}
+    check("and nothing without it, out of the folder, a dot-file, a link out, a listing",
+          all(answer == (404, b"") for answer in nothing.values()), nothing)
+    check("GET and HEAD only", raw("POST", f"/{token}/ok.txt")[0] == 405)
+    dot = cli("web", "open", os.path.join(files, ".env"), "--name", "dot", ok=False)
+    check("a dot-file is not opened, and no page is made for it", bool(dot.get("error"))
+          and not any(s.get("name") == "dot" for s in cli("sources").get("sources", [])), dot)
+
+    cli("web", "goto", os.path.join(files, "long.html"))
+    title = cli("where", "f").get("title") or ""
+    check("a page's title is kept clipped", title.startswith("TTT") and len(title) <= 301, len(title))
+    cli("web", "goto", os.path.join(elsewhere, "page.html"))
+    other = urlsplit(cli("web", "eval", "location.href").get("value", ""))
+    where = cli("where", "f").get("url", "")
+    check("a file in another folder: that folder, under a token of its own",
+          where.endswith("/file-elsewhere/page.html") and other.port == served.port
+          and other.path.split("/")[1] != token, (where, other))
+    cli("web", "back")
+    check("and back goes back", cli("where", "f").get("url", "").endswith("/file-site/long.html"))
+    cli("close", "f")
+    try:
+        gone = raw("GET", f"/{token}/ok.txt")
+    except OSError as e:
+        gone = e
+    check("closed, its folder is served no more", isinstance(gone, OSError), gone)
 
 def talk_clip(dir):
     """Three shots (cuts at 3 s and 5 s) and a voice: two sentences, 1.5 s
@@ -1201,7 +1414,8 @@ def extras_checks(cli, viewer, agent, work, project, env, hostile, sound):
 
 def links_checks(agent, env, work, clip):
     """A project that came with links in its .pepper/: nothing is written
-    through them."""
+    through them. Nor through one made a link while the viewer runs; and a
+    project's links that lead out of it aren't followed."""
     linked = os.path.join(work, "linked")
     outside = os.path.join(work, "outside")
     os.makedirs(os.path.join(linked, ".pepper"))
@@ -1211,24 +1425,28 @@ def links_checks(agent, env, work, clip):
     viewer = Viewer(agent, env, linked)
     check("a viewer starts in a project with links in .pepper/", viewer.wait_for(b"waiting for an agent"))
 
-    def cli(*args, ok=True):
-        r = subprocess.run([agent, *args, "--viewer", str(viewer.pid)], capture_output=True,
-                           text=True, cwd=linked, env=env, timeout=60)
-        if ok and r.returncode != 0:
-            check(f"pepper-agent {' '.join(args)}", False, r.stderr.strip())
-            return {}
-        if not ok:
-            return json.loads(r.stderr.strip().splitlines()[-1]) if r.stderr.strip() else {}
-        return json.loads(r.stdout)
+    def client(viewer, cwd):
+        def cli(*args, ok=True):
+            r = subprocess.run([agent, *args, "--viewer", str(viewer.pid)], capture_output=True,
+                               text=True, cwd=cwd, env=env, timeout=60)
+            if ok and r.returncode != 0:
+                check(f"pepper-agent {' '.join(args)}", False, r.stderr.strip())
+                return {}
+            if not ok:
+                return json.loads(r.stderr.strip().splitlines()[-1]) if r.stderr.strip() else {}
+            return json.loads(r.stdout)
+        return cli
 
+    cli = client(viewer, linked)
     cli("open", clip, "--name", "clip")
     since = cli("events").get("last_id", 0)
     viewer.keys(b"m")
     got = cli("events", "--since", str(since), "--wait", "5")
     check("a mark still comes", [e.get("type") for e in got.get("events", [])] == ["mark"], got)
-    check("but not through .pepper/events.jsonl, a link",
-          not os.path.exists(os.path.join(outside, "events.txt")) and not got.get("events_file", linked).startswith(linked),
-          got.get("events_file"))
+    mine = os.path.join(os.path.realpath(linked), ".pepper", f"events-{viewer.pid}.jsonl")
+    check("but not through .pepper/events.jsonl, a link: into a file of the viewer's own",
+          not os.path.exists(os.path.join(outside, "events.txt")) and got.get("events_file") == mine
+          and os.path.isfile(mine) and not os.path.islink(mine), got.get("events_file"))
     shot = cli("snapshot", ok=False)
     check("a .pepper/snapshots that's a link is refused",
           shot.get("error", {}).get("code") == "FAILED" and "link" in shot.get("error", {}).get("message", ""), shot)
@@ -1250,8 +1468,147 @@ def links_checks(agent, env, work, clip):
     with open(kept) as f:
         check("and what the links led to is left alone",
               f.read() == "keep" and not os.path.exists(os.path.join(outside, "made.png")), os.listdir(outside))
+
+    # Links in a project that lead out of it: refused, naming both; the
+    # same file named as outside the project is read, as itself.
+    named = os.path.join(work, "named")
+    os.makedirs(named)
+    secret = os.path.join(work, "secret.txt")
+    with open(secret, "w") as f:
+        f.write("not for the agent")
+    os.symlink(clip, os.path.join(named, "demo.mp4"))
+    os.symlink(work, os.path.join(named, "footage"))
+    os.symlink(secret, os.path.join(named, "index.html"))
+    there = client(viewer, named)
+    for args, target in ((("sheet", "demo.mp4"), clip), (("frames", "footage/clip.mp4", "--at", "1"), clip),
+                         (("transcribe", "demo.mp4"), clip), (("open", "demo.mp4"), clip),
+                         (("watch", "demo.mp4"), clip), (("web", "open", "index.html"), secret)):
+        e = there(*args, ok=False).get("error", {})
+        check(f"{' '.join(args[:2])}: a link out of the project is refused", e.get("code") == "ORIGIN_BLOCKED"
+              and os.path.realpath(target) in e.get("message", ""), e)
+    read = there("sheet", "../clip.mp4")
+    check("a file named as outside the project is read, as itself", read.get("file") == os.path.realpath(clip), read.get("file"))
     check("that viewer quits", viewer.end())
 
+    # A .pepper that came with a file git may track and a .gitignore that
+    # lets git see everything: the viewer's events go in a file it makes,
+    # and the .gitignore is made pepper-agent's.
+    tracked = os.path.join(work, "tracked")
+    os.makedirs(os.path.join(tracked, ".pepper"))
+    with open(os.path.join(tracked, ".pepper", "events.jsonl"), "w") as f:
+        f.write("theirs\n")
+    with open(os.path.join(tracked, ".pepper", ".gitignore"), "w") as f:
+        f.write("!*\n")
+    viewer = Viewer(agent, env, tracked)
+    check("a viewer starts in a project with a .pepper/ of its own", viewer.wait_for(b"waiting for an agent"))
+    cli = client(viewer, tracked)
+    cli("open", clip, "--name", "clip")
+    since = cli("events").get("last_id", 0)
+    viewer.keys(b"m")
+    got = cli("events", "--since", str(since), "--wait", "5")
+    mine = os.path.join(os.path.realpath(tracked), ".pepper", f"events-{viewer.pid}.jsonl")
+    check("its events go in a file it made", got.get("events_file") == mine and os.path.isfile(mine), got.get("events_file"))
+    with open(os.path.join(tracked, ".pepper", "events.jsonl")) as f:
+        check("the project's events.jsonl is left as it was", f.read() == "theirs\n")
+    with open(os.path.join(tracked, ".pepper", ".gitignore")) as f:
+        check("its .gitignore is pepper-agent's again", f.read() == "# pepper-agent's files\n*\n")
+
+    # .pepper made a link while the viewer runs (a checkout): what the human
+    # makes still goes in the folder the viewer had, never where it leads.
+    elsewhere = os.path.join(work, "elsewhere")
+    os.makedirs(os.path.join(elsewhere, "points"))
+    held = os.path.join(tracked, ".pepper-held")
+    os.rename(os.path.join(tracked, ".pepper"), held)
+    os.symlink(elsewhere, os.path.join(tracked, ".pepper"))
+    since = got.get("last_id", since)
+    viewer.keys(b"m")
+    w = next((s for s in cli("sources").get("sources", []) if s.get("name") == "clip"), {})
+    size = {"width": w.get("width") or 640, "height": w.get("height") or 360}
+    x, y = press_at(viewer, w.get("box") or [0, 0, 1, 1], size, (size["width"] / 2, size["height"] / 2))
+    viewer.keys(f"\x1b[<0;{x};{y}M\x1b[<0;{x};{y}m".encode())
+    check("a click on a video opens the note prompt", viewer.wait_for(b"note on the point"))
+    viewer.keys(b"here")
+    viewer.keys(b"\r")
+    got = cli("events", "--since", str(since), "--until", "point", "--wait", "15")
+    events = got.get("events", [])
+    point = next((e for e in events if e.get("type") == "point"), {})
+    with open(os.path.join(held, f"events-{viewer.pid}.jsonl")) as f:
+        lines = f.read().splitlines()
+    check("after .pepper became a link, the events still go in the viewer's file",
+          [e.get("type") for e in events] == ["mark", "point"] and len(lines) == 3, (events, lines))
+    names = [os.path.basename(point.get(k) or "") for k in ("snapshot", "crop")]
+    check("and a point's pictures in the points folder it had",
+          all(n and os.path.isfile(os.path.join(held, "points", n)) for n in names), point)
+    check("nothing goes where the link leads", os.listdir(os.path.join(elsewhere, "points")) == []
+          and os.listdir(elsewhere) == ["points"], os.listdir(elsewhere))
+    check("that viewer quits too", viewer.end())
+
+
+def sandbox_checks(agent, viewer, env, work, project, clip):
+    """An agent whose commands run in a sandbox: the viewer, outside it,
+    reaches nothing for it that its sandbox keeps from it."""
+    if not shutil.which("sandbox-exec"):
+        print("skip sandboxed agent: no sandbox-exec")
+        return
+    secret = os.path.realpath(os.path.join(work, "secret"))
+    os.makedirs(secret, exist_ok=True)
+    kept = os.path.join(secret, "kept.mp4")
+    shutil.copy(clip, kept)
+    link = os.path.join(work, "via-link.mp4")
+    os.symlink(kept, link)
+    profile = ('(version 1)(allow default)(deny network-outbound (remote ip))'
+               f'(deny file-read-data (subpath "{secret}"))')
+
+    def boxed(*args):
+        r = subprocess.run(["sandbox-exec", "-p", profile, agent, *args, "--viewer", str(viewer.pid)],
+                           capture_output=True, text=True, cwd=project, env=env, timeout=60)
+        if r.returncode == 0:
+            return json.loads(r.stdout)
+        return json.loads(r.stderr.strip().splitlines()[-1]) if r.stderr.strip() else {}
+
+    code = lambda r: r.get("error", {}).get("code")
+    status = boxed("status")
+    check("a sandboxed agent reaches its viewer", (status.get("viewer") or {}).get("id") == str(viewer.pid), status)
+    r = boxed("open", kept, "--name", "boxed")
+    check("but not a file its sandbox keeps from it: SANDBOXED", code(r) == "SANDBOXED", r)
+    r = boxed("open", link, "--name", "boxed")
+    check("nor through a link", code(r) == "SANDBOXED", r)
+    r = boxed("open", "https://example.com/v.mp4", "--name", "boxed")
+    check("nor an address off this machine", code(r) == "SANDBOXED", r)
+    r = boxed("open", "rtsp://127.0.0.1:9/live", "--name", "boxed")
+    check("nor a stream", code(r) == "SANDBOXED", r)
+    r = boxed("web", "open", "localhost:9", "--allow-remote", "--name", "boxed")
+    check("nor a page let reach the network", code(r) == "SANDBOXED", r)
+    r = boxed("open", clip, "--name", "boxed")
+    check("a file it may read opens", (r.get("source") or {}).get("status") == "paused", r)
+    boxed("close", "boxed")
+    if not ((status.get("deps") or {}).get("chrome") or {}).get("ok"):
+        print("skip a sandboxed agent's pages: no Chrome")
+        return
+    # A page from a file is served with its whole folder: one whose folder
+    # holds a file the sandbox keeps from the agent isn't shown for it.
+    with open(os.path.join(secret, "note.txt"), "w") as f:
+        f.write("kept from the agent")
+    beside = os.path.join(work, "beside.html")
+    with open(beside, "w") as f:
+        f.write("<p>here</p>")
+    r = boxed("web", "open", beside, "--name", "boxed-page")
+    check("a page whose folder holds a file it may not read: SANDBOXED", code(r) == "SANDBOXED", r)
+    # One in a folder of its own opens, and can't go to the file it may not
+    # read: a served page never loads file:.
+    site = os.path.join(work, "boxed-site")
+    os.makedirs(site, exist_ok=True)
+    page = os.path.join(site, "goes.html")
+    with open(page, "w") as f:
+        f.write(f'<meta http-equiv="refresh" content="0;url=file://{secret}/note.txt"><p>here</p>')
+    r = boxed("web", "open", page, "--name", "boxed-page")
+    check("a sandboxed agent's page from a file it may read opens", (r.get("source") or {}).get("name") == "boxed-page", r)
+    time.sleep(1.5)
+    r = boxed("web", "dom", "body", "--source", "boxed-page")
+    check("and what it would go to never shows", "kept from the agent" not in json.dumps(r) and "here" in json.dumps(r), r)
+    r = boxed("record", "start", "boxed-page")
+    check("a page from a file isn't recorded for it", code(r) == "SANDBOXED", r)
+    boxed("close", "boxed-page")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -1267,7 +1624,8 @@ def main():
     if not shutil.which("ffmpeg"):
         sys.exit("integration.py: needs ffmpeg")
 
-    work = tempfile.mkdtemp(prefix="pepper-agent-it-")
+    # Real paths, as answers give them (/var is a link to /private/var).
+    work = os.path.realpath(tempfile.mkdtemp(prefix="pepper-agent-it-"))
     project = os.path.join(work, "project")
     os.makedirs(project)
     clip, hostile, sound = make_media(work)
@@ -1352,7 +1710,9 @@ def main():
     check("a note keeps no control characters", "\x1b" not in note.get("text", "x\x1b") and "dark" in note.get("text", ""), note)
     mark = next((e for e in ev.get("events", []) if e.get("type") == "mark"), {})
     check("a mark has the media time", mark.get("source") == "clip" and isinstance(mark.get("time"), (int, float)), mark)
-    check("events are written to .pepper/events.jsonl", os.path.isfile(os.path.join(project, ".pepper", "events.jsonl")))
+    events_file = os.path.join(os.path.realpath(project), ".pepper", "events.jsonl")
+    check("events are written to .pepper/events.jsonl, made by the viewer",
+          ev.get("events_file") == events_file and os.path.isfile(events_file), ev.get("events_file"))
 
     t0 = time.time()
     to = cli("events", "--since", str(ev.get("last_id", 0)), "--wait", "1", ok=False)
@@ -1366,6 +1726,18 @@ def main():
     t0 = time.time()
     lp = cli("events", "--since", str(ev.get("last_id", 0)), "--wait", "10")
     check("events --wait answers when the human marks", len(lp.get("events", [])) == 1 and time.time() - t0 < 5, lp)
+
+    # What a terminal answers of its own accord (to queries printed on the
+    # pane), old mouse reports and keys in a burst (tmux's commands) aren't
+    # the human's: no event, not even a mark.
+    since = lp.get("last_id", 0)
+    viewer.keys(b"\x1bP>|ghostty 1.3.1\x1b\\")
+    viewer.keys(b"\x1bP1$r0m\x1b\\")
+    viewer.keys(b"\x1b]11;rgb:1d1d/1d1d/1d1d\x07")
+    viewer.keys(b"\x1b[M y!\x1b[M#y!")
+    viewer.keys(b"display-message -p 'y'\r")
+    quiet = cli("events", "--since", str(since))
+    check("a terminal's replies, old mouse reports and a burst of keys aren't keys", quiet.get("events") == [], quiet)
 
     # Hostile media: a file name and tags with escapes.
     h = cli("open", hostile)
@@ -1402,10 +1774,11 @@ def main():
     sock_path = os.path.join(tmp, f"pepper-agent-{os.getuid()}", f"{viewer.pid}.sock")
     check("the socket is the user's only", oct(os.stat(sock_path).st_mode & 0o777) == "0o600")
     check("its folder too", oct(os.stat(os.path.dirname(sock_path)).st_mode & 0o777) == "0o700")
+    sandbox_checks(agent, viewer, env, work, project, clip)
 
     only = a.only.split(",")
     if "edit" in only:
-        edit_checks(cli, viewer, work, project, clip, hostile)
+        edit_checks(cli, viewer, work, project, clip, hostile, sock_path)
     if "web" in only:
         web_checks(cli, viewer, work, os.path.dirname(sock_path))
     if "sharing" in only:

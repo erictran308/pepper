@@ -9,9 +9,9 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use super::player::Player;
+use super::player::{self, Player};
 use super::watch::Watch;
-use super::{New, Viewer};
+use super::{New, Viewer, check_target};
 use crate::error::{Error, Result};
 use crate::json::Value;
 use crate::{sys, text};
@@ -138,8 +138,12 @@ struct Stamp {
     inode: u64,
 }
 
+/// A plain file's size, time and inode; None for a link (its name taken
+/// by one since: never followed) or anything else.
 fn stamp(file: &Path) -> Option<Stamp> {
-    let meta = std::fs::metadata(file).ok().filter(|m| m.is_file())?;
+    let meta = std::fs::symlink_metadata(file)
+        .ok()
+        .filter(|m| m.is_file())?;
     Some(Stamp {
         len: meta.len(),
         modified: meta.mtime(),
@@ -310,11 +314,19 @@ impl Viewer {
         let target = args
             .get_str("target")
             .ok_or_else(|| Error::new("BAD_ARGS", "watch: no file"))?;
-        let file = PathBuf::from(target);
-        if !file.is_absolute() || stamp(&file).is_none() {
+        // A file, checked as open's are: the file itself is watched.
+        if !target.starts_with('/') {
             return Err(Error::new(
                 "NOT_FOUND",
                 format!("no file at {}", text::inert(target, 300)),
+            ));
+        }
+        let target = check_target(target, &self.project)?;
+        let file = PathBuf::from(&target);
+        if stamp(&file).is_none() {
+            return Err(Error::new(
+                "NOT_FOUND",
+                format!("no file at {}", text::inert(&target, 300)),
             ));
         }
         let still = file
@@ -342,7 +354,8 @@ impl Viewer {
             args,
             New {
                 kind: "watch",
-                target: target.to_owned(),
+                target,
+                references: false,
                 play: !still && args.get_bool("play") != Some(false),
                 session,
                 owner,
@@ -357,7 +370,7 @@ impl Viewer {
     pub(super) fn pipe_new(&mut self, args: &Value) -> Result<Value> {
         let format = Format::from_args(args)?;
         let (session, owner) = self.claim(args)?;
-        let fifo = self.shots.join(format!("pipe-{}", self.next_sid));
+        let fifo = self.pipes.join(format!("pipe-{}", self.next_sid));
         let _ = std::fs::remove_file(&fifo);
         sys::make_fifo(&fifo)
             .map_err(|e| Error::new("FAILED", format!("a FIFO at {}: {e}", fifo.display())))?;
@@ -378,6 +391,7 @@ impl Viewer {
             New {
                 kind: "pipe",
                 target: fifo.display().to_string(),
+                references: false,
                 play: true,
                 session,
                 owner,
@@ -434,7 +448,14 @@ impl Viewer {
                     }
                     let settled =
                         matches!(w.seen, Some((s, at)) if s == stamp && at.elapsed() >= SETTLED);
-                    if stamp.len > 0 && (settled || since.elapsed() >= AT_MOST) {
+                    // Still the file it was, as its real path: not through
+                    // a folder on the way swapped for a link since.
+                    let real = std::fs::canonicalize(&w.file).is_ok_and(|r| r == w.file);
+                    if stamp.len > 0 && !real {
+                        w.changing = None;
+                        w.seen = None;
+                        w.last_error = Some("its path now leads elsewhere: not shown again".into());
+                    } else if stamp.len > 0 && (settled || since.elapsed() >= AT_MOST) {
                         // Told the human once, not on every render of a
                         // file rendered again and again.
                         let quiet = w.reloaded_at.is_none_or(|t| sys::now() - t >= TELL_AFTER);
@@ -484,17 +505,11 @@ impl Viewer {
             Some(live) => live.load_target(&source.target),
             None => source.target.clone(),
         };
+        // A stream's address names its own (HLS's segments); a file's
+        // names nothing that's loaded.
+        let references = player::remote(&source.target);
         if let Some(player) = &mut source.player {
-            match at {
-                Some(t) => player.send(vec![
-                    "loadfile".into(),
-                    target.into(),
-                    "replace".into(),
-                    (-1).into(),
-                    format!("start={t:.3}").into(),
-                ]),
-                None => player.command(&["loadfile", &target, "replace"]),
-            };
+            player.load(&target, references, at);
             // After the load: still at the end, mpv (keep-open) pauses
             // again whatever it was told before.
             if resume {

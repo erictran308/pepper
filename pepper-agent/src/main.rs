@@ -129,7 +129,7 @@ const SPECS: &[Spec] = &[
     Spec {
         name: "open",
         usage: "open <file|url> [--name NAME] [--play] [--kind media] [--edit PROJECT] [--owner NAME] [--credentials-env VAR]",
-        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file. --owner labels its box (a session's sources have their owner's name). A stream (rtsp://, rtmp://, srt://, udp://, or HLS: an http(s) .m3u8) plays live and reconnects by itself; --credentials-env names an environment variable holding its user:password, never shown.",
+        about: "Shows a video, a picture or a video's web address in the viewer, paused on its first frame unless --play. Answers once it shows (30 s at most). Opening a --name again shows the new file in that source's box. --edit ties a render to the cut it was made from (an edit project, or video-use's edl.json), so marks on it give the clip and the time in its file. --owner labels its box (a session's sources have their owner's name). A stream (rtsp://, rtmp://, srt://, udp://, or HLS: an http(s) .m3u8) plays live and reconnects by itself; --credentials-env names a PEPPER_CREDENTIALS_… environment variable holding its user:password@host (sent to that host only; a stream's or a video's address, never a page's), never shown.",
         example: "pepper-agent open raw/take1.mp4 --name take1",
         values: &["name", "kind", "edit", "owner", "credentials-env"],
         flags: &["play"],
@@ -1244,12 +1244,16 @@ fn edit_preview(args: &Args) -> Result<Value> {
     let edl = dir.join(format!("{}.edl", files::name_part(&name)));
     files::write_private(&edl, edit::edl(&project).as_bytes())
         .map_err(|e| Error::new("FAILED", format!("{}: {e}", edl.display())))?;
+    // `edl`, which nothing else sends (no option makes it): the viewer may
+    // follow this file's references, once it's checked that it's its own
+    // EDL of the timeline, in `.pepper/edits/`. No other file's are.
     let request = Value::obj()
         .with("target", edl.display().to_string())
         .with("kind", "media")
         .with("name", name)
         .with("play", args.flag("play"))
-        .with("edit", edit::Timeline::of(&project).to_json());
+        .with("edit", edit::Timeline::of(&project).to_json())
+        .with("edl", true);
     let (viewer, opened) = recordings::ask(args, "open", request, Duration::from_secs(60))?;
     Ok(Value::obj()
         .with("viewer", viewer.id.as_str())
@@ -1305,7 +1309,16 @@ fn request_args(spec: &Spec, args: &Args) -> Result<Value> {
                     ));
                 }
             };
+            // Only a stream's or a video's address takes a password: never a
+            // page's, which would carry it to whatever the page loads.
             let target = match args.value("credentials-env") {
+                Some(_) if kind == "web" => {
+                    return Err(Error::new(
+                        "BAD_ARGS",
+                        "--credentials-env goes with a stream's or a video's address, not a page's",
+                    )
+                    .hint("Open the page without it; a page on this machine that asks for a password: give it with web type."));
+                }
                 Some(var) => with_credentials(&target, var)?,
                 None => target,
             };
@@ -1516,10 +1529,28 @@ enum Target {
     Web(String),
 }
 
+/// The environment variables --credentials-env reads: only those the user
+/// set aside for it, so no other (a token, a database's address) can be
+/// sent to an address as a password.
+const CREDENTIALS_PREFIX: &str = "PEPPER_CREDENTIALS_";
+
 /// `url` with the user and password held by the environment variable
-/// `var`, which is never printed.
+/// `var` (a PEPPER_CREDENTIALS_ one), which is never printed. The user
+/// names the host they're for with them (`user:password@host`): they're
+/// sent there only, never to a host a command names.
 fn with_credentials(url: &str, var: &str) -> Result<String> {
-    let credentials = std::env::var(var).map_err(|_| {
+    let how = "The user sets the camera's user, password and host aside (export PEPPER_CREDENTIALS_CAM=user:password@cam.local), then you name it: --credentials-env PEPPER_CREDENTIALS_CAM. They're sent to that host only.";
+    if !var.starts_with(CREDENTIALS_PREFIX) || var.len() == CREDENTIALS_PREFIX.len() {
+        return Err(Error::new(
+            "BAD_ARGS",
+            format!(
+                "--credentials-env reads only variables named {CREDENTIALS_PREFIX}…, not {}",
+                text::inert(var, 60)
+            ),
+        )
+        .hint(how));
+    }
+    let value = std::env::var(var).map_err(|_| {
         Error::new(
             "BAD_ARGS",
             format!(
@@ -1527,7 +1558,7 @@ fn with_credentials(url: &str, var: &str) -> Result<String> {
                 text::inert(var, 60)
             ),
         )
-        .hint("Set it to user:password (export CAM=user:password), then name it: --credentials-env CAM.")
+        .hint(how)
     })?;
     if !url.contains("://") {
         return Err(Error::new(
@@ -1535,13 +1566,76 @@ fn with_credentials(url: &str, var: &str) -> Result<String> {
             "--credentials-env goes with an address, not a file",
         ));
     }
-    text::with_credentials(url, &credentials)
+    // Neither part of the value is said back: a host that isn't one may
+    // be the end of a password.
+    let (credentials, host) = value
+        .rsplit_once('@')
+        .filter(|(c, h)| !c.is_empty() && !h.is_empty())
+        .ok_or_else(|| {
+            Error::new(
+                "BAD_ARGS",
+                format!(
+                    "--credentials-env: {} doesn't say which host it's for",
+                    text::inert(var, 60)
+                ),
+            )
+            .hint(how)
+        })?;
+    if !host_is(url, host) {
+        return Err(Error::new(
+            "BAD_ARGS",
+            format!(
+                "--credentials-env: {} is for another host than this address's",
+                text::inert(var, 60)
+            ),
+        )
+        .hint(how));
+    }
+    text::with_credentials(url, credentials)
         .map_err(|e| Error::new("BAD_ARGS", format!("--credentials-env: {e}")))
+}
+
+/// Whether `url`'s host is `host` (`name`, `name:port`, `[v6]:port`): the
+/// same name, any case, and the same port if `host` says one.
+fn host_is(url: &str, host: &str) -> bool {
+    let split = |a: &str| -> (String, Option<String>) {
+        let (name, port) = match a.strip_prefix('[') {
+            Some(v6) => {
+                let (name, after) = v6.split_once(']').unwrap_or((v6, ""));
+                (name, after.strip_prefix(':'))
+            }
+            None => match a.rsplit_once(':') {
+                Some((name, port)) => (name, Some(port)),
+                None => (a, None),
+            },
+        };
+        (name.to_ascii_lowercase(), port.map(str::to_owned))
+    };
+    let Some((_, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let authority = &rest[..rest.find(['/', '?', '#']).unwrap_or(rest.len())];
+    let (have, have_port) = split(authority.rsplit('@').next().unwrap_or(authority));
+    let (want, want_port) = split(host);
+    !want.is_empty() && want == have && want_port.is_none_or(|p| Some(p) == have_port)
+}
+
+/// What to say of a password sent to `url`: whether it crosses the network
+/// as it is (rtsp, rtmp, http, udp, srt), not encrypted (rtsps, rtmps,
+/// https).
+fn cleartext_warning(url: &str) -> Option<String> {
+    let scheme = url.split_once("://")?.0.to_ascii_lowercase();
+    matches!(scheme.as_str(), "rtsp" | "rtmp" | "http" | "udp" | "srt").then(|| {
+        format!(
+            "{scheme}:// isn't encrypted: the password may cross the network as it is, for anyone on the way to read. If the camera has {scheme}s://, use that."
+        )
+    })
 }
 
 /// What `open` loads: an absolute path to a file, a video's web address, or
 /// a page on this machine (an address of localhost, an HTML file), which
-/// is a web source.
+/// is a web source. A file is the real one (`media::local_file`), a page or
+/// a video by its own name, not a link's.
 fn open_target(given: &str) -> Result<Target> {
     if let Some((scheme, _)) = given.split_once("://")
         && scheme
@@ -1576,15 +1670,36 @@ fn open_target(given: &str) -> Result<Target> {
         )
     });
     Ok(if html {
-        Target::Web(format!("file://{}", file.display()))
+        Target::Web(format!("file://{}", viewer::url_path(&file)))
     } else {
         Target::Media(file.display().to_string())
     })
 }
 
 /// A page's address as given: `localhost:5173` is `http://localhost:5173`,
-/// a file is its `file://` address.
+/// a file is its `file://` address, of the real file (`media::local_file`),
+/// as is a `file://` address given.
 fn web_target(given: &str) -> Result<String> {
+    if let Some(rest) = given
+        .get(..7)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("file://"))
+        .map(|_| &given[7..])
+        && rest.starts_with('/')
+    {
+        let end = rest.find(['?', '#']).unwrap_or(rest.len());
+        let path = percent_decoded(&rest[..end]).ok_or_else(|| {
+            Error::new(
+                "BAD_ARGS",
+                format!("{}: not a file's address", text::inert(given, 300)),
+            )
+        })?;
+        let file = media::local_file(&path)?;
+        return Ok(format!(
+            "file://{}{}",
+            viewer::url_path(&file),
+            &rest[end..]
+        ));
+    }
     if given == "about:blank" || given.contains("://") {
         return Ok(given.to_owned());
     }
@@ -1597,7 +1712,33 @@ fn web_target(given: &str) -> Result<String> {
         return Ok(format!("http://{given}"));
     }
     let file = media::local_file(given)?;
-    Ok(format!("file://{}", file.display()))
+    Ok(format!("file://{}", viewer::url_path(&file)))
+}
+
+/// A URL's path with its `%XX` made the bytes they stand for: text, or
+/// None.
+fn percent_decoded(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(b)) => {
+                out.push(b);
+                i += 3;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok().filter(|s| !s.contains('\0'))
 }
 
 /// `watch`: a file shown again when it's rendered again; a page (SVG,
@@ -1671,6 +1812,11 @@ fn to_viewer(spec: &Spec, args: &Args) -> Result<Value> {
             }
         }
         "where" => add_said(&mut answer, &mut words),
+        "open" if args.value("credentials-env").is_some() => {
+            if let Some(warning) = args.plain.first().and_then(|t| cleartext_warning(t)) {
+                answer.set("warning", warning);
+            }
+        }
         _ => {}
     }
     if let Value::Obj(members) = &mut answer {
@@ -1840,7 +1986,6 @@ fn snapshot(spec: &Spec, args: &Args) -> Result<Value> {
     } else {
         "snapshot"
     };
-    let dir = proto::run_dir()?;
     let (viewer, shot) = recordings::ask(args, cmd, request, Duration::from_secs(60))?;
     // A page's region is in CSS pixels; its picture, in the device's.
     let dpr = shot
@@ -1851,14 +1996,8 @@ fn snapshot(spec: &Spec, args: &Args) -> Result<Value> {
         (Some(r), Some(dpr)) => Some(r.map(|n| (n as f64 * dpr).round() as u32)),
         (r, _) => r,
     };
-    let raw = PathBuf::from(shot.get_str("raw").unwrap_or(""));
-    // Only a file in this user's own folder for the viewers.
-    if !raw.starts_with(&dir) || !raw.is_file() {
-        return Err(Error::new(
-            "FAILED",
-            "the viewer's snapshot isn't where it should be",
-        ));
-    }
+    // Only a file the viewer made, in its own folder for them.
+    let raw = proto::raw_file(&viewer.id, shot.get_str("raw").unwrap_or(""))?;
     let name = shot.get_str("source").unwrap_or("source");
     let stamp: String = sys::iso_time(sys::now())
         .chars()
@@ -2264,23 +2403,79 @@ mod tests {
         assert_eq!(open_target("av://lavfi:x").unwrap_err().code, "UNSUPPORTED");
         // A password from the environment, never in the command line.
         let open = SPECS.iter().find(|s| s.name == "open").unwrap();
-        let line = |extra: &[&str]| {
-            let words: Vec<String> = ["rtsp://cam:554/s"]
+        let line = |target: &str, extra: &[&str]| {
+            let words: Vec<String> = [target]
                 .iter()
                 .chain(extra)
                 .map(|s| s.to_string())
                 .collect();
             request_args(open, &parse_args(open, &words).unwrap())
         };
-        unsafe { std::env::set_var("PEPPER_AGENT_TEST_CAM", "me:se/cret") };
-        let made = line(&["--credentials-env", "PEPPER_AGENT_TEST_CAM"]).unwrap();
+        unsafe { std::env::set_var("PEPPER_CREDENTIALS_TEST_CAM", "me:se/c@ret@CAM:554") };
+        let cam = ["--credentials-env", "PEPPER_CREDENTIALS_TEST_CAM"];
+        let made = line("rtsp://cam:554/s", &cam).unwrap();
         assert_eq!(
             made.get_str("target"),
-            Some("rtsp://me:se%2Fcret@cam:554/s")
+            Some("rtsp://me:se%2Fc%40ret@cam:554/s")
         );
         assert_eq!(made.get_str("kind"), Some("stream"));
-        let unset = line(&["--credentials-env", "PEPPER_AGENT_NO_SUCH_VAR"]).unwrap_err();
+        // Sent only to the host it names: not another, nor another port.
+        for elsewhere in [
+            "rtsp://attacker.example/s",
+            "rtsp://cam:8554/s",
+            "rtsp://cam.evil:554/s",
+        ] {
+            let e = line(elsewhere, &cam).unwrap_err();
+            assert!(
+                e.code == "BAD_ARGS" && !e.message.contains("ret"),
+                "{elsewhere}: {e:?}"
+            );
+        }
+        unsafe { std::env::set_var("PEPPER_CREDENTIALS_TEST_VIDEO", "me:pw@example.com") };
+        let video = line(
+            "https://example.com/v.mp4",
+            &["--credentials-env", "PEPPER_CREDENTIALS_TEST_VIDEO"],
+        )
+        .unwrap();
+        assert_eq!(
+            video.get_str("target"),
+            Some("https://me:pw@example.com/v.mp4")
+        );
+        // A value that names no host is refused, saying nothing of it.
+        unsafe { std::env::set_var("PEPPER_CREDENTIALS_TEST_BARE", "me:secret") };
+        let bare = line(
+            "rtsp://cam/s",
+            &["--credentials-env", "PEPPER_CREDENTIALS_TEST_BARE"],
+        )
+        .unwrap_err();
+        assert!(bare.code == "BAD_ARGS" && !bare.message.contains("secret"));
+        assert!(
+            host_is("rtsp://[::1]:8554/s", "[::1]:8554")
+                && !host_is("rtsp://[::1]/s", "[::1]:8554")
+        );
+        let unset = line(
+            "rtsp://cam:554/s",
+            &["--credentials-env", "PEPPER_CREDENTIALS_NO_SUCH"],
+        );
+        let unset = unset.unwrap_err();
         assert!(!unset.message.contains("cret") && unset.code == "BAD_ARGS");
+        // Only a variable set aside for it, and never for a page.
+        unsafe { std::env::set_var("PEPPER_AGENT_TEST_DB", "u:dbpass") };
+        for (target, var) in [
+            ("rtsp://cam:554/s", "PEPPER_AGENT_TEST_DB"),
+            ("rtsp://cam:554/s", "PEPPER_CREDENTIALS_"),
+            ("http://localhost:5173/", "PEPPER_CREDENTIALS_TEST_CAM"),
+        ] {
+            let e = line(target, &["--credentials-env", var]).unwrap_err();
+            assert!(
+                e.code == "BAD_ARGS" && !e.message.contains("pass"),
+                "{target} {var}: {e:?}"
+            );
+        }
+        assert!(cleartext_warning("rtsp://cam/s").is_some_and(|w| w.contains("rtsps://")));
+        assert!(cleartext_warning("http://h/live.m3u8").is_some());
+        assert_eq!(cleartext_warning("rtsps://cam/s"), None);
+        assert_eq!(cleartext_warning("https://h/v.mp4"), None);
         assert_eq!(
             open_target("no-such-file.mp4").unwrap_err().code,
             "NOT_FOUND"
@@ -2302,6 +2497,35 @@ mod tests {
         assert_eq!(web_target("https://x.dev").unwrap(), "https://x.dev");
         assert_eq!(web_target(manifest).unwrap(), format!("file://{manifest}"));
         assert_eq!(web_target("nope.html").unwrap_err().code, "NOT_FOUND");
+        // A name with a space or a % in it: given as a path or an address,
+        // it comes back as an address that reads as that file again.
+        let dir = std::env::temp_dir().join(format!("pepper-web-target-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let odd = dir.canonicalize().unwrap().join("My Site 100%#.html");
+        std::fs::write(&odd, "x").unwrap();
+        for given in [
+            odd.display().to_string(),
+            format!("file://{}", viewer::url_path(&odd)),
+        ] {
+            let url = web_target(&given).unwrap();
+            let path = url.strip_prefix("file://").and_then(percent_decoded);
+            assert_eq!(path.as_deref(), odd.to_str(), "{url}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        // A file's address is checked as its path is.
+        let encoded = manifest.replace("Cargo", "Carg%6f");
+        assert_eq!(
+            web_target(&format!("FILE://{encoded}#top")).unwrap(),
+            format!("file://{manifest}#top")
+        );
+        assert_eq!(
+            web_target("file:///no/such/page.html").unwrap_err().code,
+            "NOT_FOUND"
+        );
+        assert_eq!(percent_decoded("/a%20b%2").as_deref(), Some("/a b%2"));
+        assert_eq!(percent_decoded("/%+1").as_deref(), Some("/%+1"));
+        assert_eq!(percent_decoded("/%ff"), None);
+        assert_eq!(percent_decoded("/%00"), None);
     }
 
     #[test]

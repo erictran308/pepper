@@ -81,7 +81,7 @@ pub fn stop(args: &Args, source: Option<&str>) -> Result<Value> {
         out = dir.join(format!("{}-{stamp}-{k}.mp4", files::name_part(&name)));
     }
     let mut answer = if let Some(raw) = done.get_str("raw") {
-        take_raw(Path::new(raw), &out)?;
+        take_raw(&viewer, raw, &out)?;
         let duration = media::probe(&work, &out).ok().and_then(|p| p.duration);
         let sheet = sheet_of(&work, &out);
         Value::obj()
@@ -164,18 +164,21 @@ pub fn stop(args: &Args, source: Option<&str>) -> Result<Value> {
 }
 
 /// The viewer's recording, from its own folder into `out`.
-fn take_raw(raw: &Path, out: &Path) -> Result<()> {
-    let run = proto::run_dir()?;
-    if raw.starts_with(&run) && raw.extension().is_some_and(|e| e == "mkv") && !raw.is_file() {
+fn take_raw(viewer: &proto::Viewer, raw: &str, out: &Path) -> Result<()> {
+    let outputs = proto::outputs_path()
+        .ok_or_else(|| Error::new("FAILED", "this user has no home folder"))?;
+    let place = proto::raw_path(&outputs, &viewer.id, raw)?;
+    // Made empty beforehand: nothing came if it's still so.
+    if place.extension().is_some_and(|e| e == "mkv")
+        && std::fs::symlink_metadata(&place)
+            .ok()
+            .is_none_or(|m| m.len() == 0)
+    {
         return Err(Error::new("FAILED", "nothing came while it was recorded")
             .hint("Record while it plays: pepper-agent where says its status."));
     }
-    if !raw.starts_with(&run) || !raw.is_file() {
-        return Err(Error::new(
-            "FAILED",
-            "the viewer's recording isn't where it should be",
-        ));
-    }
+    // Only a file the viewer made, in its own folder for them.
+    let raw = &proto::raw_file(&viewer.id, raw)?;
     files::make_way(out).map_err(|e| Error::new("FAILED", format!("{}: {e}", out.display())))?;
     if raw.extension().is_some_and(|e| e == "mkv") {
         // mpv answers before it has closed the file: until it stops growing.
@@ -205,9 +208,9 @@ fn take_raw(raw: &Path, out: &Path) -> Result<()> {
 fn to_mp4(raw: &Path, out: &Path) -> Result<()> {
     let ffmpeg = media::tool("ffmpeg")?;
     let made = |codecs: &[&str]| -> std::result::Result<(), String> {
-        let done = std::process::Command::new(&ffmpeg)
-            .args(["-nostdin", "-v", "error", "-y", "-i"])
-            .arg(format!("file:{}", raw.display()))
+        let done = media::command(&ffmpeg)
+            .args(["-nostdin", "-v", "error", "-y"])
+            .args(media::input(raw))
             .args(["-map", "0:v:0", "-map", "0:a?"])
             .args(codecs)
             .args(["-movflags", "+faststart", "-f", "mp4"])

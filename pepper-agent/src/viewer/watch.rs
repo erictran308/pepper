@@ -4,6 +4,7 @@
 
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 
 use super::Msg;
@@ -19,8 +20,8 @@ const LATENCY: f64 = 0.1;
 struct StreamContext {
     version: isize,
     info: *mut c_void,
-    retain: *const c_void,
-    release: *const c_void,
+    retain: Option<extern "C" fn(*const c_void) -> *const c_void>,
+    release: Option<extern "C" fn(*const c_void)>,
     describe: *const c_void,
 }
 
@@ -72,7 +73,9 @@ unsafe extern "C" {
     fn dispatch_release(object: *mut c_void);
 }
 
-/// What the callback needs: where to say so.
+/// What the callback needs: where to say so. FSEvents holds a reference to
+/// it (retain_info, release_info) and lets go only when the stream is gone,
+/// after a callback that was running when it was stopped has returned.
 struct Info {
     sid: u64,
     tx: Sender<Msg>,
@@ -81,12 +84,26 @@ struct Info {
 pub struct Watch {
     stream: *mut c_void,
     queue: *mut c_void,
-    info: *mut Info,
+    /// Its Info, for a test to see when it goes.
+    #[cfg(test)]
+    info: std::sync::Weak<Info>,
 }
 
 // SAFETY: the stream and queue are only started and torn down, from one
 // thread at a time; the callback runs on the queue.
 unsafe impl Send for Watch {}
+
+extern "C" fn retain_info(info: *const c_void) -> *const c_void {
+    // SAFETY: an Arc<Info>'s pointer (Watch::start), alive while FSEvents
+    // holds it.
+    unsafe { Arc::increment_strong_count(info.cast::<Info>()) };
+    info
+}
+
+extern "C" fn release_info(info: *const c_void) {
+    // SAFETY: as above; FSEvents gives back the reference it took.
+    unsafe { Arc::decrement_strong_count(info.cast::<Info>()) };
+}
 
 /// Whether a change at `path` counts: not in a folder of tools' own.
 fn counts(path: &str) -> bool {
@@ -103,14 +120,16 @@ extern "C" fn changed(
     _flags: *const u32,
     _ids: *const u64,
 ) {
-    // SAFETY: FSEvents passes the context's info, alive until the stream is
-    // invalidated, and `count` C strings.
+    // SAFETY: FSEvents passes the context's info, which it holds a
+    // reference to while it may call back, and `count` C strings.
     let (info, paths) = unsafe {
         (
             &*(info as *const Info),
             std::slice::from_raw_parts(paths as *const *const c_char, count),
         )
     };
+    #[cfg(test)]
+    tests::hold(info.sid);
     let any = paths.iter().any(|&p| {
         // SAFETY: each is a NUL-terminated path.
         !p.is_null() && counts(&unsafe { CStr::from_ptr(p) }.to_string_lossy())
@@ -123,14 +142,14 @@ extern "C" fn changed(
 impl Watch {
     pub fn start(dir: &Path, sid: u64, tx: Sender<Msg>) -> Option<Watch> {
         let path = CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
-        let info = Box::into_raw(Box::new(Info { sid, tx }));
+        // FSEvents takes its own reference to it, if it makes the stream;
+        // this one goes at the end of start.
+        let info = Arc::new(Info { sid, tx });
         // SAFETY: CoreFoundation and FSEvents calls on what's made here; the
-        // array and string are released once the stream holds them, and
-        // `info` lives until Drop.
+        // array and string are released once the stream holds them.
         unsafe {
             let string = CFStringCreateWithCString(std::ptr::null(), path.as_ptr(), UTF8);
             if string.is_null() {
-                drop(Box::from_raw(info));
                 return None;
             }
             let paths = CFArrayCreate(
@@ -142,9 +161,9 @@ impl Watch {
             CFRelease(string);
             let context = StreamContext {
                 version: 0,
-                info: info.cast(),
-                retain: std::ptr::null(),
-                release: std::ptr::null(),
+                info: Arc::as_ptr(&info).cast_mut().cast(),
+                retain: Some(retain_info),
+                release: Some(release_info),
                 describe: std::ptr::null(),
             };
             let stream = FSEventStreamCreate(
@@ -158,7 +177,6 @@ impl Watch {
             );
             CFRelease(paths);
             if stream.is_null() {
-                drop(Box::from_raw(info));
                 return None;
             }
             let queue = dispatch_queue_create(c"pepper-agent.watch".as_ptr(), std::ptr::null());
@@ -166,7 +184,8 @@ impl Watch {
             let watch = Watch {
                 stream,
                 queue,
-                info,
+                #[cfg(test)]
+                info: Arc::downgrade(&info),
             };
             (FSEventStreamStart(stream) != 0).then_some(watch)
         }
@@ -175,14 +194,14 @@ impl Watch {
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        // SAFETY: tears down what start made, in order: once invalidated, the
-        // callback won't run again, so `info` can go.
+        // SAFETY: tears down what start made, in order. A callback running
+        // meanwhile goes on with its Info: FSEvents lets go of it only once
+        // that has returned (release_info).
         unsafe {
             FSEventStreamStop(self.stream);
             FSEventStreamInvalidate(self.stream);
             FSEventStreamRelease(self.stream);
             dispatch_release(self.queue);
-            drop(Box::from_raw(self.info));
         }
     }
 }
@@ -190,7 +209,22 @@ impl Drop for Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Barrier, OnceLock};
+    use std::time::{Duration, Instant};
+
+    /// The sid whose first callback a test holds: it waits there till let go.
+    const HELD: u64 = 4242;
+    static HOLD: OnceLock<(Barrier, Barrier)> = OnceLock::new();
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn hold(sid: u64) {
+        if sid == HELD && !TAKEN.swap(true, Ordering::SeqCst) {
+            let (entered, go) = HOLD.get_or_init(|| (Barrier::new(2), Barrier::new(2)));
+            entered.wait();
+            go.wait();
+        }
+    }
 
     #[test]
     fn what_counts() {
@@ -206,6 +240,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("pepper-agent-watch-{}", std::process::id()));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let dir = dir.canonicalize().unwrap();
+        // FSEvents may still tell of the folder's making, just before.
+        std::thread::sleep(Duration::from_millis(500));
         let (tx, rx) = std::sync::mpsc::channel();
         let watch = Watch::start(&dir, 7, tx).unwrap();
         std::thread::sleep(Duration::from_millis(300));
@@ -215,6 +251,40 @@ mod tests {
         let got = rx.recv_timeout(Duration::from_secs(3));
         assert!(matches!(got, Ok(Msg::Watch(7))));
         drop(watch);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_callback_running_when_its_watch_ends_keeps_its_info() {
+        let dir = std::env::temp_dir().join(format!("pepper-agent-held-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = Watch::start(&dir, HELD, tx).unwrap();
+        let info = watch.info.clone();
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(dir.join("page.html"), "x").unwrap();
+        let (entered, go) = HOLD.get_or_init(|| (Barrier::new(2), Barrier::new(2)));
+        // The callback is running, held: the watch ends meanwhile.
+        entered.wait();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(watch);
+            let _ = done_tx.send(());
+        });
+        assert!(done.recv_timeout(Duration::from_secs(2)).is_ok());
+        assert!(info.upgrade().is_some(), "freed under a running callback");
+        // Let go: it says so, then its Info goes with the stream.
+        go.wait();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Msg::Watch(HELD))
+        ));
+        let end = Instant::now() + Duration::from_secs(2);
+        while info.upgrade().is_some() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(info.upgrade().is_none(), "never let go");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

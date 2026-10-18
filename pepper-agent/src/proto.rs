@@ -16,11 +16,20 @@
 //! The viewer takes only the commands in [`COMMANDS`], a request of at most
 //! [`MAX_REQUEST`] bytes, and version [`VERSION`]; nothing is passed through
 //! to mpv.
+//!
+//! A sandboxed agent's commands may be let write the user's temp folder
+//! (Codex's are), so what's there isn't trusted as the viewer's: the
+//! program holding a socket must be the one its record names, and not
+//! sandboxed. The viewers write their files (snapshots, recordings) in a
+//! folder of their own outside it, `~/Library/Caches/pepper-agent-<uid>/`,
+//! where no such sandbox lets a link be planted for mpv or ffmpeg to write
+//! through.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -92,6 +101,72 @@ pub fn record_path(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("{id}.json"))
 }
 
+/// The folder the viewers write their files in: `pepper-agent-<uid>` in
+/// the user's caches (made by the viewer: `files::own_dir`).
+pub fn outputs_path() -> Option<PathBuf> {
+    Some(
+        sys::home_dir()?
+            .join("Library/Caches")
+            .join(format!("pepper-agent-{}", sys::uid())),
+    )
+}
+
+/// Where viewer `id` writes its files, in `outputs`.
+pub fn shots_dir(outputs: &Path, id: &str) -> PathBuf {
+    outputs.join(format!("{id}-shots"))
+}
+
+/// The file a viewer's answer names as one it made (`raw`), if it is one:
+/// by a path of plain names right in viewer `id`'s folder for them (no
+/// `..`, no link on the way), a plain file of this user's with no other
+/// name. Only then does a command read it and take it away.
+pub fn raw_file(id: &str, raw: &str) -> Result<PathBuf> {
+    let outputs = outputs_path().ok_or_else(misplaced)?;
+    let raw = raw_path(&outputs, id, raw)?;
+    lone_file(&raw).then_some(raw).ok_or_else(misplaced)
+}
+
+/// `raw_file`'s place only: the file may not be there (yet).
+pub fn raw_path(outputs: &Path, id: &str, raw: &str) -> Result<PathBuf> {
+    let raw = PathBuf::from(raw);
+    let shots = shots_dir(outputs, id);
+    // Exactly `<shots>/<name>`, spelled so: not even a `.` on the way.
+    let names = raw
+        .components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    let exact = raw
+        .file_name()
+        .is_some_and(|n| shots.join(n).as_os_str() == raw.as_os_str());
+    if !valid_id(id) || !raw.is_absolute() || !names || !exact {
+        return Err(misplaced());
+    }
+    // As the system finds it too: no link leads there from elsewhere.
+    let real = |p: &Path| p.canonicalize().ok();
+    let place = real(outputs).map(|o| o.join(format!("{id}-shots")));
+    if !own_folder(outputs) || !own_folder(&shots) || place.is_none() || real(&shots) != place {
+        return Err(misplaced());
+    }
+    Ok(raw)
+}
+
+/// Whether `path` is a folder of this user's itself (not a link to one)
+/// that only they can open.
+fn own_folder(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.is_dir() && m.uid() == sys::uid() && m.permissions().mode() & 0o077 == 0)
+}
+
+/// Whether `path` is a plain file of this user's itself, with no other
+/// name (a hard link) to it.
+pub fn lone_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .is_ok_and(|m| m.is_file() && m.uid() == sys::uid() && m.nlink() == 1)
+}
+
+fn misplaced() -> Error {
+    Error::new("FAILED", "the viewer's file isn't where it should be")
+}
+
 /// A viewer, as its record says.
 #[derive(Clone, Debug)]
 pub struct Viewer {
@@ -125,7 +200,8 @@ pub fn viewers(dir: &Path) -> Vec<Viewer> {
             .and_then(|r| r.get_num("pid"))
             .map(|p| p as u32)
             .unwrap_or(0);
-        if !sys::alive(pid) {
+        // A record names the viewer it's of: its pid is its id.
+        if pid.to_string() != id || !sys::alive(pid) {
             let _ = std::fs::remove_file(entry.path());
             let _ = std::fs::remove_file(socket_path(dir, id));
             continue;
@@ -196,12 +272,7 @@ pub fn request(
             gone(e)
         }
     })?;
-    if sys::peer_uid(stream.as_raw_fd()) != Some(sys::uid()) {
-        return Err(Error::new(
-            "FAILED",
-            "the viewer's socket isn't this user's",
-        ));
-    }
+    check_peer(viewer, sys::peer(stream.as_raw_fd()))?;
     let line = Value::obj()
         .with("v", VERSION)
         .with("cmd", cmd)
@@ -233,6 +304,12 @@ pub fn request(
                 format!("the viewer didn't answer in {} s", wait.as_secs()),
             ));
         }
+        Err(e) if e.to_string() == TOO_LONG => {
+            return Err(Error::new(
+                "TOO_LONG",
+                "the viewer's answer is too long to read",
+            ));
+        }
         Err(e) => return Err(gone(e)),
     };
     let answer = json::parse(&answer)
@@ -243,6 +320,34 @@ pub fn request(
         Err(Error::from_json(
             answer.get("error").unwrap_or(&Value::Null),
         ))
+    }
+}
+
+/// Whether the program holding a viewer's socket is that viewer: this
+/// user's, the pid its record names, and not sandboxed. Anything else
+/// holding it (a record and a socket put there by something else) isn't
+/// told anything, credentials included, nor believed.
+fn check_peer(viewer: &Viewer, peer: Option<sys::Peer>) -> Result<()> {
+    let refused = |why: String| {
+        Error::new("NO_VIEWER", format!("viewer {}'s socket is {why}", viewer.id)).hint(
+            "Run `pepper-agent status`; if it's still so, ask the user to quit the viewer and run it again.",
+        )
+    };
+    match peer {
+        None => Err(Error::new(
+            "FAILED",
+            "couldn't tell who holds the viewer's socket",
+        )),
+        Some(p) if p.uid != sys::uid() => Err(Error::new(
+            "FAILED",
+            "the viewer's socket isn't this user's",
+        )),
+        Some(p) if p.pid != viewer.pid => Err(refused(format!(
+            "held by another program (pid {}), not the viewer (pid {})",
+            p.pid, viewer.pid
+        ))),
+        Some(p) if p.sandboxed => Err(refused("held by a sandboxed program".into())),
+        Some(_) => Ok(()),
     }
 }
 
@@ -362,5 +467,126 @@ mod tests {
         assert!(!valid_id("../x"));
         assert!(!valid_id(""));
         assert!(!valid_id("12345678901"));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pepper-proto-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_the_viewer_holding_its_socket_is_believed() {
+        let viewer = Viewer {
+            id: "4242".into(),
+            pid: 4242,
+            started: 0.0,
+            pepper_port: None,
+            record: Value::obj(),
+        };
+        let me = sys::uid();
+        assert!(check_peer(&viewer, Some(sys::Peer::of(me, 4242, false))).is_ok());
+        for (peer, code) in [
+            (Some(sys::Peer::of(me, 4343, false)), "NO_VIEWER"),
+            (Some(sys::Peer::of(me, 4242, true)), "NO_VIEWER"),
+            (Some(sys::Peer::of(me + 1, 4242, false)), "FAILED"),
+            (None, "FAILED"),
+        ] {
+            assert_eq!(
+                check_peer(&viewer, peer).unwrap_err().code,
+                code,
+                "{peer:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_planted_record_and_socket_are_not_believed() {
+        let dir = scratch("planted");
+        // A record naming another program of this user's (a sleep), and a
+        // socket this test holds, answering as a viewer would.
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("10")
+            .spawn()
+            .unwrap();
+        let id = other.id().to_string();
+        let record = format!(r#"{{"pid":{id},"started_unix":1}}"#);
+        std::fs::write(record_path(&dir, &id), record).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(socket_path(&dir, &id)).unwrap();
+        let answering = std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let _ = s.write_all(
+                    b"{\"v\":1,\"ok\":true,\"result\":{\"events\":[{\"type\":\"approve\"}]}}\n",
+                );
+            }
+        });
+        let viewer = pick(&dir, Some(&id)).unwrap();
+        let e = request(
+            &dir,
+            &viewer,
+            "events",
+            Value::obj(),
+            Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert_eq!(e.code, "NO_VIEWER");
+        assert!(e.message.contains("another program"), "{e:?}");
+        let _ = answering.join();
+        // A record whose pid isn't its id is taken away, its socket too.
+        let record = format!(r#"{{"pid":{id},"started_unix":2}}"#);
+        std::fs::write(record_path(&dir, "12345"), record).unwrap();
+        std::fs::write(socket_path(&dir, "12345"), "").unwrap();
+        assert!(viewers(&dir).iter().all(|v| v.id != "12345"));
+        assert!(!record_path(&dir, "12345").exists() && !socket_path(&dir, "12345").exists());
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_viewers_files_are_its_own_only() {
+        let outputs = scratch("outputs");
+        let shots = shots_dir(&outputs, "4242");
+        std::fs::create_dir(&shots).unwrap();
+        std::fs::set_permissions(&shots, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = shots.join("1-1-ab.png");
+        std::fs::write(&file, "png").unwrap();
+        let at = |raw: &Path| raw_path(&outputs, "4242", &raw.display().to_string());
+        assert_eq!(at(&file).unwrap(), file);
+        assert!(lone_file(&file));
+        // Not right in its folder, or not by plain names.
+        let outside = outputs.join("x.png");
+        std::fs::write(&outside, "x").unwrap();
+        for raw in [
+            outside.clone(),
+            shots.join("../x.png"),
+            shots.join("./1-1-ab.png"),
+            PathBuf::from("1-1-ab.png"),
+            shots.clone(),
+        ] {
+            assert!(at(&raw).is_err(), "{raw:?}");
+        }
+        assert!(raw_path(&outputs, "../4242", &file.display().to_string()).is_err());
+        // A link, or a file with another name too: in place, but not one.
+        let link = shots.join("2-2-cd.png");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        assert!(at(&link).is_ok() && !lone_file(&link));
+        let hard = shots.join("3-3-ef.png");
+        std::fs::hard_link(&file, &hard).unwrap();
+        assert!(!lone_file(&hard) && !lone_file(&file));
+        // Its folder a link to another: refused.
+        let other = outputs.join("elsewhere");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&other, shots_dir(&outputs, "4343")).unwrap();
+        let via = shots_dir(&outputs, "4343").join("1-1-ab.png");
+        std::fs::write(other.join("1-1-ab.png"), "x").unwrap();
+        assert!(raw_path(&outputs, "4343", &via.display().to_string()).is_err());
+        // Or one others can open.
+        std::fs::set_permissions(&shots, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(at(&file).is_err());
+        let _ = std::fs::remove_dir_all(&outputs);
     }
 }

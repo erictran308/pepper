@@ -30,9 +30,10 @@ const NO_SPACES: &[&str] = &["zh", "ja", "yue", "th", "lo", "km", "my", "bo"];
 /// longest a word is taken to be.
 const PAUSE: f64 = 0.12;
 const MAX_WORD: f64 = 1.5;
-/// What to download when there's no model (the best quality per size).
-const MODEL_URL: &str =
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
+/// What to download when there's no model (the best quality per size): a
+/// revision of it, not whatever's there now, and its SHA-256 to check.
+const MODEL_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin";
+const MODEL_SHA256: &str = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2";
 
 fn round3(t: f64) -> f64 {
     (t * 1000.0).round() / 1000.0
@@ -123,8 +124,8 @@ pub fn scenes(work: &Path, file: &Path, threshold: f64) -> Result<Value> {
     let found = cached(&dir.join(name), || {
         let ffmpeg = media::tool("ffmpeg")?;
         // Shots are told apart as well 320 pixels wide, and faster.
-        let mut list = args(&["-nostdin", "-v", "error", "-hwaccel", "videotoolbox", "-i"]);
-        list.push(media::file_arg(file));
+        let mut list = args(&["-nostdin", "-v", "error", "-hwaccel", "videotoolbox"]);
+        list.extend(media::input(file));
         list.extend(args(&["-map", "0:V:0", "-an", "-sn", "-dn", "-vf"]));
         list.push(format!(
             "scale=320:-2,select='gt(scene,{threshold})',metadata=print:file=-"
@@ -222,8 +223,8 @@ pub fn silences(work: &Path, file: &Path, db: f64, min: f64) -> Result<Value> {
     );
     let found = cached(&dir.join(name), || {
         let ffmpeg = media::tool("ffmpeg")?;
-        let mut list = args(&["-nostdin", "-v", "error", "-i"]);
-        list.push(media::file_arg(file));
+        let mut list = args(&["-nostdin", "-v", "error"]);
+        list.extend(media::input(file));
         list.extend(args(&["-map", "0:a:0", "-vn", "-sn", "-dn", "-af"]));
         list.push(format!(
             "silencedetect=noise={db}dB:d={min},ametadata=print:file=-"
@@ -285,8 +286,10 @@ pub struct TranscribeAsk<'a> {
 
 /// Where whisper models are looked for.
 pub fn models_dir() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".cache/pepper-agent/whisper"))
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    // whisper-cli runs in `/`: a model's path must hold on its own.
+    home.is_absolute()
+        .then(|| home.join(".cache/pepper-agent/whisper"))
 }
 
 /// The model `transcribe` uses without `--model`, if there's one.
@@ -325,7 +328,7 @@ fn model(given: Option<&str>, lang: &str) -> Result<PathBuf> {
             format!("no whisper model in {shown} (ggml-*.bin)"),
         )
         .hint(format!(
-            "Ask the human first (about 550 MB), then: mkdir -p {shown} && curl -L -o {shown}/ggml-large-v3-turbo-q5_0.bin {MODEL_URL} (ggml-base.bin, 148 MB, is faster and rougher). Or pass --model PATH."
+            "Ask the human first (about 550 MB), then: mkdir -p {shown} && curl -L -o {shown}/ggml-large-v3-turbo-q5_0.bin {MODEL_URL} && echo '{MODEL_SHA256}  {shown}/ggml-large-v3-turbo-q5_0.bin' | shasum -a 256 -c (ggml-base.bin, 148 MB, is faster and rougher). Or pass --model PATH."
         ))
     })
 }
@@ -463,8 +466,8 @@ fn run_whisper(
             .map_err(|e| Error::new("FAILED", format!("{}: {e}", path.display())))?;
     }
     // 16 kHz mono, what whisper reads.
-    let mut list = args(&["-nostdin", "-v", "error", "-i"]);
-    list.push(media::file_arg(file));
+    let mut list = args(&["-nostdin", "-v", "error"]);
+    list.extend(media::input(file));
     list.extend(args(&[
         "-map",
         "0:a:0",
@@ -481,13 +484,13 @@ fn run_whisper(
         "wav",
         "-y",
     ]));
-    list.push(wav.display().to_string());
+    list.push(media::file_arg(&wav));
     if let Err(e) = media::run(&ffmpeg, &list) {
         let _ = std::fs::remove_file(&wav);
         return Err(e);
     }
-    let mut list = args(&["-nostdin", "-v", "error", "-i"]);
-    list.push(media::file_arg(&wav));
+    let mut list = args(&["-nostdin", "-v", "error"]);
+    list.extend(media::input(&wav));
     list.push("-af".into());
     list.push(format!(
         "silencedetect=noise=-35dB:d={PAUSE},ametadata=print:file=-"
@@ -496,26 +499,7 @@ fn run_whisper(
     let pauses = media::run(&ffmpeg, &list)
         .map(|out| quiet_stretches(&out, duration))
         .unwrap_or_default();
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
-    let mut command = Command::new(whisper);
-    command.arg("-m").arg(model).args([
-        "-l",
-        lang,
-        "-t",
-        &threads.to_string(),
-        "-ojf",
-        "-np",
-        "-pp",
-    ]);
-    // The alignment that times words well needs flash attention off.
-    if let Some(preset) = dtw_preset(model) {
-        command.args(["-nfa", "-dtw", &preset]);
-    }
-    let child = command
-        .arg("-of")
-        .arg(&raw)
-        .arg("-f")
-        .arg(&wav)
+    let child = whisper_command(whisper, model, lang, &raw, &wav)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -570,6 +554,29 @@ fn run_whisper(
     let raw = json::parse(&String::from_utf8_lossy(&text))
         .map_err(|e| Error::new("FAILED", format!("whisper.cpp's output: {e}")))?;
     Ok((raw, pauses))
+}
+
+/// whisper-cli's command for `wav`, its JSON written as `raw`.json: in `/`,
+/// not the project, since whisper.cpp's ggml loads its backends from the
+/// folder it runs in too; so it's given absolute paths only.
+fn whisper_command(whisper: &Path, model: &Path, lang: &str, raw: &Path, wav: &Path) -> Command {
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get().min(8));
+    let mut command = media::command(whisper);
+    command.arg("-m").arg(model).args([
+        "-l",
+        lang,
+        "-t",
+        &threads.to_string(),
+        "-ojf",
+        "-np",
+        "-pp",
+    ]);
+    // The alignment that times words well needs flash attention off.
+    if let Some(preset) = dtw_preset(model) {
+        command.args(["-nfa", "-dtw", &preset]);
+    }
+    command.arg("-of").arg(raw).arg("-f").arg(wav);
+    command
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -821,13 +828,20 @@ fn srt(segments: &[Segment]) -> String {
 
 /// The newest transcript `transcribe` made of `src` in this folder's
 /// `.pepper/`, if there is one. Only a plain file has one: a pipe's FIFO
-/// isn't opened (that would wait for a writer, and take its frames).
+/// isn't opened (that would wait for a writer, and take its frames). As
+/// for the cache's other readers, nothing through a link: its folders are
+/// the user's own, the transcript a plain file.
 pub fn transcript_of(src: &Path) -> Option<PathBuf> {
     if !std::fs::metadata(src).is_ok_and(|m| m.is_file()) {
         return None;
     }
-    let work = std::env::current_dir().ok()?.join(".pepper");
-    let dir = work.join("cache").join(media::fingerprint(src).ok()?);
+    let mut dir = std::env::current_dir().ok()?;
+    for part in [".pepper", "cache", &media::fingerprint(src).ok()?] {
+        dir.push(part);
+        if !files::is_own_dir(&dir) {
+            return None;
+        }
+    }
     std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| Some(e.ok()?.path()))
@@ -835,8 +849,9 @@ pub fn transcript_of(src: &Path) -> Option<PathBuf> {
             p.file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.starts_with("transcript-") && n.ends_with(".json"))
+                && files::is_plain(p)
         })
-        .max_by_key(|p| p.metadata().and_then(|m| m.modified()).ok())
+        .max_by_key(|p| std::fs::symlink_metadata(p).and_then(|m| m.modified()).ok())
 }
 
 #[cfg(test)]
@@ -1010,6 +1025,25 @@ mod tests {
         );
         assert_eq!(preset("ggml-small.en-tdrz.bin"), None);
         assert_eq!(preset("model.bin"), None);
+    }
+
+    /// whisper-cli runs in `/`, not the project it's asked from (its ggml
+    /// would load a project's libggml-*.so), with absolute paths only.
+    #[test]
+    fn whisper_runs_outside_the_project() {
+        let command = whisper_command(
+            Path::new("/opt/homebrew/bin/whisper-cli"),
+            Path::new("/m/ggml-base.bin"),
+            "auto",
+            Path::new("/p/.pepper/cache/k/whisper-1"),
+            Path::new("/p/.pepper/cache/k/audio-16k-1.wav"),
+        );
+        assert_eq!(command.get_current_dir(), Some(Path::new("/")));
+        let args: Vec<_> = command.get_args().collect();
+        for flag in ["-m", "-of", "-f"] {
+            let at = args.iter().position(|a| *a == flag).unwrap();
+            assert!(Path::new(args[at + 1]).is_absolute(), "{flag}");
+        }
     }
 
     #[test]

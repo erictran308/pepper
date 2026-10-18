@@ -3,8 +3,8 @@
 //! wrapper: each call runs pepper-agent itself with the call's arguments as
 //! its command line and answers with what that printed, the JSON as text,
 //! and the pictures it names (snapshots, frames, sheets, the crops of what
-//! the human pointed at) as images too. It decides nothing the command
-//! doesn't.
+//! the human pointed at) as images too: those pepper-agent made, where it
+//! writes them. It decides nothing the command doesn't.
 //!
 //! Messages are JSON-RPC, one per line. Calls run side by side, each in a
 //! process of its own, so `events --wait` holds up nothing else; a call the
@@ -12,9 +12,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::error::{Error, Result};
@@ -27,6 +29,10 @@ const VERSIONS: &[&str] = &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-0
 const NOT_TOOLS: &[&str] = &["view", "mcp", "install-skill"];
 const MAX_LINE: usize = 4 * 1024 * 1024;
 const MAX_OUTPUT: u64 = 16 * 1024 * 1024;
+/// A line a command says on stderr, at most.
+const MAX_ERR_LINE: usize = 64 * 1024;
+/// Calls that run at once, at most: each is a process.
+const MAX_CALLS: usize = 32;
 /// Pictures sent back with one answer, and their size; more are paths only.
 const MAX_IMAGES: usize = 8;
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
@@ -35,9 +41,12 @@ const INSTRUCTIONS: &str = "Pepper shows the human video, live pages of your web
 struct Server {
     exe: PathBuf,
     out: Mutex<std::io::Stdout>,
-    /// Calls that run, by request id (as JSON): their process group.
-    running: Mutex<HashMap<String, u32>>,
-    cancelled: Mutex<HashSet<String>>,
+    /// Calls that run, by a number of the server's own (two may come with
+    /// the same id): their request id (as JSON) and process group.
+    running: Mutex<HashMap<u64, (String, u32)>>,
+    cancelled: Mutex<HashSet<u64>>,
+    next: AtomicU64,
+    calls: AtomicUsize,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -69,6 +78,8 @@ pub fn serve() -> Result<()> {
         out: Mutex::new(std::io::stdout()),
         running: Mutex::new(HashMap::new()),
         cancelled: Mutex::new(HashSet::new()),
+        next: AtomicU64::new(1),
+        calls: AtomicUsize::new(0),
     });
     let stdin = std::io::stdin();
     let mut reader = stdin.lock();
@@ -95,7 +106,7 @@ pub fn serve() -> Result<()> {
         }
     }
     // The client is gone: stop what still runs.
-    for pgid in lock(&server.running).values() {
+    for (_, pgid) in lock(&server.running).values() {
         crate::sys::terminate_group(*pgid);
     }
     Ok(())
@@ -371,8 +382,15 @@ fn call(server: &Server, id: &Value, params: &Value) {
     };
     let key = id.to_line();
     let token = params.get("_meta").and_then(|m| m.get("progressToken"));
-    let result = run(server, &key, &words, token);
-    if lock(&server.cancelled).remove(&key) {
+    if server.calls.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS {
+        server.calls.fetch_sub(1, Ordering::Relaxed);
+        let text = format!("{MAX_CALLS} calls run already: wait for one to end");
+        return server.reply(id, tool_error(&text));
+    }
+    let n = server.next.fetch_add(1, Ordering::Relaxed);
+    let result = run(server, n, &key, &words, token);
+    server.calls.fetch_sub(1, Ordering::Relaxed);
+    if lock(&server.cancelled).remove(&n) {
         return;
     }
     server.reply(id, result);
@@ -380,7 +398,7 @@ fn call(server: &Server, id: &Value, params: &Value) {
 
 /// Runs the command, telling its progress if the client asked, and makes
 /// its answer the call's result.
-fn run(server: &Server, key: &str, words: &[String], token: Option<&Value>) -> Value {
+fn run(server: &Server, n: u64, key: &str, words: &[String], token: Option<&Value>) -> Value {
     let child = Command::new(&server.exe)
         .args(words)
         .stdin(Stdio::null())
@@ -393,7 +411,7 @@ fn run(server: &Server, key: &str, words: &[String], token: Option<&Value>) -> V
         Ok(child) => child,
         Err(e) => return tool_error(&format!("cannot run pepper-agent: {e}")),
     };
-    lock(&server.running).insert(key.to_owned(), child.id());
+    lock(&server.running).insert(n, (key.to_owned(), child.id()));
     let stdout = child.stdout.take();
     let reader = std::thread::spawn(move || {
         let mut out = Vec::new();
@@ -405,10 +423,21 @@ fn run(server: &Server, key: &str, words: &[String], token: Option<&Value>) -> V
     let mut error = None;
     let mut other: Vec<String> = Vec::new();
     if let Some(stderr) = child.stderr.take() {
-        for line in BufReader::new(stderr)
-            .lines()
-            .map_while(std::io::Result::ok)
-        {
+        let mut stderr = BufReader::new(stderr);
+        loop {
+            let line = match crate::proto::read_line(&mut stderr, MAX_ERR_LINE) {
+                Ok(Some(line)) => line,
+                Ok(None) => break,
+                // Too long (the rest of it goes) or not UTF-8: not a line of
+                // pepper-agent's.
+                Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                    if e.to_string() == crate::proto::TOO_LONG {
+                        let _ = stderr.skip_until(b'\n');
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            };
             match json::parse(&line) {
                 Ok(v) if v.get("progress").is_some() => {
                     if let (Some(token), Some(p)) = (token, v.get("progress")) {
@@ -435,8 +464,10 @@ fn run(server: &Server, key: &str, words: &[String], token: Option<&Value>) -> V
         }
     }
     let out = reader.join().unwrap_or_default();
+    // Out of the list before it's reaped: a cancel from now on finds
+    // nothing, not a group that may be another's.
+    lock(&server.running).remove(&n);
     let status = child.wait();
-    lock(&server.running).remove(key);
     if !status.is_ok_and(|s| s.success()) {
         let text = error.unwrap_or_else(|| match other.is_empty() {
             true => "the command failed".to_owned(),
@@ -451,19 +482,65 @@ fn run(server: &Server, key: &str, words: &[String], token: Option<&Value>) -> V
             .with("text", text.as_str()),
     ];
     if let Ok(answer) = json::parse(&text) {
-        let mut found = Vec::new();
-        pictures(&answer, &mut found);
-        content.extend(found.iter().take(MAX_IMAGES).filter_map(|p| image(p)));
+        content.extend(attached(&answer, &picture_roots()));
     }
     Value::obj().with("content", content).with("isError", false)
 }
 
-/// The pictures an answer names, as its `path`, `crop` or `sheet`.
+/// Where pepper-agent writes pictures, real paths: the work folder's
+/// `.pepper/`, each viewer's project's (points' pictures), its run folder,
+/// and the viewers' folder for what they write (points' pictures without a
+/// project), each a folder of the user's, not a link.
+fn picture_roots() -> Vec<PathBuf> {
+    let own = |dir: &Path| {
+        std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == crate::sys::uid())
+    };
+    let mut roots = Vec::new();
+    if let Ok(here) = std::env::current_dir() {
+        let top = here.join(".pepper");
+        if own(&top) {
+            roots.extend(std::fs::canonicalize(&top));
+        }
+    }
+    if let Ok(run) = crate::proto::run_dir() {
+        for viewer in crate::proto::viewers(&run) {
+            if let Some(project) = viewer.record.get_str("project") {
+                let top = Path::new(project).join(".pepper");
+                if own(&top) {
+                    roots.extend(std::fs::canonicalize(&top));
+                }
+            }
+        }
+        roots.extend(std::fs::canonicalize(run));
+    }
+    if let Some(outputs) = crate::proto::outputs_path()
+        && own(&outputs)
+    {
+        roots.extend(std::fs::canonicalize(outputs));
+    }
+    roots
+}
+
+/// The pictures an answer names that are pepper-agent's (under `roots`),
+/// as images, MAX_IMAGES at most.
+fn attached(answer: &Value, roots: &[PathBuf]) -> Vec<Value> {
+    let mut found = Vec::new();
+    pictures(answer, &mut found);
+    found
+        .iter()
+        .filter_map(|p| image(p, roots))
+        .take(MAX_IMAGES)
+        .collect()
+}
+
+/// The pictures an answer names, as its `path`, `crop` or `sheet`; never in
+/// a `value`, which is the page's (`web eval`'s), keys and all.
 fn pictures(v: &Value, found: &mut Vec<PathBuf>) {
     match v {
         Value::Obj(members) => {
             for (key, value) in members {
                 match value {
+                    _ if key == "value" => {}
                     Value::Str(s)
                         if matches!(key.as_str(), "path" | "crop" | "sheet")
                             && [".png", ".jpg", ".jpeg"]
@@ -481,12 +558,27 @@ fn pictures(v: &Value, found: &mut Vec<PathBuf>) {
     }
 }
 
-fn image(path: &Path) -> Option<Value> {
-    let meta = std::fs::metadata(path).ok()?;
+/// A picture as an image, if it's one of pepper-agent's: its real path
+/// (links followed) under one of `roots`, a PNG or JPEG, not too large.
+fn image(path: &Path, roots: &[PathBuf]) -> Option<Value> {
+    let real = std::fs::canonicalize(path).ok()?;
+    if !roots.iter().any(|root| real.starts_with(root)) {
+        return None;
+    }
+    // Not waiting on a FIFO named like a picture, nor following a link.
+    const O_NONBLOCK: i32 = 0x0004;
+    const O_NOFOLLOW: i32 = 0x0100;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NONBLOCK | O_NOFOLLOW)
+        .open(&real)
+        .ok()?;
+    let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() > MAX_IMAGE_BYTES {
         return None;
     }
-    let bytes = std::fs::read(path).ok()?;
+    let mut bytes = Vec::new();
+    file.take(MAX_IMAGE_BYTES).read_to_end(&mut bytes).ok()?;
     let mime = if bytes.starts_with(b"\x89PNG") {
         "image/png"
     } else if bytes.starts_with(b"\xff\xd8\xff") {
@@ -519,11 +611,14 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Stops the calls with that request id (the client's), if they still run.
 fn cancel(server: &Server, request: &Value) {
     let key = request.to_line();
-    if let Some(&pgid) = lock(&server.running).get(&key) {
-        lock(&server.cancelled).insert(key);
-        crate::sys::terminate_group(pgid);
+    for (n, (k, pgid)) in lock(&server.running).iter() {
+        if *k == key {
+            lock(&server.cancelled).insert(*n);
+            crate::sys::terminate_group(*pgid);
+        }
     }
 }
 
@@ -636,7 +731,7 @@ mod tests {
     fn pictures_in_answers() {
         let answer = args(
             r#"{"path": "/a/shot.png", "file": "/a/v.mp4", "frames": [{"path": "/a/f.PNG"}, {"path": "/a/r.mp4"}],
-                "events": [{"crop": "/a/c.jpg", "note": "/a/x.png"}]}"#,
+                "events": [{"crop": "/a/c.jpg", "note": "/a/x.png"}], "value": {"path": "/a/page.png", "x": [{"crop": "/a/p.jpg"}]}}"#,
         );
         let mut found = Vec::new();
         pictures(&answer, &mut found);
@@ -648,6 +743,77 @@ mod tests {
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"fo"), "Zm8=");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn only_pepper_agents_pictures_are_attached() {
+        let dir = std::env::temp_dir().join(format!("pepper-mcp-pictures-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (snapshots, outside) = (dir.join("work/.pepper/snapshots"), dir.join("outside"));
+        std::fs::create_dir_all(&snapshots).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let png = b"\x89PNG\r\n\x1a\n0000";
+        let (shot, mine) = (snapshots.join("s.png"), outside.join("x.png"));
+        std::fs::write(&shot, png).unwrap();
+        std::fs::write(&mine, png).unwrap();
+        std::os::unix::fs::symlink(&mine, snapshots.join("link.png")).unwrap();
+        std::fs::write(
+            snapshots.join("big.png"),
+            vec![0x89; MAX_IMAGE_BYTES as usize + 1],
+        )
+        .unwrap();
+        let roots = [std::fs::canonicalize(dir.join("work/.pepper")).unwrap()];
+        let answer = |v: &str| {
+            args(
+                &v.replace("SNAP", &snapshots.display().to_string())
+                    .replace("MINE", &mine.display().to_string()),
+            )
+        };
+        let count = |v: &str| attached(&answer(v), &roots).len();
+
+        // A snapshot is attached; a picture of the user's elsewhere isn't,
+        // named in eval's value or anywhere, or through a link.
+        assert_eq!(count(r#"{"path": "SNAP/s.png"}"#), 1);
+        assert_eq!(count(r#"{"viewer": "1", "value": {"path": "MINE"}}"#), 0);
+        assert_eq!(
+            count(r#"{"path": "MINE", "events": [{"crop": "MINE"}]}"#),
+            0
+        );
+        assert_eq!(count(r#"{"path": "SNAP/link.png"}"#), 0);
+        assert_eq!(count(r#"{"path": "SNAP/../../../outside/x.png"}"#), 0);
+        assert_eq!(
+            count(r#"{"path": "SNAP/big.png", "sheet": "SNAP/none.png"}"#),
+            0
+        );
+        // Those that aren't don't push out those that are.
+        let many = format!(
+            "{{\"frames\": [{}{{\"path\": \"SNAP/s.png\"}}]}}",
+            r#"{"path": "MINE"},"#.repeat(MAX_IMAGES)
+        );
+        assert_eq!(count(&many), 1);
+        let image = &attached(&answer(r#"{"path": "SNAP/s.png"}"#), &roots)[0];
+        assert_eq!(image.get_str("mimeType"), Some("image/png"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn calls_with_the_same_id_are_told_apart() {
+        let server = Server {
+            exe: PathBuf::new(),
+            out: Mutex::new(std::io::stdout()),
+            running: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(HashSet::new()),
+            next: AtomicU64::new(1),
+            calls: AtomicUsize::new(0),
+        };
+        // Groups no process has: nothing is signalled.
+        lock(&server.running).insert(1, ("7".into(), 999_998));
+        lock(&server.running).insert(2, ("7".into(), 999_999));
+        lock(&server.running).insert(3, ("8".into(), 999_997));
+        cancel(&server, &Value::from(7.0));
+        assert_eq!(*lock(&server.cancelled), HashSet::from([1, 2]));
+        lock(&server.running).remove(&1);
+        assert_eq!(lock(&server.running).len(), 2);
     }
 
     #[test]

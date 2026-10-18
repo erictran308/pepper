@@ -2,11 +2,12 @@
 //! first), the agent's `web` commands, each run on a thread of its own and
 //! answered when done, and what the box and the keys do for a page.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::frames::{FrameMsg, Presenter};
+use super::serve;
 use super::watch::Watch;
 use super::web::{self, Device, Files, Host, OpenAsk, Page};
 use super::{Cells, Msg, Request, Source, State, Viewer, WaitFor, valid_name};
@@ -46,7 +47,7 @@ impl WebSource {
             return String::new();
         };
         let state = page.state();
-        let url = text::redact_url(&state.url);
+        let url = page.shown(&state.url);
         let short = url.split_once("://").map(|(_, rest)| rest).unwrap_or(&url);
         let mut out = format!("  {}", text::inert(short, 60));
         if !state.title.is_empty() {
@@ -64,7 +65,7 @@ impl WebSource {
             .with("playable", false);
         if let Some(page) = &self.page {
             let state = page.state();
-            v.set("url", text::redact_url(&state.url));
+            v.set("url", page.shown(&state.url));
             v.set("title", state.title.as_str());
             v.set(
                 "latency_ms",
@@ -134,7 +135,8 @@ impl Viewer {
             .ok_or_else(|| Error::new("BAD_ARGS", "web open: which address?"))?;
         web::check_url(target)?;
         let allow_remote = args.get_bool("allow_remote").unwrap_or(false);
-        if !allow_remote && !web::is_local(target) {
+        // A file is too: its folder is served on 127.0.0.1.
+        if !allow_remote && !web::is_local(target) && !serve::is_file_url(target) {
             return Err(Error::new(
                 "ORIGIN_BLOCKED",
                 format!(
@@ -142,6 +144,10 @@ impl Viewer {
                     text::inert(&text::redact_url(target), 200)
                 ),
             ));
+        }
+        // One that won't be served isn't a page: said now, not once it's one.
+        if serve::is_file_url(target) {
+            serve::check(target)?;
         }
         let device = match args.get_str("device") {
             Some(name) => Device::parse(name).ok_or_else(|| bad_device(name))?,
@@ -177,8 +183,11 @@ impl Viewer {
         // The same name again: that page goes to the new address.
         if let Some(i) = name.and_then(|n| self.sources.iter().position(|s| s.name == n)) {
             self.check_owner(i, args)?;
+            // Not a page whose browser ended: that one is opened anew.
             if let Some(page) = self.sources[i].web.as_ref().and_then(|w| w.page.clone())
                 && page.allow_remote == allow_remote
+                && page.state().crashed.is_none()
+                && !page.conn.is_closed()
             {
                 let source = &mut self.sources[i];
                 source.target = target.to_owned();
@@ -304,6 +313,14 @@ impl Viewer {
                     match &*slot {
                         Some(h) if h.alive() => h.clone(),
                         _ => {
+                            // A browser that ended is closed (reaped, its
+                            // profile deleted) before the next starts.
+                            if let Some(dead) = slot.take() {
+                                std::thread::spawn(move || dead.close());
+                            }
+                            if let Some(dir) = profile.parent() {
+                                sweep_profiles(dir);
+                            }
                             let h = Host::launch(&chrome, &profile, log.as_deref())?;
                             *slot = Some(h.clone());
                             h
@@ -430,6 +447,30 @@ impl Viewer {
         {
             presenter.send(FrameMsg::Size(size));
         }
+    }
+
+    pub(super) fn on_box_refused(&mut self, token: &str) {
+        if let Some(web) = self
+            .sources
+            .iter()
+            .find(|s| s.token == token)
+            .and_then(|s| s.web.as_ref())
+            && let Some(presenter) = &web.presenter
+        {
+            presenter.send(FrameMsg::Refused);
+        }
+    }
+
+    /// Pepper answered: pages opened before draw into their boxes now.
+    pub(super) fn on_pepper(&mut self, client: Arc<crate::pepper::Client>) {
+        for presenter in self
+            .sources
+            .iter()
+            .filter_map(|s| s.web.as_ref()?.presenter.as_ref())
+        {
+            presenter.send(FrameMsg::Client(client.clone()));
+        }
+        self.pepper = Some(client);
     }
 
     pub(super) fn on_watch(&mut self, sid: u64) {
@@ -804,6 +845,28 @@ enum Started {
     Job(u64, u64, Duration),
 }
 
+/// The profiles of viewers that ended without deleting them (killed, say):
+/// `<pid>-chrome-<n>` folders in the run folder whose viewer is gone.
+fn sweep_profiles(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.split_once("-chrome-"))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let path = entry.path();
+        if !crate::sys::alive(pid) && std::fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
 fn bad_device(name: &str) -> Error {
     let names: Vec<&str> = web::DEVICES.iter().map(|d| d.0).collect();
     Error::new(
@@ -814,4 +877,31 @@ fn bad_device(name: &str) -> Error {
         "One of {}, or WIDTHxHEIGHT@DPR (CSS pixels, like 1280x800@2).",
         names.join(", ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dead_viewers_profiles_go() {
+        let dir = std::env::temp_dir().join(format!("pepper-pages-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // No process has a pid this high; this one runs.
+        let (dead, alive) = (
+            dir.join("999999-chrome-3"),
+            dir.join(format!("{}-chrome-1", std::process::id())),
+        );
+        for d in [&dead, &alive, &dir.join("999999-shots")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(dead.join("Local State"), "{}").unwrap();
+        std::os::unix::fs::symlink(&alive, dir.join("999998-chrome-1")).unwrap();
+        sweep_profiles(&dir);
+        assert!(!dead.exists());
+        assert!(alive.is_dir() && dir.join("999999-shots").is_dir());
+        // A link isn't followed, and stays.
+        assert!(std::fs::symlink_metadata(dir.join("999998-chrome-1")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

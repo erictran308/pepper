@@ -4,13 +4,19 @@
 //! changed file has a new fingerprint.
 //!
 //! Files are given to ffmpeg as `file:` and an absolute path, so a name is
-//! never taken for one of its protocols.
+//! never taken for one of its protocols, and read only as a format that
+//! reads that file alone ([`input`]): a playlist or a list of files would
+//! have it read others, unnamed. A file's name is resolved first
+//! ([`real_file`]): the file read is the one the answers name.
+//!
+//! The tools run in `/` ([`command`]), not the project, so nothing they
+//! look for where they run (a config, a library to load) is the project's.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::font::Picture;
@@ -24,21 +30,111 @@ const MAX_FRAMES: usize = 100;
 const MAX_TILES: u32 = 64;
 const JOBS: usize = 6;
 const GAP: usize = 4;
+/// Demuxers that open more than the file they're given: playlists and
+/// lists of files (hls, dash, concat, imf), a picture name's sequence
+/// (image2 and its kin), network descriptions (sdp, rtp, rtsp), a
+/// subtitle index's pictures (vobsub), scripts (avisynth, vapoursynth), a
+/// DVD's folder. A file is never read as one.
+const FOLLOWING: &[&str] = &[
+    "hls",
+    "applehttp",
+    "dash",
+    "imf",
+    "concat",
+    "image2",
+    "alias_pix",
+    "brender_pix",
+    "sdp",
+    "rtp",
+    "rtsp",
+    "vobsub",
+    "avisynth",
+    "vapoursynth",
+    "dvdvideo",
+];
+/// Demuxers that draw a text file as pictures (ANSI art): text is never
+/// footage.
+const TEXT_ART: &[&str] = &["tty", "bin", "xbin", "adf", "idf"];
+/// What files are read as when ffprobe can't list its demuxers.
+const COMMON_FORMATS: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,mpegts,avi,flv,asf,mpeg,ogg,wav,aiff,caf,w64,mp3,aac,flac,gif,apng,webp_pipe,png_pipe,jpeg_pipe,bmp_pipe,tiff_pipe,yuv4mpegpipe,mjpeg,h264,hevc";
 
-/// An absolute path to a file that exists.
+/// The file `given` names, from the current folder: see [`real_file`].
 pub fn local_file(given: &str) -> Result<PathBuf> {
-    let path = std::path::absolute(given)
-        .map_err(|e| Error::new("NOT_FOUND", format!("{}: {e}", text::inert(given, 300))))?;
-    if !path.is_file() {
+    let here = std::env::current_dir()
+        .map_err(|e| Error::new("FAILED", format!("the current folder: {e}")))?;
+    real_file(&here, Path::new(given))
+}
+
+/// The file `named` is, itself (links and `..` resolved; a relative name is
+/// from `project`), so what reads it and the answers have the same file. A
+/// name in `project` whose file is outside it, through a link the project
+/// holds (a repository's, an archive's), is refused: a file outside is read
+/// only when it's named as one.
+pub fn real_file(project: &Path, named: &Path) -> Result<PathBuf> {
+    let named = project.join(named);
+    let shown = |p: &Path| text::inert(&p.display().to_string(), 300);
+    let real = named
+        .canonicalize()
+        .ok()
+        .filter(|p| p.is_file())
+        .ok_or_else(|| Error::new("NOT_FOUND", format!("no file at {}", shown(&named))))?;
+    // What ffmpeg and mpv are given is the path as text.
+    if real.to_str().is_none() {
         return Err(Error::new(
-            "NOT_FOUND",
-            format!(
-                "no file at {}",
-                text::inert(&path.display().to_string(), 300)
-            ),
+            "BAD_ARGS",
+            format!("{}: its path isn't UTF-8", shown(&real)),
         ));
     }
-    Ok(path)
+    if let Ok(root) = project.canonicalize()
+        && !real.starts_with(&root)
+        && goes_through(&named, &root)
+    {
+        return Err(Error::new(
+            "ORIGIN_BLOCKED",
+            format!(
+                "{} is in the project ({}) but leads outside it, to {}",
+                shown(&named),
+                shown(&root),
+                shown(&real)
+            ),
+        )
+        .hint(
+            "A project's links aren't followed out of it. If the human wants that file, ask them, then name it by its own path.",
+        ));
+    }
+    Ok(real)
+}
+
+/// Whether a path, as written (a `..` taken back lexically), is in `root`:
+/// one of its folders is `root`.
+fn goes_through(named: &Path, root: &Path) -> bool {
+    let mut written = PathBuf::new();
+    for part in named.components() {
+        match part {
+            Component::ParentDir => {
+                written.pop();
+            }
+            Component::CurDir => {}
+            other => written.push(other),
+        }
+    }
+    let mut prefix = PathBuf::new();
+    for part in written.components() {
+        prefix.push(part);
+        if prefix == root || prefix.canonicalize().is_ok_and(|p| p == root) {
+            return true;
+        }
+    }
+    false
+}
+
+/// A tool's command, run in `/`: a folder no project controls, so nothing
+/// the tool looks for in its working folder (a config, a library it loads)
+/// comes from the project. Every path it's given is absolute.
+pub fn command(tool: &Path) -> Command {
+    let mut command = Command::new(tool);
+    command.current_dir("/");
+    command
 }
 
 /// A tool's path on the PATH, or MISSING_DEP with how to install it.
@@ -61,18 +157,81 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub fn file_arg(path: &Path) -> String {
+    debug_assert!(path.is_absolute(), "{}", path.display());
     format!("file:{}", path.display())
+}
+
+/// ffmpeg's (or ffprobe's) arguments for reading a file: `-i file:<path>`,
+/// read only as one of [`formats`].
+pub fn input(path: &Path) -> [String; 4] {
+    [
+        "-format_whitelist".into(),
+        formats().into(),
+        "-i".into(),
+        file_arg(path),
+    ]
+}
+
+/// The formats a file may be read as: every demuxer installed but devices,
+/// and those that open more than the file ([`FOLLOWING`], [`TEXT_ART`]).
+/// Asked of ffprobe once.
+pub fn formats() -> &'static str {
+    static FORMATS: OnceLock<String> = OnceLock::new();
+    FORMATS.get_or_init(|| {
+        let listed = tool("ffprobe")
+            .ok()
+            .and_then(|ffprobe| run(&ffprobe, &["-hide_banner".into(), "-demuxers".into()]).ok())
+            .map(|out| readable(&String::from_utf8_lossy(&out)))
+            .filter(|names| !names.is_empty());
+        match listed {
+            Some(names) => names.join(","),
+            None => COMMON_FORMATS.into(),
+        }
+    })
+}
+
+/// The demuxers in `ffprobe -demuxers`'s list that read only the file.
+fn readable(listed: &str) -> Vec<String> {
+    listed
+        .lines()
+        .skip_while(|line| line.trim() != "---")
+        .skip(1)
+        .filter_map(|line| {
+            // " D d name,alias   description": demuxing, muxing, a device.
+            let flags = line.get(1..4)?;
+            let names = line.get(5..)?.split_whitespace().next()?;
+            (flags.starts_with('D') && !flags.contains('d')).then_some(names)
+        })
+        .filter(|names| {
+            !names
+                .split(',')
+                .any(|n| FOLLOWING.contains(&n) || TEXT_ART.contains(&n))
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// A file ffmpeg wouldn't read as one of [`formats`].
+fn not_read() -> Error {
+    Error::new(
+        "NOT_PLAYABLE",
+        "the file is a playlist or a list of other files, or names a sequence of pictures (an HLS .m3u8, an ffconcat list, a %d in a picture's name): it isn't read, nor what it names",
+    )
+    .hint("Name a media file itself: only the file named is read.")
 }
 
 /// Runs a tool and returns its stdout; its stderr, made inert, if it fails.
 pub fn run(tool: &Path, args: &[String]) -> Result<Vec<u8>> {
-    let out = Command::new(tool)
+    let out = command(tool)
         .args(args)
         .stdin(Stdio::null())
         .output()
         .map_err(|e| Error::new("FAILED", format!("cannot run {}: {e}", tool.display())))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
+        if err.contains("not on whitelist") {
+            return Err(not_read());
+        }
         let err = err.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
         let name = tool
             .file_name()
@@ -103,11 +262,47 @@ impl Fnv {
 }
 
 /// A file's fingerprint: its path, size, time and inode, and its first and
-/// last 64 KB, so a re-rendered file gets new cache entries.
+/// last 64 KB, so a re-rendered file gets new cache entries; and this
+/// user's [`cache_key`].
 pub fn fingerprint(path: &Path) -> Result<String> {
+    keyed_fingerprint(cache_key(), path)
+}
+
+/// A key of this user's in every fingerprint, so a cache a project came
+/// with (a repository's, an archive's, a disk image's whose times and
+/// inodes are fixed) is never taken for one of the user's: its entries
+/// could say anything. Made once, in `~/.cache/pepper-agent/`; none where
+/// that can't be read or made (a sandbox's), whose caches are its own.
+fn cache_key() -> &'static str {
+    static KEY: OnceLock<String> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let made = || -> Option<String> {
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            let path = home
+                .is_absolute()
+                .then(|| home.join(".cache/pepper-agent/cache-key"))?;
+            let key = |text: String| {
+                (text.len() == 32 && text.bytes().all(|b| b.is_ascii_hexdigit())).then_some(text)
+            };
+            if let Some(found) = crate::files::read_plain_at_most(&path, 64).and_then(key) {
+                return Some(found);
+            }
+            crate::files::private_dir(path.parent()?).ok()?;
+            crate::files::write_private(&path, crate::sys::random_hex().ok()?.as_bytes()).ok()?;
+            // Another run may have made one at once: the one there is it.
+            crate::files::read_plain_at_most(&path, 64).and_then(key)
+        };
+        // Without one (a sandbox that can't write it): still not the
+        // fingerprints of before there was a key.
+        made().unwrap_or_else(|| "no key".into())
+    })
+}
+
+fn keyed_fingerprint(key: &str, path: &Path) -> Result<String> {
     let fail = |e: std::io::Error| Error::new("FAILED", format!("{}: {e}", path.display()));
     let meta = std::fs::metadata(path).map_err(fail)?;
     let mut hash = Fnv::new();
+    hash.add(key.as_bytes());
     hash.add(path.as_os_str().as_encoded_bytes());
     for n in [
         meta.len(),
@@ -221,16 +416,22 @@ fn probe_file(file: &Path) -> Result<Value> {
             "json",
             "-show_format",
             "-show_streams",
-            "-i",
         ]
         .map(String::from)
         .into_iter()
-        .chain([file_arg(file)])
+        .chain(input(file))
         .collect::<Vec<_>>(),
     )?;
     let raw = json::parse(&String::from_utf8_lossy(&out))
         .map_err(|e| Error::new("FAILED", format!("ffprobe's output: {e}")))?;
     let format = raw.get("format").cloned().unwrap_or(Value::Null);
+    // Never one that opens other files, whatever ffprobe was told.
+    if format
+        .get_str("format_name")
+        .is_some_and(|name| name.split(',').any(|n| FOLLOWING.contains(&n)))
+    {
+        return Err(not_read());
+    }
     let streams = raw.get("streams").and_then(Value::arr).unwrap_or(&[]);
     let duration = num_field(&format, "duration");
     let tag = |v: &Value, key: &str| {
@@ -342,11 +543,10 @@ fn keyframe_interval(file: &Path) -> Option<f64> {
         "%+30",
         "-of",
         "csv=p=0",
-        "-i",
     ]
     .map(String::from)
     .into_iter()
-    .chain([file_arg(file)])
+    .chain(input(file))
     .collect();
     let out = run(&ffprobe, &args).ok()?;
     let mut keys: Vec<f64> = String::from_utf8_lossy(&out)
@@ -384,7 +584,7 @@ fn frame_time(t: f64, probe: &Probe) -> f64 {
 }
 
 fn ffmpeg_frame_args(file: &Path, t: f64, (w, h): (u32, u32)) -> Vec<String> {
-    vec![
+    let mut args: Vec<String> = vec![
         "-nostdin".into(),
         "-v".into(),
         "error".into(),
@@ -392,15 +592,17 @@ fn ffmpeg_frame_args(file: &Path, t: f64, (w, h): (u32, u32)) -> Vec<String> {
         "videotoolbox".into(),
         "-ss".into(),
         format!("{t:.3}"),
-        "-i".into(),
-        file_arg(file),
+    ];
+    args.extend(input(file));
+    args.extend([
         "-frames:v".into(),
         "1".into(),
         "-an".into(),
         "-sn".into(),
         "-vf".into(),
         format!("scale={w}:{h}:flags=lanczos"),
-    ]
+    ]);
+    args
 }
 
 /// Runs `jobs` on JOBS threads, telling progress on stderr when there are
@@ -518,7 +720,7 @@ pub fn frames(work: &Path, file: &Path, ask: &FramesAsk) -> Result<Value> {
                         .map_err(|e| Error::new("FAILED", e.to_string()))?;
                     let mut args = ffmpeg_frame_args(&file, t, size);
                     args.extend(["-update", "1", "-y"].map(String::from));
-                    args.push(tmp.display().to_string());
+                    args.push(file_arg(&tmp));
                     run(&ffmpeg, &args)?;
                     if !tmp.is_file() {
                         return Err(Error::new(
@@ -664,7 +866,7 @@ pub fn sheet(work: &Path, file: &Path, ask: &SheetAsk) -> Result<Value> {
 fn encode_png(ffmpeg: &Path, picture: &Picture, path: &Path) -> Result<()> {
     let tmp = path.with_extension("tmp.png");
     crate::files::make_way(&tmp).map_err(|e| Error::new("FAILED", e.to_string()))?;
-    let mut child = Command::new(ffmpeg)
+    let mut child = command(ffmpeg)
         .args([
             "-nostdin",
             "-v",
@@ -677,7 +879,7 @@ fn encode_png(ffmpeg: &Path, picture: &Picture, path: &Path) -> Result<()> {
         ])
         .arg(format!("{}x{}", picture.width, picture.height))
         .args(["-i", "pipe:0", "-frames:v", "1", "-update", "1", "-y"])
-        .arg(&tmp)
+        .arg(file_arg(&tmp))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -706,6 +908,12 @@ fn encode_png(ffmpeg: &Path, picture: &Picture, path: &Path) -> Result<()> {
 pub fn png_size(path: &Path) -> Option<(u32, u32)> {
     let mut head = [0u8; 24];
     std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    png_header(&head)
+}
+
+/// A PNG's width and height, from its first bytes.
+fn png_header(head: &[u8]) -> Option<(u32, u32)> {
+    let head = head.get(..24)?;
     if &head[..8] != b"\x89PNG\r\n\x1a\n" || &head[12..16] != b"IHDR" {
         return None;
     }
@@ -723,13 +931,26 @@ pub struct Shrunk {
 
 /// A snapshot the viewer's player wrote at the video's own size, cropped
 /// (`region`: x, y, w, h in its pixels) and made at most `max_side`, as
-/// `out`.
+/// `out` (written aside, then moved over the name).
 pub fn shrink_png(
     raw: &Path,
     out: &Path,
     region: Option<[u32; 4]>,
     max_side: u32,
 ) -> Result<Shrunk> {
+    let (png, shrunk) = shrunk_png(raw, region, max_side)?;
+    crate::files::write_private(out, &png)
+        .map_err(|e| Error::new("FAILED", format!("{}: {e}", out.display())))?;
+    Ok(shrunk)
+}
+
+/// [`shrink_png`]'s picture, as a PNG's bytes: ffmpeg writes it to its
+/// output, never to a name.
+pub fn shrunk_png(
+    raw: &Path,
+    region: Option<[u32; 4]>,
+    max_side: u32,
+) -> Result<(Vec<u8>, Shrunk)> {
     let full = png_size(raw).ok_or_else(|| Error::new("FAILED", "the snapshot isn't a PNG"))?;
     let region = match region {
         Some([x, y, w, h]) => {
@@ -755,18 +976,29 @@ pub fn shrink_png(
     }
     filter += &format!("scale={}:{}:flags=lanczos", size.0, size.1);
     let ffmpeg = tool("ffmpeg")?;
-    let tmp = out.with_extension("tmp.png");
-    crate::files::make_way(&tmp).map_err(|e| Error::new("FAILED", e.to_string()))?;
-    let args: Vec<String> = ["-nostdin", "-v", "error", "-i"]
+    let args: Vec<String> = ["-nostdin", "-v", "error"]
         .map(String::from)
         .into_iter()
-        .chain([file_arg(raw), "-vf".into(), filter])
-        .chain(["-frames:v", "1", "-update", "1", "-y"].map(String::from))
-        .chain([tmp.display().to_string()])
+        .chain(input(raw))
+        .chain(["-vf".into(), filter])
+        .chain(
+            [
+                "-frames:v",
+                "1",
+                "-c:v",
+                "png",
+                "-f",
+                "image2pipe",
+                "pipe:1",
+            ]
+            .map(String::from),
+        )
         .collect();
-    run(&ffmpeg, &args)?;
-    std::fs::rename(&tmp, out).map_err(|e| Error::new("FAILED", e.to_string()))?;
-    Ok(Shrunk { size, full, region })
+    let png = run(&ffmpeg, &args)?;
+    if png_header(&png).is_none() {
+        return Err(Error::new("FAILED", "ffmpeg didn't make a PNG"));
+    }
+    Ok((png, Shrunk { size, full, region }))
 }
 
 #[cfg(test)]
@@ -808,8 +1040,169 @@ mod tests {
         std::fs::write(&file, b"one").unwrap();
         let a = fingerprint(&file).unwrap();
         assert_eq!(a, fingerprint(&file).unwrap());
+        // Another user's key (or none) gives another: a cache made
+        // elsewhere isn't this user's.
+        assert_eq!(a, keyed_fingerprint(cache_key(), &file).unwrap());
+        let other = keyed_fingerprint("0123456789abcdef0123456789abcdef", &file).unwrap();
+        assert_ne!(
+            other,
+            keyed_fingerprint("fedcba9876543210fedcba9876543210", &file).unwrap()
+        );
+        assert!(cache_key().is_empty() || keyed_fingerprint("", &file).unwrap() != a);
         std::fs::write(&file, b"two").unwrap();
         assert_ne!(a, fingerprint(&file).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn links_out_of_the_project_are_refused() {
+        let dir = std::env::temp_dir().join(format!("pepper-media-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (project, outside) = (dir.join("project"), dir.join("outside"));
+        std::fs::create_dir_all(project.join("assets")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("red.mp4"), "x").unwrap();
+        std::fs::write(project.join("assets/own.mp4"), "x").unwrap();
+        let link = |to: &Path, at: &str| std::os::unix::fs::symlink(to, project.join(at)).unwrap();
+        link(&outside.join("red.mp4"), "demo.mp4");
+        link(&outside, "footage");
+        link(&project.join("assets/own.mp4"), "inside.mp4");
+        let real = |named: &str| real_file(&project, Path::new(named));
+        let outside_real = outside.join("red.mp4").canonicalize().unwrap();
+        // A name in the project that leads out of it, as a file or through
+        // a folder, or back in by `..` after a link: refused, both named.
+        for named in ["demo.mp4", "footage/red.mp4", "./assets/../demo.mp4"] {
+            let e = real(named).unwrap_err();
+            assert_eq!(e.code, "ORIGIN_BLOCKED", "{named}");
+            assert!(
+                e.message.contains(&outside_real.display().to_string()),
+                "{named}"
+            );
+        }
+        let through = project.join("footage/red.mp4");
+        assert_eq!(
+            real(&through.display().to_string()).unwrap_err().code,
+            "ORIGIN_BLOCKED"
+        );
+        // Named as outside: taken, as the file itself.
+        assert_eq!(real("../outside/red.mp4").unwrap(), outside_real);
+        assert_eq!(
+            real(&outside_real.display().to_string()).unwrap(),
+            outside_real
+        );
+        // A link that stays inside: the file it leads to.
+        let own = project.join("assets/own.mp4").canonicalize().unwrap();
+        assert_eq!(real("inside.mp4").unwrap(), own);
+        assert_eq!(real("assets").unwrap_err().code, "NOT_FOUND");
+        assert_eq!(real("none.mp4").unwrap_err().code, "NOT_FOUND");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn files_are_read_as_themselves() {
+        let listed = " Formats:\n D.. = Demuxing supported\n ---\n D   aac             raw ADTS AAC\n D d avfoundation    AVFoundation input device\n D   concat          Virtual concatenation script\n D   hls             Apple HTTP Live Streaming\n D   image2          image2 sequence\n D   mov,mp4,m4a,3gp,3g2,mj2 QuickTime / MOV\n D   png_pipe        piped png sequence\n D   tty             Tele-typewriter\n";
+        assert_eq!(
+            readable(listed),
+            ["aac", "mov,mp4,m4a,3gp,3g2,mj2", "png_pipe"]
+        );
+        // What's installed here: the usual formats, none that follows.
+        let installed: Vec<&str> = formats().split(',').collect();
+        for kept in [
+            "mov",
+            "matroska",
+            "mpegts",
+            "png_pipe",
+            "jpeg_pipe",
+            "wav",
+            "gif",
+        ] {
+            assert!(installed.contains(&kept), "{kept}");
+        }
+        for left in FOLLOWING
+            .iter()
+            .chain(TEXT_ART)
+            .chain(&["lavfi", "avfoundation"])
+        {
+            assert!(!installed.contains(left), "{left}");
+        }
+        let args = input(Path::new("/p/a.mp4"));
+        assert_eq!(args[0], "-format_whitelist");
+        assert_eq!(&args[2..], ["-i", "file:/p/a.mp4"]);
+        // Tools run in `/`, whatever the project.
+        assert_eq!(
+            command(Path::new("/bin/ls")).get_current_dir(),
+            Some(Path::new("/"))
+        );
+    }
+
+    /// A playlist or a concat list (under any name) isn't read, nor what it
+    /// names; the media itself still is.
+    #[test]
+    fn playlists_are_not_followed() {
+        if tool("ffmpeg").is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("pepper-media-lists-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (work, outside) = (dir.join("work"), dir.join("outside"));
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let red = outside.join("red.ts");
+        let made = run(
+            &tool("ffmpeg").unwrap(),
+            &[
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=red:size=64x64:rate=10",
+                "-t",
+                "1",
+                "-c:v",
+                "mpeg2video",
+                "-f",
+                "mpegts",
+                "-y",
+            ]
+            .map(String::from)
+            .into_iter()
+            .chain([file_arg(&red)])
+            .collect::<Vec<_>>(),
+        );
+        made.unwrap();
+        let m3u8 = dir.join("list.m3u8");
+        std::fs::write(
+            &m3u8,
+            format!(
+                "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n{}\n#EXT-X-ENDLIST\n",
+                red.display()
+            ),
+        )
+        .unwrap();
+        let concat = dir.join("demo.mp4");
+        std::fs::write(&concat, "ffconcat version 1.0\nfile ../outside/red.ts\n").unwrap();
+        let picture = dir.join("x%d.png");
+        std::fs::write(&picture, "").unwrap();
+        for list in [&m3u8, &concat, &picture] {
+            let e = probe(&work, list).err().unwrap();
+            assert_eq!(e.code, "NOT_PLAYABLE", "{}: {}", list.display(), e.message);
+        }
+        let ask = SheetAsk {
+            from: None,
+            to: None,
+            cols: 1,
+            rows: 1,
+            max_side: 64,
+        };
+        assert_eq!(
+            sheet(&work, &concat, &ask).err().unwrap().code,
+            "NOT_PLAYABLE"
+        );
+        // The media itself is read.
+        let probed = probe(&work, &red).unwrap();
+        assert_eq!(probed.json.get_str("format"), Some("mpegts"));
+        assert!(probed.display.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
