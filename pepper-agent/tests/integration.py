@@ -81,6 +81,13 @@ class Viewer:
         os.write(self.fd, data)
         time.sleep(pause)
 
+    def resize(self, rows, cols=160):
+        fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, cols * 10, rows * 20))
+        time.sleep(0.5)
+
+    def alive(self):
+        return os.waitpid(self.pid, os.WNOHANG) == (0, 0)
+
     def wait_for(self, needle, timeout=10):
         end = time.time() + timeout
         while time.time() < end:
@@ -586,18 +593,24 @@ def sharing_checks(cli, viewer, work, project, clip):
     check("events --owner: that agent's sources only", [e.get("source") for e in got] == ["a-clip"], got)
     check("an event says its source's owner", got and got[0].get("owner") == "alice", got)
 
-    # A video's recording: the stretch that played, cut from the file.
-    cli("seek", "2", "--source", "a-clip", "--session", a)
+    # A video's recording: the stretches that played, cut from the file,
+    # not what's between where it started and where it stopped.
+    cli("seek", "0", "--source", "a-clip", "--session", a)
     started = cli("record", "start", "a-clip", "--session", a)
-    check("record start", started.get("recording") is True and abs((started.get("from") or 0) - 2) < 0.1, started)
+    check("record start", started.get("recording") is True and abs(started.get("from", 1)) < 0.1, started)
     check("the label shows it's recording", viewer.wait_for("● REC".encode()))
     again = cli("record", "start", "a-clip", "--session", a, ok=False)
     check("one recording a source", again.get("error", {}).get("code") == "BAD_ARGS", again)
     cli("review", "2", "4", "--source", "a-clip", "--session", a)
     time.sleep(2.4)
+    cli("review", "6", "7", "--source", "a-clip", "--session", a)
+    time.sleep(1.4)
     rec = cli("record", "stop", "--session", a, timeout=120)
     path = rec.get("path", "")
-    check("record stop cuts what played from the file", os.path.isfile(path) and abs((rec.get("duration") or 0) - 2) < 0.2, rec)
+    check("record stop cuts what played from the file", os.path.isfile(path) and abs((rec.get("duration") or 0) - 3) < 0.25, rec)
+    spans = rec.get("played") or []
+    check("each stretch that played, in order", len(spans) == 2 and abs(spans[0][0] - 2) < 0.15
+          and abs(spans[0][1] - 4) < 0.15 and abs(spans[1][0] - 6) < 0.15 and abs(spans[1][1] - 7) < 0.15, spans)
     check("into .pepper/recordings", "/.pepper/recordings/a-clip-" in path, path)
     check("with a sheet to check it by", os.path.isfile(rec.get("sheet") or ""), rec)
     none = cli("record", "stop", "a-clip", "--session", a, ok=False)
@@ -1167,6 +1180,10 @@ def extras_checks(cli, viewer, agent, work, project, env, hostile, sound):
     odd = mcp.call("probe", bogus=1)
     check("mcp: an unknown argument is BAD_ARGS", odd.get("isError") is True and "BAD_ARGS" in odd["content"][0]["text"], odd)
     check("mcp: an unknown method", mcp.ask("resources/list").get("error", {}).get("code") == -32601)
+    mcp.p.stdin.buffer.write(b'{"jsonrpc": "2.0", "id": 99, "method": "\xff"}\n')
+    mcp.p.stdin.buffer.flush()
+    check("mcp: a line that isn't UTF-8, and the next is still answered", mcp.ask("ping", {}).get("result") == {}
+          and any(m.get("error", {}).get("code") == -32700 for m in mcp.lines), mcp.lines[-2:])
     last = cli("events").get("last_id", 0)
     waiting = mcp.ask("tools/call", {"name": "events", "arguments": {
         "wait": 30, "since": last, "viewer": str(viewer.pid)}}, wait=False)
@@ -1367,6 +1384,9 @@ def main():
 
     lay = cli("layout", "grid")
     check("layout grid shows all three", len(lay.get("visible", [])) == 3, lay)
+    viewer.resize(4)
+    check("a pane too short for any box: the viewer goes on", viewer.alive() and len(cli("sources").get("sources", [])) == 3)
+    viewer.resize(50)
     places = viewer.screen().count(b"\x1b]777;pepper;place;")
     check("each source got a box", places >= 3, places)
     extra = cli("open", clip, "--name", "four")
