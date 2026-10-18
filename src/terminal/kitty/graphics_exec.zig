@@ -263,14 +263,21 @@ fn display(
             .after => {
                 // We use terminal.index to properly handle scroll regions.
                 const size = p.gridSize(img, terminal);
-                for (0..size.rows) |_| terminal.index() catch |err| {
+                // Once the requested movement leaves the screen, its exact
+                // position is undefined by the Kitty graphics protocol. Bound
+                // the work so an untrusted row count can't make us spin.
+                const rows_to_move: usize = @min(
+                    @as(usize, size.rows),
+                    @as(usize, terminal.rows),
+                );
+                for (0..rows_to_move) |_| terminal.index() catch |err| {
                     log.warn("failed to move cursor: {}", .{err});
                     break;
                 };
 
                 terminal.setCursorPos(
                     terminal.screens.active.cursor.y,
-                    pin.x + size.cols + 1,
+                    @as(usize, pin.x) +| @as(usize, size.cols) +| 1,
                 );
             },
         },
@@ -567,4 +574,22 @@ test "kittygfx no response with no image ID or number load and display" {
         const resp = execute(alloc, &t, &cmd);
         try testing.expect(resp == null);
     }
+}
+
+test "kittygfx placement bounds cursor movement for untrusted dimensions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    const cmd = try command.Parser.parseString(
+        alloc,
+        "a=T,t=d,f=24,i=1,s=1,v=1,c=4294967295,r=4294967295;////",
+    );
+    defer cmd.deinit(alloc);
+
+    const resp = execute(alloc, &t, &cmd).?;
+    try testing.expect(resp.ok());
+    try testing.expectEqual(@as(usize, 1), t.screens.active.kitty_images.placements.count());
 }

@@ -18,6 +18,12 @@ test "is_safe with newline" {
     try testing.expect(!is_safe(unsafe.ptr, unsafe.len));
 }
 
+test "is_safe with carriage return" {
+    const testing = std.testing;
+    const unsafe = "hello\rworld";
+    try testing.expect(!is_safe(unsafe.ptr, unsafe.len));
+}
+
 test "is_safe with bracketed paste end" {
     const testing = std.testing;
     const unsafe = "hello\x1b[201~world";

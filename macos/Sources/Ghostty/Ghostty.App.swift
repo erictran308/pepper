@@ -720,6 +720,22 @@ extension Ghostty {
                 url = URL(filePath: expandedPath)
             }
 
+            // pepper: from Ghostty's later code (#13634, #14683). Links come
+            // from terminal output, which any program can control: Ghostty
+            // 1.3.1 sends both OSC 8 targets and text matched by `link` as
+            // `unknown`, so these go through UntrustedURL instead of straight
+            // to Launch Services. Unknown URLs may be plain paths, which
+            // UntrustedURL rejects, so check the file URL built above.
+            // Values with unsafe characters are passed unchanged so they are
+            // rejected before percent-encoding hides them.
+            if action.kind == .unknown {
+                let hasScheme = URL(string: action.url)?.scheme != nil
+                let target = hasScheme || UntrustedURL.containsUnsafeCharacters(action.url)
+                    ? action.url
+                    : url.absoluteString
+                return openUntrustedURL(target)
+            }
+
             switch action.kind {
             case .text:
                 // Open with the default editor for `*.ghostty` file or just system text editor
@@ -734,11 +750,36 @@ extension Ghostty {
                 break
 
             case .unknown:
-                break
+                assertionFailure("Untrusted URLs must use the safe-opening policy")
+                return true
             }
 
             // Open with the default application for the URL
             NSWorkspace.shared.open(url)
+            return true
+        }
+
+        private static func openUntrustedURL(_ value: String) -> Bool {
+            let target = UntrustedURL(value)
+            switch target.decision {
+            case .allow(let url):
+                _ = NSWorkspace.shared.open(url)
+
+            case .confirm(let url):
+                UntrustedURLAlert.presentConfirmation(
+                    for: url,
+                    displayString: target.displayString
+                )
+
+            case .deny(let reason):
+                UntrustedURLAlert.presentBlock(
+                    reason: reason,
+                    displayString: target.displayString
+                )
+            }
+
+            // Always report untrusted URLs as handled. Returning false would
+            // cause the core to retry with the unrestricted fallback opener.
             return true
         }
 

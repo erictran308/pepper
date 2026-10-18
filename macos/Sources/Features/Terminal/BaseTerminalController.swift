@@ -1088,10 +1088,14 @@ class BaseTerminalController: NSWindowController,
         guard let state = notification.userInfo?[Ghostty.Notification.ConfirmClipboardStateKey] as? UnsafeMutableRawPointer? else { return }
         guard let request = notification.userInfo?[Ghostty.Notification.ConfirmClipboardRequestKey] as? Ghostty.ClipboardRequest else { return }
 
-        // If we already have a clipboard confirmation view up, we ignore this request.
-        // This shouldn't be possible...
+        // If we already have a clipboard confirmation view up, ignore this
+        // request. Complete it on the next run loop iteration so that we don't
+        // invalidate the state pointer from inside its confirmation callback.
         guard self.clipboardConfirmation == nil else {
-            Ghostty.App.completeClipboardRequest(surface, data: "", state: state, confirmed: true)
+            DispatchQueue.main.async {
+                guard let surface = target.surface else { return }
+                Ghostty.App.completeClipboardRequest(surface, data: "", state: state, confirmed: true)
+            }
             return
         }
 

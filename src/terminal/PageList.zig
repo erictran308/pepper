@@ -2017,7 +2017,10 @@ fn resizeWithoutReflow(self: *PageList, opts: Resize) Allocator.Error!void {
                     const rows = page.rows.ptr(page.memory);
                     for (0..page.size.rows) |i| {
                         const row = &rows[i];
-                        page.clearCells(row, cols, self.cols);
+                        // If the cut splits a wide char, clear its head too.
+                        const cells = row.cells.ptr(page.memory);
+                        const start = if (cells[cols - 1].wide == .wide) cols - 1 else cols;
+                        page.clearCells(row, start, self.cols);
                     }
 
                     page.size.cols = cols;
@@ -3730,12 +3733,36 @@ pub fn eraseRowBounded(
     node.data.clearCells(&rows[node.data.size.rows - 1], 0, node.data.size.cols);
 }
 
-/// Erase the rows from the given top to bottom (inclusive). Erasing
-/// the rows doesn't clear them but actually physically REMOVES the rows.
-/// If the top or bottom point is in the middle of a page, the other
-/// contents in the page will be preserved but the page itself will be
-/// underutilized (size < capacity).
-pub fn eraseRows(
+/// Erase all history rows, optionally up to a bottom-left bound.
+/// This always starts from the beginning of the history area.
+pub fn eraseHistory(
+    self: *PageList,
+    bl_pt: ?point.Point,
+) void {
+    self.eraseRows(.{ .history = .{} }, bl_pt);
+}
+
+/// Erase active area rows, from the top of the active area to the
+/// given row (inclusive).
+pub fn eraseActive(
+    self: *PageList,
+    y: size.CellCountInt,
+) void {
+    assert(y < self.rows);
+    self.eraseRows(.{ .active = .{} }, .{ .active = .{ .y = y } });
+}
+
+/// Erase rows from tl_pt to bl_pt (inclusive), physically removing
+/// them rather than just clearing their contents. If a point falls
+/// in the middle of a page, remaining rows in that page are shifted
+/// and the page becomes underutilized (size < capacity).
+///
+/// Callers must ensure that the erased range only removes pages from
+/// the front or back of the linked list, never the middle. Middle-page
+/// erasure would create serial gaps that page_serial_min cannot
+/// represent, leaving dangling references in consumers such as search.
+/// Use the public eraseHistory/eraseActive wrappers which enforce this.
+fn eraseRows(
     self: *PageList,
     tl_pt: point.Point,
     bl_pt: ?point.Point,
@@ -3839,15 +3866,28 @@ pub fn eraseRows(
     self.fixupViewport(erased);
 }
 
-/// Erase a single page, freeing all its resources. The page can be
-/// anywhere in the linked list but must NOT be the final page in the
-/// entire list (i.e. must not make the list empty).
+/// Erase a single page, freeing all its resources. The page must be
+/// at the front or back of the linked list (not the middle) and must
+/// NOT be the final page in the entire list (i.e. must not make the
+/// list empty).
 ///
 /// IMPORTANT: This function does NOT update `total_rows`. The caller is
 /// responsible for accounting for the removed rows before or after calling
 /// this function.
 fn erasePage(self: *PageList, node: *List.Node) void {
+    // Must not be the final page.
     assert(node.next != null or node.prev != null);
+
+    // We only support erasing from the front or back, never the middle.
+    // Middle erasure would create serial gaps that page_serial_min can't
+    // represent. If this ever needs to change, we'll need a more
+    // sophisticated invalidation mechanism.
+    assert(node.prev == null or node.next == null);
+
+    // If we're erasing the first page, update page_serial_min so that
+    // any external references holding this page's serial will know it
+    // has been invalidated.
+    if (node.prev == null) self.page_serial_min = node.next.?.serial;
 
     // Update any tracked pins to move to the previous or next page.
     const pin_keys = self.tracked_pins.keys();
@@ -7136,10 +7176,7 @@ test "PageList eraseRows invalidates viewport offset cache" {
     // This removes rows from before our pin, which changes its absolute
     // offset from the top, but the cache is not invalidated.
     const rows_to_erase = page.capacity.rows / 2;
-    s.eraseRows(
-        .{ .history = .{} },
-        .{ .history = .{ .y = rows_to_erase - 1 } },
-    );
+    s.eraseHistory(.{ .history = .{ .y = rows_to_erase - 1 } });
 
     try testing.expectEqual(Scrollbar{
         .total = s.total_rows,
@@ -9314,7 +9351,7 @@ test "PageList erase" {
     try testing.expect(s.total_rows > s.rows);
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expectEqual(s.rows, s.total_rows);
 
     // We should be back to just one page
@@ -9345,7 +9382,7 @@ test "PageList erase reaccounts page size" {
     try testing.expect(s.page_size > start_size);
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expectEqual(start_size, s.page_size);
 }
 
@@ -9377,7 +9414,7 @@ test "PageList erase row with tracked pin resets to top-left" {
     defer s.untrackPin(p);
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expectEqual(s.rows, s.total_rows);
 
     // Our pin should move to the first page
@@ -9398,7 +9435,7 @@ test "PageList erase row with tracked pin shifts" {
     defer s.untrackPin(p);
 
     // Erase only a few rows in our active
-    s.eraseRows(.{ .active = .{} }, .{ .active = .{ .y = 3 } });
+    s.eraseActive(3);
     try testing.expectEqual(s.rows, s.total_rows);
 
     // Our pin should move to the first page
@@ -9419,7 +9456,7 @@ test "PageList erase row with tracked pin is erased" {
     defer s.untrackPin(p);
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .active = .{} }, .{ .active = .{ .y = 3 } });
+    s.eraseActive(3);
     try testing.expectEqual(s.rows, s.total_rows);
 
     // Our pin should move to the first page
@@ -9453,7 +9490,7 @@ test "PageList erase resets viewport to active if moves within active" {
     try testing.expect(s.viewport == .top);
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expect(s.viewport == .active);
 }
 
@@ -9482,7 +9519,7 @@ test "PageList erase resets viewport if inside erased page but not active" {
     try testing.expect(s.viewport == .top);
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .history = .{} }, .{ .history = .{ .y = 2 } });
+    s.eraseHistory(.{ .history = .{ .y = 2 } });
     try testing.expect(s.viewport == .top);
 }
 
@@ -9510,7 +9547,7 @@ test "PageList erase resets viewport to active if top is inside active" {
     s.scroll(.{ .top = {} });
 
     // Erase the entire history, we should be back to just our active set.
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expect(s.viewport == .active);
 }
 
@@ -9521,7 +9558,7 @@ test "PageList erase active regrows automatically" {
     var s = try init(alloc, 80, 24, null);
     defer s.deinit();
     try testing.expect(s.totalRows() == s.rows);
-    s.eraseRows(.{ .active = .{} }, .{ .active = .{ .y = 10 } });
+    s.eraseActive(10);
     try testing.expect(s.totalRows() == s.rows);
 }
 
@@ -9543,7 +9580,7 @@ test "PageList erase a one-row active" {
         };
     }
 
-    s.eraseRows(.{ .active = .{} }, .{ .active = .{} });
+    s.eraseActive(0);
     try testing.expectEqual(s.rows, s.total_rows);
 
     // The row should be empty
@@ -13838,7 +13875,7 @@ test "PageList resize (no reflow) more cols remaps pins in backfill path" {
 
     // Trim a history row so the first page has spare capacity.
     // This triggers the backfill path in resizeWithoutReflowGrowCols.
-    s.eraseRows(.{ .history = .{} }, .{ .history = .{ .y = 0 } });
+    s.eraseHistory(.{ .history = .{ .y = 0 } });
     try testing.expect(first_page.data.size.rows < first_page.data.capacity.rows);
 
     // Ensure the resize takes the slow path (new capacity > current capacity).

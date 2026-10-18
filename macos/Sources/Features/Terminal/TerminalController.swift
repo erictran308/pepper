@@ -442,8 +442,10 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
                 Self.applyCascade(to: window, hasFixedPos: hasFixedPos)
             }
 
-            controller.showWindow(self)
-            window.makeKeyAndOrderFront(self)
+            // showWindow makes regular windows key and ordered front. AppKit can
+            // throw while selecting a tab if its fullscreen stack is inconsistent,
+            // so this must cross the Objective-C exception bridge.
+            controller.showWindowSafely(self)
 
             // We also activate our app so that it becomes front. This may be
             // necessary for the dock menu.

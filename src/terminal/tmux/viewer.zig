@@ -226,6 +226,9 @@ pub const Viewer = struct {
                         const value = @field(self, u_field.name);
                         switch (u_field.type) {
                             []const u8 => try writer.print("\"{s}\"", .{std.mem.trim(u8, value, " \t\r\n")}),
+                            // Window embeds ArenaAllocator.State; dumping
+                            // `{any}` walks freed/poisoned arena nodes.
+                            []const Window => try writer.print("[{d} windows]", .{value.len}),
                             else => try writer.print("{any}", .{value}),
                         }
                     }
@@ -849,9 +852,13 @@ pub const Viewer = struct {
         content: []const u8,
     ) !void {
         // If there is an error, reset our actions to what it was before.
-        errdefer actions.shrinkRetainingCapacity(actions.items.len);
+        const actions_len = actions.items.len;
+        errdefer actions.shrinkRetainingCapacity(actions_len);
 
         // This stores our new window state from this list-windows output.
+        // Ownership of each Window's layout arena transfers into
+        // `self.windows` via syncLayouts; this list only owns the
+        // ArrayList buffer itself.
         var windows: std.ArrayList(Window) = .empty;
         defer windows.deinit(self.alloc);
 
@@ -893,12 +900,12 @@ pub const Viewer = struct {
             });
         }
 
-        // Setup our windows action so the caller can process GUI
-        // window changes.
-        try actions.append(arena_alloc, .{ .windows = windows.items });
-
-        // Sync up our layouts. This will populate unknown panes, prune, etc.
+        // Sync into self.windows first. The `.windows` action must point at
+        // `self.windows.items` (stable for the duration of next()), not the
+        // temporary list buffer which is freed by the defer above — otherwise
+        // logging/formatting the action is a use-after-free.
         try self.syncLayouts(windows.items);
+        try actions.append(arena_alloc, .{ .windows = self.windows.items });
     }
 
     fn receivedPaneState(
@@ -1014,6 +1021,12 @@ pub const Viewer = struct {
                     size.CellCountInt,
                     data.scroll_region_lower,
                 ) orelse break :scroll;
+
+                // Ignore invalid regions. The terminal assumes the scroll
+                // region is always within the screen bounds.
+                if (scroll_top >= scroll_bottom or
+                    scroll_bottom >= t.rows) break :scroll;
+
                 t.scrolling_region.top = scroll_top;
                 t.scrolling_region.bottom = scroll_bottom;
             }
@@ -2287,6 +2300,69 @@ test "two pane flow with pane state" {
         .{
             .input = .{ .tmux = .exit },
             .contains_tags = &.{.exit},
+        },
+    });
+}
+
+test "pane state ignores out of bounds scroll region" {
+    var viewer = try Viewer.init(testing.allocator);
+    defer viewer.deinit();
+
+    try testViewer(&viewer, &.{
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{
+            .input = .{ .tmux = .{ .session_changed = .{
+                .id = 0,
+                .name = "0",
+            } } },
+            .contains_command = "display-message",
+        },
+        .{
+            .input = .{ .tmux = .{ .block_end = "3.5a" } },
+            .contains_command = "list-windows",
+        },
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "$0 @0 80 24 b25d,80x24,0,0,0",
+            } },
+            .contains_tags = &.{ .windows, .command },
+        },
+        // capture-pane primary/alternate history/visible
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        .{ .input = .{ .tmux = .{ .block_end = "" } } },
+        // list-panes with a scroll region bottom far past the screen
+        .{
+            .input = .{ .tmux = .{
+                .block_end = "%0;0;5;1;;;0;0;4294967295;4294967295;0;1;0;0;0;0;0;0;0;0;0;0;0;0;60000;",
+            } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    // Verify the line parsed and was applied. (1.3.1 sets
+                    // the cursor on the primary screen without switching
+                    // to it, so check that screen directly.)
+                    try testing.expectEqual(5, t.screens.get(.primary).?.cursor.y);
+                    try testing.expectEqual(0, t.scrolling_region.top);
+                    try testing.expectEqual(t.rows - 1, t.scrolling_region.bottom);
+                }
+            }).check,
+        },
+        // Vertical tabs act as linefeeds and must scroll within the screen.
+        .{
+            .input = .{ .tmux = .{ .output = .{
+                .pane_id = 0,
+                .data = "\x0b" ** 30,
+            } } },
+            .check = (struct {
+                fn check(v: *Viewer, _: []const Viewer.Action) anyerror!void {
+                    const pane: *Viewer.Pane = v.panes.getEntry(0).?.value_ptr;
+                    const t: *Terminal = &pane.terminal;
+                    try testing.expectEqual(t.rows - 1, t.screens.active.cursor.y);
+                }
+            }).check,
         },
     });
 }

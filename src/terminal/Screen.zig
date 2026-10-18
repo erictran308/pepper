@@ -350,6 +350,16 @@ pub fn assertIntegrity(self: *const Screen) void {
         ) orelse unreachable;
         assert(self.cursor.x == pt.active.x);
         assert(self.cursor.y == pt.active.y);
+
+        // The cursor style and hyperlink if non-zero must reference
+        // real data in the page the pin is in.
+        const page: *const Page = &self.cursor.page_pin.node.data;
+        if (self.cursor.style_id != style.default_id) {
+            assert(page.styles.refCount(page.memory, self.cursor.style_id) > 0);
+        }
+        if (self.cursor.hyperlink_id != 0) {
+            assert(page.hyperlink_set.refCount(page.memory, self.cursor.hyperlink_id) > 0);
+        }
     }
 }
 
@@ -754,9 +764,31 @@ pub fn cursorReload(self: *Screen) void {
         .active,
         self.cursor.page_pin.*,
     ) orelse reset: {
+        // Our cached row/cell pointers may be invalid (that is often
+        // the reason cursorReload is being called), so refresh them
+        // from the pin first since cursorChangePin below marks the
+        // old cursor row as dirty.
+        const old_rac = self.cursor.page_pin.rowAndCell();
+        self.cursor.page_row = old_rac.row;
+        self.cursor.page_cell = old_rac.cell;
+
+        // The cursor style and hyperlink IDs are only valid within the
+        // page that the pin points at, so the pin change must go through
+        // cursorChangePin, which migrates them when the active top-left
+        // is on a different page. Writing the pin directly here would
+        // leave the cursor holding IDs that are dead or alias unrelated
+        // entries on the new page.
         const pin = self.pages.pin(.{ .active = .{} }).?;
-        self.cursor.page_pin.* = pin;
-        break :reset self.pages.pointFromPin(.active, pin).?;
+        self.cursor.x = 0; // Must be set before cursorChangePin
+        self.cursor.y = 0;
+        self.cursorChangePin(pin);
+
+        // cursorChangePin can trigger a page capacity adjustment which
+        // moves the pin again, so we re-read it to derive our point.
+        break :reset self.pages.pointFromPin(
+            .active,
+            self.cursor.page_pin.*,
+        ).?;
     };
 
     self.cursor.x = @intCast(pt.active.x);
@@ -764,20 +796,6 @@ pub fn cursorReload(self: *Screen) void {
     const page_rac = self.cursor.page_pin.rowAndCell();
     self.cursor.page_row = page_rac.row;
     self.cursor.page_cell = page_rac.cell;
-
-    // If we have a style, we need to ensure it is in the page because this
-    // method may also be called after a page change.
-    if (self.cursor.style_id != style.default_id) {
-        self.manualStyleUpdate() catch |err| {
-            // This failure should not happen because manualStyleUpdate
-            // handles page splitting, overflow, and more. This should only
-            // happen if we're out of RAM. In this case, we'll just degrade
-            // gracefully back to the default style.
-            log.err("failed to update style on cursor reload err={}", .{err});
-            self.cursor.style = .{};
-            self.cursor.style_id = 0;
-        };
-    }
 }
 
 /// Scroll the active area and keep the cursor at the bottom of the screen.
@@ -1161,6 +1179,10 @@ inline fn cursorChangePin(self: *Screen, new: Pin) void {
     if (self.cursor.hyperlink != null) {
         const old_page: *Page = &self.cursor.page_pin.node.data;
         old_page.hyperlink_set.release(old_page.memory, self.cursor.hyperlink_id);
+        // Zero the ID, it is invalid now and style changes below may
+        // run integrity checks. We still have self.cursor.hyperlink to
+        // rebuild this later.
+        self.cursor.hyperlink_id = 0;
     }
 
     // Update our pin to the new page
@@ -1182,8 +1204,9 @@ inline fn cursorChangePin(self: *Screen, new: Pin) void {
 
     // On the new page, we need to migrate our hyperlink
     if (self.cursor.hyperlink) |link| {
-        // So we don't attempt to free any memory in the replaced page.
-        self.cursor.hyperlink_id = 0;
+        // startHyperlink will try to free old hyperlinks, so set this
+        // to null. We free it ourselves later since we're doing some
+        // ref-counting shenanigans in this function.
         self.cursor.hyperlink = null;
 
         // Re-add
@@ -1302,19 +1325,21 @@ pub inline fn viewportIsBottom(self: Screen) bool {
 /// Erase the region specified by tl and br, inclusive. This will physically
 /// erase the rows meaning the memory will be reclaimed (if the underlying
 /// page is empty) and other rows will be shifted up.
-pub inline fn eraseRows(
+pub inline fn eraseHistory(
     self: *Screen,
-    tl: point.Point,
     bl: ?point.Point,
 ) void {
     defer self.assertIntegrity();
+    self.pages.eraseHistory(bl);
+    self.cursorReload();
+}
 
-    // Erase the rows
-    self.pages.eraseRows(tl, bl);
-
-    // Just to be safe, reset our cursor since it is possible depending
-    // on the points that our active area shifted so our pointers are
-    // invalid.
+pub inline fn eraseActive(
+    self: *Screen,
+    y: size.CellCountInt,
+) void {
+    defer self.assertIntegrity();
+    self.pages.eraseActive(y);
     self.cursorReload();
 }
 
@@ -1761,7 +1786,7 @@ pub inline fn resize(
     // erase our history. This is because PageList always keeps at least
     // a page size of history.
     if (self.no_scrollback) {
-        self.pages.eraseRows(.{ .history = .{} }, null);
+        self.pages.eraseHistory(null);
     }
 
     // If our cursor was updated, we do a full reload so all our cursor
@@ -3591,6 +3616,81 @@ test "Screen cursorCopy hyperlink deref" {
     try testing.expect(s2.cursor.hyperlink_id == 0);
 }
 
+// The cursor style and hyperlink IDs are only meaningful within the page
+// the cursor pin points at. scrollClear can move the active area onto a
+// later page while the cursor pin stays with its content on an earlier
+// page (now scrollback), so the reset in cursorReload must migrate both
+// references to the destination page. It previously replaced the pin
+// directly and then released the old style ID on the new page.
+test "Screen scrollClear across pages migrates cursor style and hyperlink" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{
+        .cols = 10,
+        .rows = 10,
+        .max_scrollback = std.math.maxInt(usize),
+    });
+    defer s.deinit();
+
+    // Fill the first page so the active area spans two pages.
+    const first_page_size = s.pages.pages.first.?.data.capacity.rows;
+    s.pages.pages.first.?.data.pauseIntegrityChecks(true);
+    for (0..first_page_size - 5) |_| {
+        try s.testWriteString("\n");
+    }
+    s.pages.pages.first.?.data.pauseIntegrityChecks(false);
+    try s.testWriteString("1\n2\n3\n4\n5\n6\n7\n8\n9\n10");
+    try testing.expect(s.pages.pages.first != s.pages.pages.last);
+
+    // Move the cursor to the top of the active area, which is on the
+    // first page, and give it a style and a hyperlink there.
+    s.cursorAbsolute(0, 0);
+    try testing.expect(s.cursor.page_pin.node == s.pages.pages.first.?);
+    try s.setAttribute(.{ .bold = {} });
+    try s.startHyperlink("https://example.com/", null);
+
+    const old_page: *Page = &s.cursor.page_pin.node.data;
+    const old_style_id = s.cursor.style_id;
+    const old_hyperlink_id = s.cursor.hyperlink_id;
+    try testing.expect(old_style_id != style.default_id);
+    try testing.expect(old_hyperlink_id != 0);
+
+    // All ten active rows are non-empty, so this moves the active area
+    // fully onto the second page while the cursor pin stays with its
+    // old row, which is now scrollback.
+    try s.scrollClear();
+
+    // The cursor was moved to the new active top-left on the second
+    // page with its style and hyperlink references rebuilt there.
+    const new_page: *Page = &s.cursor.page_pin.node.data;
+    try testing.expect(new_page != old_page);
+    try testing.expect(s.cursor.style_id != style.default_id);
+    try testing.expect(s.cursor.hyperlink_id != 0);
+    try testing.expect(new_page.styles.refCount(
+        new_page.memory,
+        s.cursor.style_id,
+    ) > 0);
+    try testing.expect(new_page.hyperlink_set.refCount(
+        new_page.memory,
+        s.cursor.hyperlink_id,
+    ) > 0);
+
+    // The cursor's references on the old page were released. Nothing
+    // else referenced either entry, so both are dead there now.
+    try testing.expectEqual(0, old_page.styles.refCount(
+        old_page.memory,
+        old_style_id,
+    ));
+    try testing.expectEqual(0, old_page.hyperlink_set.refCount(
+        old_page.memory,
+        old_hyperlink_id,
+    ));
+
+    // Printing attaches the migrated style and hyperlink to a cell.
+    try s.testWriteString("B");
+}
+
 test "Screen cursorCopy hyperlink deref new page" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -3880,7 +3980,7 @@ test "Screen eraseRows history" {
         try testing.expectEqualStrings("1\n2\n3\n4\n5\n6", str);
     }
 
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
 
     {
         const str = try s.dumpStringAlloc(alloc, .{ .active = .{} });
@@ -3914,7 +4014,7 @@ test "Screen eraseRows history with more lines" {
         try testing.expectEqualStrings("A\nB\nC\n1\n2\n3\n4\n5\n6", str);
     }
 
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
 
     {
         const str = try s.dumpStringAlloc(alloc, .{ .active = .{} });
@@ -3943,7 +4043,7 @@ test "Screen eraseRows active partial" {
         try testing.expectEqualStrings("1\n2\n3", str);
     }
 
-    s.eraseRows(.{ .active = .{} }, .{ .active = .{ .y = 1 } });
+    s.eraseActive(1);
 
     {
         const str = try s.dumpStringAlloc(alloc, .{ .active = .{} });
@@ -5655,7 +5755,7 @@ test "Screen: clear history with no history" {
     defer s.deinit();
     try s.testWriteString("4ABCD\n5EFGH\n6IJKL");
     try testing.expect(s.pages.viewport == .active);
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expect(s.pages.viewport == .active);
     {
         // Test our contents rotated
@@ -5689,7 +5789,7 @@ test "Screen: clear history" {
         try testing.expectEqualStrings("1ABCD\n2EFGH\n3IJKL", contents);
     }
 
-    s.eraseRows(.{ .history = .{} }, null);
+    s.eraseHistory(null);
     try testing.expect(s.pages.viewport == .active);
     {
         // Test our contents rotated
@@ -7518,6 +7618,32 @@ test "Screen: select untracked" {
     try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
     try s.select(null);
     try testing.expectEqual(tracked, s.pages.countTrackedPins());
+}
+
+test "Screen: select replaces existing pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, .{ .cols = 10, .rows = 10, .max_scrollback = 0 });
+    defer s.deinit();
+    try s.testWriteString("ABC  DEF\n 123\n456");
+
+    const tracked = s.pages.countTrackedPins();
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 3, .y = 0 } }).?,
+        false,
+    ));
+    try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
+
+    // Replacing the selection must untrack the prior selection's pins
+    // rather than leak them.
+    try s.select(Selection.init(
+        s.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
+        s.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
+        false,
+    ));
+    try testing.expectEqual(tracked + 2, s.pages.countTrackedPins());
 }
 
 test "Screen: selectAll" {

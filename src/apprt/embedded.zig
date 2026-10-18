@@ -1675,7 +1675,7 @@ pub const CAPI = struct {
         return true;
     }
 
-    export fn ghostty_surface_free_text(ptr: *Text) void {
+    export fn ghostty_surface_free_text(_: *Surface, ptr: *Text) void {
         ptr.deinit();
     }
 

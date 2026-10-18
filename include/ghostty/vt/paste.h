@@ -53,7 +53,9 @@ extern "C" {
  * Check if paste data is safe to paste into the terminal.
  *
  * Data is considered unsafe if it contains:
- * - Newlines (`\n`) which can inject commands
+ * - Line terminators (`\n` or `\r`) which can inject commands. A
+ *   carriage return is what the Enter key sends, so it is as dangerous
+ *   as a newline on an unbracketed paste.
  * - The bracketed paste end sequence (`\x1b[201~`) which can be used
  *   to exit bracketed paste mode and inject commands
  *
