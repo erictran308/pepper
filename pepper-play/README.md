@@ -17,13 +17,13 @@ Put `--` before a name you didn't write yourself: one that starts with `--` woul
 
 The video takes the terminal (the alternate screen, as a full-screen program does) but for its last row, where the status line is (time, length, paused), and follows the window as it resizes. mpv's keys work: `q` quits, space pauses, the arrows seek, and `f` makes the video fill the whole tab, over the status line (again to bring it back). For the whole screen, make Pepper's window full screen too (⌘↩). When it ends, the terminal is as it was.
 
-mpv prints nothing to the terminal: its messages hold the video's tags, file names and URLs, and its own status line would carry subtitles and on-screen text, all of which could hold escape sequences. pepper-play draws the status line itself, from numbers only, and keeps a video output even for sound alone (a black box), so subtitles and mpv's on-screen text are drawn in the box. If something couldn't play, mpv's errors are shown once the screen is back, with control and invisible format characters escaped (`\u{1b}`, `\u{202e}`). Your own options can turn mpv's terminal output back on (`--msg-level`, `--term-osd=force`, `--term-title`); don't put text from a video in them.
+mpv prints nothing to the terminal: its messages hold the video's tags, file names and URLs, and its own status line would carry subtitles and on-screen text, all of which could hold escape sequences. pepper-play draws the status line itself, from numbers only, and keeps a video output even for sound alone (a black box), so subtitles and mpv's on-screen text are drawn in the box. If something couldn't play, mpv's errors are shown once the screen is back, with control and invisible format characters escaped (`\u{1b}`, `\u{202e}`). Your own options can turn mpv's terminal output back on (`--msg-level` turns on only the modules it names, `--term-osd=force`, `--term-title`); don't put text from a video in them. As in mpv, a web address goes through yt-dlp, which reads a `yt-dlp.conf` in the folder pepper-play runs from: run it from a folder of yours.
 
 Pepper puts `pepper-play` on every shell's `PATH`. A shell that sets its own `PATH` from scratch can run `"$PEPPER_PLAY"`.
 
 ## From an app
 
-An app shows video in a box of its own, laid out among its text, and controls playback over mpv's JSON IPC. pepper-play acts as an app's player when it gets a token (`PEPPER_TOKEN`) or an IPC option (`--input-ipc-client`, `--input-ipc-server`): then it leaves the screen and the keys alone, and writes mpv's warnings to its stderr, with any control characters escaped.
+An app shows video in a box of its own, laid out among its text, and controls playback over mpv's JSON IPC. pepper-play acts as an app's player when it gets a token (`PEPPER_TOKEN`) or an IPC option (`--input-ipc-client`, `--input-ipc-server`): then it leaves the screen and the keys alone, and writes mpv's warnings to its stderr, with any control characters escaped. It also loads no cover art of its own (`cover-art-auto=no`; an app's option wins).
 
 ### Is this Pepper?
 
@@ -78,7 +78,7 @@ Files and URLs on the command line play at once, and pepper-play quits after the
 | Variable | What it does |
 | --- | --- |
 | `PEPPER_TOKEN` | The token the app places the box with. pepper-play takes it out of its environment at once, so nothing it starts (yt-dlp) gets it. Giving it over the IPC is better still. |
-| `PEPPER_LIBMPV` | libmpv's absolute path, if it isn't in Homebrew's or MacPorts' `lib` (`/opt/homebrew`, `/opt/local`, `/usr/local`). The library, and its folder, must belong to you or root and not be writable by others, and it mustn't be a download (quarantined). |
+| `PEPPER_LIBMPV` | libmpv's absolute path, if it isn't in Homebrew's or MacPorts' `lib` (`/opt/homebrew`, `/opt/local`, `/usr/local`). The library, and every folder above it, must belong to you or root and not be writable by others, and it mustn't be a download (quarantined). |
 | `PEPPER_PLAY_DEBUG` | Set: mpv's messages from verbose up on stderr, not only its warnings, and at the end what it drew and showed (frames, surfaces made, time waiting on the graphics chip, the decoder). |
 
 ### Examples
@@ -160,14 +160,19 @@ Measured on an Apple M5 Pro (macOS 27.2, mpv 0.41.0), test clips in a 1926×1058
 
 ## Without pepper-play
 
-A program can also hand Pepper frames itself, without mpv. It looks up `PEPPER_PORT` with `bootstrap_look_up`, makes BGRA IOSurfaces, and sends Mach messages. Each starts with the token, NUL padded to 64 bytes:
+A program can also hand Pepper frames itself, without mpv. It looks up `PEPPER_PORT` with `bootstrap_look_up`, checks that it's Pepper's (below), makes BGRA IOSurfaces (4 bytes a pixel), and sends Mach messages. Each starts with the token, NUL padded to 64 bytes:
 
 | Message | `msgh_id` | Body after the header |
 | --- | --- | --- |
-| attach | `0x70700001` | 1 to 4 IOSurfaces (`IOSurfaceCreateMachPort`) as port descriptors, then the token. `msgh_local_port` is a receive right of the program's own, sent as `MAKE_SEND`: Pepper watches it to learn when the program ends, and answers on it. |
+| attach | `0x70700001` | 1 to 4 IOSurfaces (`IOSurfaceCreateMachPort`) as port descriptors, then the token. `msgh_local_port` is a receive right of the program's own, sent as `MAKE_SEND`: Pepper watches it to learn when the program ends, and answers on it. A stream also ends when the process that attached it exits or runs another program, and a process has at most 4. |
 | present | `0x70700002` | The token, then the surface to show, a `UInt32` from 0. |
 | detach | `0x70700003` | The token. |
+| hello | `0x70700004` | Any token, with `msgh_local_port` a send-once right of the program's (`MAKE_SEND_ONCE`). Pepper answers at once. |
 | size, from Pepper | `0x70700101` | The token, then the box's width and height in pixels, whether it's placed, and the display it's on (a `CGDirectDisplayID`, 0 if not known) (`UInt32`s; an older Pepper sends no display). Sent when the stream and its box both exist, and when the box moves, resizes or goes, or its window goes to another display. |
+| refused, from Pepper | `0x70700102` | The token, when an attach isn't taken (too many streams, a surface it can't show): offer the surfaces again later. |
+| hello's answer, from Pepper | `0x70700103` | The token. |
+
+The port's name is `io.github.erictran308.pepper.<pid>`: before sending frames, a program checks that the pid runs `<X>.app/Contents/MacOS/ghostty` in an app whose bundle id is the name's, then says hello and asks for the answer's audit trailer. The answer must come from that pid, and from the same program (the pid's version); after that, it takes size reports only from that process. Someone else holding the name, a quit Pepper's pid taken by another program, never gets a frame.
 
 Draw each frame into a surface the window server isn't showing (`IOSurfaceIsInUse`), wait for it to finish, then present it. `src/pepper.rs` is a client in Rust, and `macos/Sources/Features/Pepper/PepperServer.swift` is Pepper's side.
 
