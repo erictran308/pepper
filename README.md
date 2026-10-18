@@ -32,14 +32,15 @@ It's named after Pepper's ghost, the stage trick that lays a picture over the li
 
 ## Ghostty's terminal, untouched
 
-Pepper is Ghostty. It draws text, reads your keys and runs your shell with Ghostty's own code, unchanged. In what programs print, it understands one more escape sequence, and that's its only change to Ghostty's core. It reads your Ghostty config (`~/.config/ghostty/config`), and it installs next to Ghostty, which keeps working as before.
+Pepper is Ghostty. It draws text, reads your keys and runs your shell with Ghostty's own code, unchanged. In what programs print, it understands one more escape sequence. Its only other change of its own to Ghostty's core is in the Metal renderer, which keeps custom shaders' textures once per split instead of once per frame in flight (1.7 GB less with two cursor shaders and five splits on a 6K screen). It also carries 21 fixes taken early from Ghostty's own later code, 17 for security and 4 for performance ([the list](notes/upstream-backports.md)). It reads your Ghostty config (`~/.config/ghostty/config`), and it installs next to Ghostty, which keeps working as before.
 
 Everything Pepper adds to Ghostty 1.3.1 is in this table, and in [a handful of commits](https://github.com/ghostty-org/ghostty/compare/v1.3.1...erictran308:pepper:pepper) you can read in an evening:
 
 | Where | What Pepper adds | Size |
 | --- | --- | --- |
-| Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box. | 332 lines, tests included |
-| The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 741 lines, plus 22 that hook it in |
+| Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box; custom shaders' textures kept once per split; and most of the fixes from Ghostty's later code (next rows). | 1,373 lines added and 263 taken out, tests included; the fixes are 903 and 171 of them |
+| The macOS app (Swift) | One new file, [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box. | 896 lines, plus 22 that hook it in |
+| Fixes from Ghostty's later code | 21 fixes Ghostty made after 1.3.1, taken before a release has them: [the list](notes/upstream-backports.md). Most are in the core, counted above. In the app, a link from terminal output is checked before it opens, in two new files ([`UntrustedURL.swift`](macos/Sources/Helpers/UntrustedURL.swift), [`UntrustedURLAlert.swift`](macos/Sources/Helpers/UntrustedURLAlert.swift)), and three crashes are fixed. | 612 lines added and 13 taken out in the app, tests included |
 | Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says where new releases are. | About 2,100 lines fewer |
 | The player (Rust) | [`pepper-play`](pepper-play/), a program of its own inside the app. Pepper never starts it: you do, or a program you run does. | Separate program |
 | A helper for AI agents (Rust) | [`pepper-agent`](pepper-agent/), a program of its own inside the app: a viewer pane you run, and commands an AI agent runs to show you video or a live page there. Pepper never starts it either. | Separate program |
