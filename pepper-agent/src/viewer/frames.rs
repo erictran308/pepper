@@ -10,7 +10,7 @@
 
 use std::ffi::c_void;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -121,9 +121,29 @@ fn run(
     let mut decoder: Option<Decoder> = None;
     // VideoToolbox couldn't make a decoder: ImageIO from then on.
     let mut no_hardware = false;
-    while let Ok(first) = rx.recv() {
+    // The last picture, for offering again when Pepper hasn't taken the
+    // surfaces (it answered late, or refused): a still page sends no more.
+    let mut last: Option<Vec<u8>> = None;
+    loop {
+        let retry = (client.is_some() && visible && !attached && last.is_some()).then(|| {
+            refused.map_or(Duration::ZERO, |when| {
+                ATTACH_AGAIN.saturating_sub(when.elapsed())
+            })
+        });
+        let first = match retry {
+            Some(wait) => match rx.recv_timeout(wait) {
+                Ok(msg) => Some(msg),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match rx.recv() {
+                Ok(msg) => Some(msg),
+                Err(_) => return,
+            },
+        };
+        let timed_out = first.is_none();
         let mut frame: Option<(Vec<u8>, Done)> = None;
-        for msg in std::iter::once(first).chain(rx.try_iter()) {
+        for msg in first.into_iter().chain(rx.try_iter()) {
             match msg {
                 FrameMsg::Frame(jpeg, done) => {
                     if let Some((_, older)) = frame.replace((jpeg, done)) {
@@ -165,7 +185,12 @@ fn run(
                 }
             }
         }
-        let Some((jpeg, done)) = frame else { continue };
+        let (jpeg, done): (Vec<u8>, Done) = match (frame, timed_out.then(|| last.take()).flatten())
+        {
+            (Some(frame), _) => frame,
+            (None, Some(again)) => (again, Box::new(|_| {})),
+            (None, None) => continue,
+        };
         let mut shown = false;
         if let (Some(client), true, Some(own)) = (&client, visible, jpeg_size(&jpeg)) {
             let target = capped(own);
@@ -229,6 +254,7 @@ fn run(
             }
         }
         done(shown);
+        last = Some(jpeg);
     }
 }
 

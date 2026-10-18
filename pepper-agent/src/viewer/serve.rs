@@ -359,12 +359,26 @@ fn servable(file: &Path) -> Result<(PathBuf, OsString)> {
     Ok((root, name.to_owned()))
 }
 
-/// A folder too wide to serve: `/`, the home folder or one right in it
-/// (Downloads, Desktop, Library: all of a kind of the user's files), or one
-/// holding pepper-agent's own folders.
+/// A folder too wide to serve: `/`, the home folder, one of the home
+/// folder's own (Downloads, Desktop, Library: all of a kind of the user's
+/// files; a project's folder right in it is fine), or one holding
+/// pepper-agent's own folders.
 fn too_wide(root: &Path, home: Option<&Path>, own: &[Option<PathBuf>]) -> bool {
+    const HOMES: &[&str] = &[
+        "Desktop",
+        "Documents",
+        "Downloads",
+        "Library",
+        "Movies",
+        "Music",
+        "Pictures",
+        "Public",
+        "Library/Mobile Documents",
+        "Library/Mobile Documents/com~apple~CloudDocs",
+    ];
+    let homes = |h: &Path| HOMES.iter().any(|name| root == h.join(name));
     root.parent().is_none()
-        || home.is_some_and(|h| h.starts_with(root) || root.parent() == Some(h))
+        || home.is_some_and(|h| h.starts_with(root) || homes(h))
         || own.iter().flatten().any(|p| p.starts_with(root))
 }
 
@@ -830,9 +844,12 @@ mod tests {
             Some(home),
             &own
         ));
+        let icloud = "/Users/u/Library/Mobile Documents/com~apple~CloudDocs";
+        assert!(too_wide(Path::new(icloud), Some(home), &own));
         for fine in [
             "/Users/u/Downloads/site",
             "/Users/u/code/app/dist",
+            "/Users/u/my-app",
             "/tmp/x",
         ] {
             assert!(!too_wide(Path::new(fine), Some(home), &own), "{fine}");

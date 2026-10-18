@@ -1244,9 +1244,10 @@ fn edit_preview(args: &Args) -> Result<Value> {
     let edl = dir.join(format!("{}.edl", files::name_part(&name)));
     files::write_private(&edl, edit::edl(&project).as_bytes())
         .map_err(|e| Error::new("FAILED", format!("{}: {e}", edl.display())))?;
-    // `edl`, which nothing else sends (no option makes it): the viewer may
-    // follow this file's references, once it's checked that it's its own
-    // EDL of the timeline, in `.pepper/edits/`. No other file's are.
+    // `edl`, which nothing else sends (no option makes it): the viewer plays
+    // an EDL it writes itself from the timeline, each clip pinned and
+    // checked, the one file whose references it follows. This one, which it
+    // never reads, is for the agent to look at.
     let request = Value::obj()
         .with("target", edl.display().to_string())
         .with("kind", "media")
@@ -1647,7 +1648,22 @@ fn open_target(given: &str) -> Result<Target> {
             _ if viewer::is_stream(given) => Ok(Target::Stream(given.to_owned())),
             "http" | "https" if viewer::is_local(given) => Ok(Target::Web(given.to_owned())),
             "http" | "https" => Ok(Target::Media(given.to_owned())),
-            "file" => open_target(&given[7..]),
+            // A file's address as a browser reads it: `localhost` or no host,
+            // percent-decoded, no `?` or `#`.
+            "file" => {
+                let rest = &given[7..];
+                let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+                let end = rest.find(['?', '#']).unwrap_or(rest.len());
+                let path = percent_decoded(&rest[..end])
+                    .filter(|p| p.starts_with('/'))
+                    .ok_or_else(|| {
+                        Error::new(
+                            "BAD_ARGS",
+                            format!("{}: not a file's address", text::inert(given, 300)),
+                        )
+                    })?;
+                open_target(&path)
+            }
             _ => Err(Error::new(
                 "UNSUPPORTED",
                 format!(
@@ -2510,6 +2526,7 @@ mod tests {
             let url = web_target(&given).unwrap();
             let path = url.strip_prefix("file://").and_then(percent_decoded);
             assert_eq!(path.as_deref(), odd.to_str(), "{url}");
+            assert_eq!(open_target(&given).unwrap(), Target::Web(url.clone()));
         }
         let _ = std::fs::remove_dir_all(&dir);
         // A file's address is checked as its path is.
