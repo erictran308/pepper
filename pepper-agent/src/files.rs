@@ -34,6 +34,61 @@ unsafe extern "C" {
     fn mkdirat(fd: c_int, path: *const c_char, mode: u16) -> c_int;
     fn renameat(from_fd: c_int, from: *const c_char, to_fd: c_int, to: *const c_char) -> c_int;
     fn unlinkat(fd: c_int, path: *const c_char, flags: c_int) -> c_int;
+    fn clonefile(from: *const c_char, to: *const c_char, flags: c_uint) -> c_int;
+}
+
+/// clonefile(2): don't follow a link at `from`.
+const CLONE_NOFOLLOW: c_uint = 0x0001;
+
+/// A copy of `from` made at `to`, a new name, sharing its blocks until one
+/// changes (APFS): `to` stays as `from` was, whatever happens to `from`
+/// after. Fails across volumes.
+pub fn clone_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let c = |p: &Path| {
+        CString::new(p.as_os_str().as_encoded_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+    };
+    let (from, to) = (c(from)?, c(to)?);
+    // SAFETY: two NUL-terminated paths; clonefile makes `to` (never over a
+    // file there) and reads them only during the call.
+    if unsafe { clonefile(from.as_ptr(), to.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Whether a file starts as one mpv reads for the files it names, whatever
+/// its name: an mpv EDL, a playlist, a cue sheet, an archive.
+pub fn names_others(file: &Path) -> bool {
+    let mut head = [0u8; 64];
+    let read = File::open(file)
+        .and_then(|mut f| f.read(&mut head))
+        .unwrap_or(0);
+    let head = head[..read].to_ascii_lowercase();
+    let head = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&head);
+    let start = head
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(head.len());
+    let head = &head[start..];
+    [
+        b"# mpv edl".as_slice(),
+        b"#extm3u",
+        b"ffconcat",
+        b"[playlist]",
+        b"[reference]",
+        b"[internetshortcut]",
+        b"<asx",
+        b"<?xml",
+        b"file \"",
+        b"rem ",
+        b"pk\x03\x04",
+        b"rar!",
+        b"7z\xbc\xaf\x27\x1c",
+    ]
+    .iter()
+    .any(|magic| head.starts_with(magic))
 }
 
 /// What `.pepper/.gitignore` holds: everything in `.pepper/` (itself too)
@@ -468,6 +523,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn clips_that_name_others_and_clones() {
+        let dir = scratch("names-others");
+        let clip = dir.join("clip.mp4");
+        for (body, names) in [
+            (&b"# mpv EDL v0\n%3%/x\n"[..], true),
+            (b"\xef\xbb\xbf  #EXTM3U\n/x.mp4\n", true),
+            (b"[Playlist]\nFile1=/x\n", true),
+            (b"ffconcat version 1.0\n", true),
+            (b"PK\x03\x04rest", true),
+            (b"\x00\x00\x00\x18ftypmp42", false),
+            (b"\x1a\x45\xdf\xa3 matroska", false),
+        ] {
+            std::fs::write(&clip, body).unwrap();
+            assert_eq!(names_others(&clip), names, "{body:?}");
+        }
+        // A clone is the file as it was, and never made over another.
+        let (a, b) = (dir.join("a.bin"), dir.join("b.bin"));
+        std::fs::write(&a, b"one").unwrap();
+        clone_file(&a, &b).unwrap();
+        std::fs::write(&a, b"two").unwrap();
+        assert_eq!(std::fs::read(&b).unwrap(), b"one");
+        assert!(clone_file(&a, &b).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn gitignore_is_made_ours_again() {
         let dir = scratch("gitignore");

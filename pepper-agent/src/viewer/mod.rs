@@ -1934,18 +1934,27 @@ impl Viewer {
                 ));
             }
         }
-        // A video another agent opened, of a file this one may not read.
+        // A video another agent opened, of a file this one may not read; or
+        // an edit's preview, any of whose clips it may not.
         if matches!(req.cmd.as_str(), "snapshot" | "record.start")
             && let Ok(i) = self.pick(&req.args)
         {
             let s = &self.sources[i];
-            if s.web.is_none() && s.target.starts_with('/') && !may_read(Path::new(&s.target)) {
+            let clips = s.edit.iter().flat_map(|e| e.srcs.iter());
+            let files = std::iter::once(&s.target).chain(clips);
+            let hidden = files.filter(|f| f.starts_with('/')).any(|f| {
+                let real = std::fs::canonicalize(f).unwrap_or_else(|_| PathBuf::from(f));
+                !(may_read(Path::new(f)) && may_read(&real))
+            });
+            if s.web.is_none() && hidden {
                 return Err(Error::new(
                     "SANDBOXED",
                     format!("{} shows a file your sandbox keeps from you", s.name),
                 ));
             }
         }
+        // What the viewer does for it is held to that too (`own_edl`).
+        req.args.set("_sandboxed", true);
         sandboxed_reach(&req.cmd, &mut req.args, &may_read, remote_page)
     }
 
@@ -2207,7 +2216,7 @@ impl Viewer {
         // EDL the viewer writes itself.
         let own_edl = args.get_bool("edl") == Some(true);
         if own_edl {
-            target = self.own_edl(edit.as_ref())?;
+            target = self.own_edl(edit.as_ref(), args.get_bool("_sandboxed") == Some(true))?;
         }
         let (session, owner) = self.claim(args)?;
         let stream = kind == "stream";
@@ -2234,7 +2243,13 @@ impl Viewer {
     /// another name, whose own references mpv would follow too). So what
     /// mpv opens through it is the clips the answers name, never what a file
     /// names, and the EDL the command wrote is never read.
-    fn own_edl(&mut self, edit: Option<&edit::Timeline>) -> Result<String> {
+    ///
+    /// Each clip is pinned first: cloned into the viewer's folder (APFS), and
+    /// the clone checked and played, so a clip changed after the check (by a
+    /// sandboxed agent that may write it) plays as it was. A clip on another
+    /// volume can't be cloned: its own path is played, but not for a
+    /// sandboxed agent (`strict`).
+    fn own_edl(&mut self, edit: Option<&edit::Timeline>, strict: bool) -> Result<String> {
         const O_NOFOLLOW: i32 = 0x0100;
         let refuse = |why: String| Error::new("BAD_ARGS", format!("an edit preview's EDL: {why}"));
         let mut own = edit
@@ -2244,9 +2259,33 @@ impl Viewer {
             if !src.starts_with('/') {
                 return Err(refuse("a clip that isn't a file".into()));
             }
-            let real = check_target(src, &self.project)?;
+            let real = PathBuf::from(check_target(src, &self.project)?);
+            let ext = real
+                .extension()
+                .and_then(|e| e.to_str())
+                .filter(|e| e.len() <= 8 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+                .unwrap_or("bin");
+            let hex =
+                sys::random_hex().map_err(|e| Error::new("FAILED", format!("a name: {e}")))?;
+            let pinned = self.shots.join(format!("clip-{}.{ext}", &hex[..16]));
+            let real = match files::clone_file(&real, &pinned) {
+                Ok(()) => pinned,
+                Err(_) if strict => {
+                    return Err(refuse(format!(
+                        "the clip {} can't be pinned (another volume): copy it beside the project",
+                        text::inert(src, 300)
+                    )));
+                }
+                Err(_) => real,
+            };
+            if files::names_others(&real) {
+                return Err(refuse(format!(
+                    "the clip {} names other files (a playlist, an EDL, an archive)",
+                    text::inert(src, 300)
+                )));
+            }
             // A picture or a sound (media::probe's `video`, `audio`).
-            let plain = crate::media::probe(&self.shots, Path::new(&real)).is_ok_and(|p| {
+            let plain = crate::media::probe(&self.shots, &real).is_ok_and(|p| {
                 p.json.get("video").is_some_and(|v| !v.is_null())
                     || p.json
                         .get("audio")
@@ -2259,7 +2298,7 @@ impl Viewer {
                     text::inert(src, 300)
                 )));
             }
-            *src = real;
+            *src = real.display().to_string();
         }
         let path = self.output("edit", "edl")?;
         OpenOptions::new()
@@ -3057,16 +3096,21 @@ fn sandboxed_reach(
                 .into(),
         ));
     }
-    // An edit's preview: every clip of its timeline plays through its EDL.
-    if cmd == "open" && args.get_bool("edl") == Some(true) {
-        let srcs = args
-            .get("edit")
-            .and_then(|e| e.get("srcs"))
-            .and_then(Value::arr)
-            .unwrap_or(&[]);
-        for src in srcs.iter().filter_map(Value::str) {
-            file(Path::new(src))?;
+    // An edit's preview: every clip of its timeline plays through its EDL,
+    // by the real path checked here (`own_edl` resolves it no more).
+    if cmd == "open"
+        && args.get_bool("edl") == Some(true)
+        && let Some(mut edit) = args.take("edit")
+    {
+        let mut reals = Vec::new();
+        for src in edit.get("srcs").and_then(Value::arr).unwrap_or(&[]) {
+            let Some(src) = src.str() else {
+                return Err(Error::new("BAD_ARGS", "an edit's clip isn't a path"));
+            };
+            reals.push(file(Path::new(src))?.display().to_string());
         }
+        edit.set("srcs", reals);
+        args.set("edit", edit);
     }
     let key = match cmd {
         "open" | "watch" | "web.open" => "target",
@@ -3103,7 +3147,7 @@ fn sandboxed_reach(
         args.set(key, format!("file://{}{after}", url_path(&real)));
     } else if live::is_stream(&target) {
         return Err(refused("a stream comes from the network".into()));
-    } else if target != "about:blank" && !on_this_machine(&target) {
+    } else if target != "about:blank" && !on_this_machine(&target, page) {
         return Err(refused(format!(
             "{} isn't on this machine",
             text::inert(&text::redact_url(&target), 200)
@@ -3241,21 +3285,23 @@ pub(crate) fn url_path(path: &Path) -> String {
 }
 
 /// Whether an http(s) address is of this machine, both as Chrome reads its
-/// host (web::is_local) and as ffmpeg does (up to `/ ? #`, so no `\`).
-fn on_this_machine(url: &str) -> bool {
+/// host (web::is_local) and as ffmpeg does (up to `/ ? #`, so no `\`). For
+/// a video (not a `page`), not `*.localhost`: this machine to Chrome, but
+/// mpv and ffmpeg ask DNS.
+fn on_this_machine(url: &str, page: bool) -> bool {
     let Some((scheme, rest)) = url.split_once("://") else {
         return false;
     };
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    // `*.localhost` is this machine to Chrome, but mpv and ffmpeg ask DNS.
     let host = authority.rsplit('@').next().unwrap_or("");
     let name = match host.strip_prefix('[') {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => host.split(':').next().unwrap_or(""),
     };
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
     matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https")
         && !authority.contains('\\')
-        && !name.to_ascii_lowercase().ends_with(".localhost")
+        && (page || !name.ends_with(".localhost"))
         && web::is_local(url)
 }
 
