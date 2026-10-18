@@ -2032,26 +2032,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // If we have custom shaders, then we render them.
-            if (self.custom_shader_state) |state| {
+            if (self.custom_shader_state) |state| custom: {
+                // pepper: the uniforms, and `front_texture` for more than
+                // one shader, are made above in this same hold of the draw
+                // mutex. Were either missing, the post passes are skipped
+                // rather than reading a null.
+                const pipelines = self.shaders.post_pipelines;
+                const uniforms = if (frame.custom_shader_uniforms) |*u| u else break :custom;
+                if (pipelines.len > 1 and state.front_texture == null) break :custom;
+
                 // Sync our uniforms.
-                const uniforms = &frame.custom_shader_uniforms.?;
                 try uniforms.sync(&.{self.custom_shader_uniforms});
 
                 // pepper: each shader reads `source` and draws to `spare`,
                 // then they trade places; the last draws to the frame's
                 // target. Swapped here rather than in the shared state, so
-                // every frame finds the terminal in `back_texture`.
+                // every frame finds the terminal in `back_texture`. A single
+                // shader draws only to the target, and has no spare.
                 var source = state.back_texture;
-                var spare = state.front_texture;
-                for (self.shaders.post_pipelines, 0..) |pipeline, i| {
-                    const last = i == self.shaders.post_pipelines.len - 1;
-                    defer if (!last) std.mem.swap(Texture, &source, &spare.?);
+                var spare = state.front_texture orelse source;
+                for (pipelines, 0..) |pipeline, i| {
+                    const last = i == pipelines.len - 1;
+                    defer if (!last) std.mem.swap(Texture, &source, &spare);
 
                     var pass = frame_ctx.renderPass(&.{.{
                         .target = if (last)
                             .{ .target = frame.target }
                         else
-                            .{ .texture = spare.? },
+                            .{ .texture = spare },
                         .clear_color = .{ 0.0, 0.0, 0.0, 0.0 },
                     }});
                     defer pass.complete();

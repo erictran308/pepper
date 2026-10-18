@@ -227,9 +227,9 @@ fn api() -> &'static Api {
 /// there is. Call it once, before anything else here.
 ///
 /// The library is code this program runs, so only a file that only the user
-/// or the system could have put there: an absolute path, the file and its
-/// folder owned by the user or root and not writable by others, and not
-/// downloaded (no quarantine).
+/// or the system could have put there: an absolute path, the file and every
+/// folder above it owned by the user or root and not writable by others, and
+/// not downloaded (no quarantine).
 pub fn load() -> Result<(), String> {
     let from_env = std::env::var("PEPPER_LIBMPV")
         .ok()
@@ -289,8 +289,10 @@ fn trusted(place: &str) -> Result<std::path::PathBuf, String> {
     let real = std::fs::canonicalize(place).map_err(|e| e.to_string())?;
     // SAFETY: getuid has no preconditions.
     let me = unsafe { getuid() };
-    let folder = real.parent().ok_or("no folder")?;
-    for path in [real.as_path(), folder] {
+    // The file and every folder above it: anyone who could write to one could
+    // put another library in its place. Homebrew's Cellar is writable by the
+    // admin group, on purpose, so a group may write.
+    for path in real.ancestors() {
         let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
         if meta.uid() != me && meta.uid() != 0 {
             return Err(format!("{} belongs to someone else", path.display()));
@@ -323,4 +325,40 @@ pub fn error(code: c_int) -> String {
     unsafe { CStr::from_ptr(mpv_error_string(code)) }
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_library_only_the_user_could_have_put_there() {
+        let dir = std::env::temp_dir().join(format!("pepper-libmpv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let lib = dir.join("open/lib/libmpv.2.dylib");
+        std::fs::create_dir_all(lib.parent().unwrap()).unwrap();
+        std::fs::write(&lib, b"").unwrap();
+        let place = lib.to_str().unwrap();
+        let mode = |mode| {
+            std::fs::set_permissions(dir.join("open"), std::fs::Permissions::from_mode(mode))
+                .unwrap()
+        };
+        let mine = trusted(place);
+        // A folder above the library's own that anyone can write to: they
+        // could put another folder, with another library, in its place.
+        mode(0o777);
+        let open = trusted(place);
+        mode(0o775);
+        let group = trusted(place);
+        mode(0o755);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(mine.is_ok(), "{mine:?}");
+        assert!(open.unwrap_err().starts_with("anyone can write to"));
+        assert!(group.is_ok(), "{group:?}");
+        assert_eq!(
+            trusted("lib/libmpv.2.dylib").unwrap_err(),
+            "not an absolute path"
+        );
+    }
 }

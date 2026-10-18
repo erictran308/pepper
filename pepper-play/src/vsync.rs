@@ -11,6 +11,7 @@
 //! waits too long (the displays asleep) is shown anyway (REFRESH_LATE).
 
 use std::ffi::c_void;
+use std::sync::{Mutex, MutexGuard};
 
 type DisplayLink = *mut c_void;
 
@@ -55,9 +56,14 @@ pub type OnRefresh = Box<dyn Fn() + Send + Sync>;
 
 pub struct Vsync {
     link: DisplayLink,
+    /// Its calls, one at a time: the render thread starts and stops the link
+    /// while the size reports' thread moves it to another display, and
+    /// CoreVideo doesn't say those may run at once.
+    calls: Mutex<()>,
 }
 
-// SAFETY: a CVDisplayLink may be started and stopped from any thread.
+// SAFETY: a CVDisplayLink may be used from any thread, `calls` keeping the
+// calls one at a time.
 unsafe impl Send for Vsync {}
 unsafe impl Sync for Vsync {}
 
@@ -109,11 +115,19 @@ impl Vsync {
             unsafe { CVDisplayLinkRelease(link) };
             return Err(format!("CVDisplayLinkSetOutputCallback failed: {err}"));
         }
-        Ok(Vsync { link })
+        Ok(Vsync {
+            link,
+            calls: Mutex::new(()),
+        })
+    }
+
+    fn calls(&self) -> MutexGuard<'_, ()> {
+        self.calls.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The display's refreshes a second, as it says it runs.
     pub fn rate(&self) -> Option<f64> {
+        let _calls = self.calls();
         // SAFETY: a live link.
         let period = unsafe { CVDisplayLinkGetNominalOutputVideoRefreshPeriod(self.link) };
         (period.flags & TIME_INDEFINITE == 0 && period.value > 0 && period.scale > 0)
@@ -123,6 +137,7 @@ impl Vsync {
     /// Follows `display` (a CGDirectDisplayID) from now on: its refreshes,
     /// and its rate. False if the link can't.
     pub fn follow(&self, display: u32) -> bool {
+        let _calls = self.calls();
         // SAFETY: a live link; any display id may be asked for.
         unsafe { CVDisplayLinkSetCurrentCGDisplay(self.link, display) == 0 }
     }
@@ -130,11 +145,13 @@ impl Vsync {
     /// Calls at each refresh from now on (the first at the next one). False
     /// if the link won't run.
     pub fn start(&self) -> bool {
+        let _calls = self.calls();
         // SAFETY: a live link.
         unsafe { CVDisplayLinkIsRunning(self.link) != 0 || CVDisplayLinkStart(self.link) == 0 }
     }
 
     pub fn stop(&self) {
+        let _calls = self.calls();
         // SAFETY: a live link.
         unsafe {
             if CVDisplayLinkIsRunning(self.link) != 0 {

@@ -74,8 +74,11 @@ DEBUG_LINE = re.compile(
     r"(\d+) surfaces made(?: in (\d+) rings)?;(?: (\d+) repeats not drawn;)? "
     r"(\d+(?:\.\d+)?) s waiting on the graphics chip; "
     r"hwdec (\S+)$", re.M)
+# With the display the box is on (`display: Some(N)` or `None`), and without
+# it, as an older pepper-play says it.
 BOX_LINE = re.compile(
-    r"^pepper-play: Pepper says the box is BoxSize \{ width: (\d+), height: (\d+), visible: true \}$",
+    r"^pepper-play: Pepper says the box is BoxSize \{ width: (\d+), height: (\d+), "
+    r"visible: true(?:, display: (?:Some\(\d+\)|None))? \}$",
     re.M)
 # How much of a player's stderr is read after a run.
 STDERR_TAIL = 1 << 20
@@ -126,16 +129,19 @@ def pid_path(pid):
     return buf.raw[:n].decode(errors="replace") if n > 0 else None
 
 
-def ps_cpu(pid):
-    """CPU seconds from ps, for a process that isn't this user's."""
-    out = subprocess.run(["/bin/ps", "-o", "time=", "-p", str(pid)],
+def ps_usage(pid):
+    """(CPU seconds, start time) from ps, for a process that isn't this
+    user's, or None. The start time (to the second) tells a reused pid from
+    the process sampled before, as rusage's does."""
+    out = subprocess.run(["/bin/ps", "-o", "time=,lstart=", "-p", str(pid)],
                          capture_output=True, text=True).stdout.strip()
     if not out:
         return None
+    cpu, _, start = out.partition(" ")
     total = 0.0
-    for part in out.split(":"):
+    for part in cpu.split(":"):
         total = total * 60 + float(part)
-    return total
+    return total, start.strip()
 
 
 def gpu_percent():
@@ -170,9 +176,13 @@ class Sampler:
         for name, pid in self.pids.items():
             usage = rusage(pid)
             if usage is None:
-                cpu = ps_cpu(pid)
-                usage = (cpu, None, None, None, None) if cpu is not None else None
-            elif self.started.setdefault(name, usage[4]) != usage[4]:
+                ps = ps_usage(pid)
+                usage = (ps[0], None, None, None, ("ps", ps[1])) if ps else None
+            else:
+                usage = usage[:4] + (("rusage", usage[4]),)
+            # Each start time says where it's from: a process doesn't move
+            # from one to the other, so a change is another process too.
+            if usage is not None and self.started.setdefault(name, usage[4]) != usage[4]:
                 usage = None  # the pid now belongs to another process
             row[name] = usage
         self.samples.append((now, row, gpu_percent()))
@@ -204,11 +214,15 @@ class Sampler:
                 "cpu_mean": 100 * (cpus[-1][1] - cpus[0][1]) / (cpus[-1][0] - cpus[0][0]),
                 "cpu_p95": percentile(seconds, 95),
             }
-            rows = [row[name] for _, row, _ in self.samples if row.get(name)]
-            if rows[0][1] is not None:
-                entry["wakeups_per_s"] = (rows[-1][1] - rows[0][1]) / wall
-                entry["rss_peak_mb"] = max(r[2] for r in rows) / 2**20
-                entry["footprint_peak_mb"] = max(r[3] for r in rows) / 2**20
+            # Wakeups and memory from rusage's rows only: ps has neither.
+            full = [(t, row[name]) for t, row, _ in self.samples
+                    if row.get(name) and None not in row[name][:4]]
+            if len(full) >= 2 and full[-1][0] > full[0][0]:
+                (t0, r0), (t1, r1) = full[0], full[-1]
+                entry["wakeups_per_s"] = (r1[1] - r0[1]) / (t1 - t0)
+            if full:
+                entry["rss_peak_mb"] = max(r[2] for _, r in full) / 2**20
+                entry["footprint_peak_mb"] = max(r[3] for _, r in full) / 2**20
             out[name] = entry
         gpus = [g for _, _, g in self.samples if g is not None]
         out["gpu_mean"] = sum(gpus) / len(gpus) if gpus else None
@@ -408,10 +422,17 @@ def run_player(kind, argv, sock, args, pids, place=None, window=None):
 
 
 def read_tail(f):
-    """The last STDERR_TAIL bytes of a file, as text."""
+    """The last STDERR_TAIL bytes of a file, as text, from a line's start: a
+    line cut at the front (one of mpv's, which can hold a video's tags) is
+    dropped, so no part of it is taken for one of pepper-play's own."""
     size = f.seek(0, os.SEEK_END)
-    f.seek(max(0, size - STDERR_TAIL))
-    return f.read().decode(errors="replace")
+    start = max(0, size - STDERR_TAIL)
+    # From the byte before: if it ends a line, only that newline goes.
+    f.seek(max(0, start - 1))
+    data = f.read()
+    if start > 0:
+        data = data.partition(b"\n")[2]
+    return data.decode(errors="replace")
 
 
 def parse_stderr(text):
@@ -610,8 +631,8 @@ def table(results):
             f"  {r.get('windowserver', {}).get('cpu_mean', 0):>4.0f}"
             f"  {r.get('gpu_mean') or 0:>5.0f}"
             f"  {p.get('rss_peak_mb', 0):>8.0f}/{p.get('footprint_peak_mb', 0):<6.0f}"
-            f"  {c.get('frame-drop-count')!s:>6} {c.get('mistimed-frame-count')!s:>8}"
-            f" {c.get('vo-delayed-frame-count')!s:>7}  {safe(props.get('hwdec-current'))}")
+            f"  {safe(c.get('frame-drop-count')):>6} {safe(c.get('mistimed-frame-count')):>8}"
+            f" {safe(c.get('vo-delayed-frame-count')):>7}  {safe(props.get('hwdec-current'))}")
     return "\n".join(lines)
 
 

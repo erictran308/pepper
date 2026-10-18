@@ -64,6 +64,17 @@ impl Surface {
         unsafe {
             let numbers = values
                 .map(|v| CFNumberCreate(std::ptr::null(), CF_NUMBER_SINT32, (&raw const v).cast()));
+            let release = |objects: &[*const c_void]| {
+                objects
+                    .iter()
+                    .filter(|object| !object.is_null())
+                    .for_each(|object| CFRelease(*object));
+            };
+            // Out of memory: no surface (and CFRelease takes no NULL).
+            if numbers.iter().any(|number| number.is_null()) {
+                release(&numbers);
+                return None;
+            }
             let keys = [
                 kIOSurfaceWidth,
                 kIOSurfaceHeight,
@@ -78,9 +89,12 @@ impl Surface {
                 &raw const kCFTypeDictionaryKeyCallBacks,
                 &raw const kCFTypeDictionaryValueCallBacks,
             );
+            release(&numbers);
+            if properties.is_null() {
+                return None;
+            }
             let raw = IOSurfaceCreate(properties);
             CFRelease(properties);
-            numbers.iter().for_each(|n| CFRelease(*n));
             if !raw.is_null() {
                 tag_srgb(raw);
             }

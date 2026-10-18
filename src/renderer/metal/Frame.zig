@@ -35,6 +35,9 @@ pub fn begin(
     /// The target is presented via the provided renderer's API when completed.
     target: *Target,
 ) !Self {
+    // pepper: a command buffer that retains what it uses, so a frame in
+    // flight keeps the shared custom shader textures alive when they're
+    // replaced (generic.zig, CustomShaderState).
     const buffer = opts.queue.msgSend(
         objc.Object,
         objc.sel("commandBuffer"),
