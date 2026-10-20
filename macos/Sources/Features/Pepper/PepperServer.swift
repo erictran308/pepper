@@ -184,6 +184,38 @@ final class PepperServer {
     /// The processes that have streams, each watched, so that its streams end
     /// when it exits or runs another program.
     private var owners: [Sender: DispatchSourceProcess] = [:]
+    /// The tokens whose box shows its stream, as `videoDidChange` last told.
+    private var videoTokens: Set<String> = []
+
+    /// Posted when the boxes that show a stream change: their tabs show it.
+    static let videoDidChange = Notification.Name("PepperVideoDidChange")
+
+    /// Whether a stream shows in `view`.
+    func showsVideo(in view: Ghostty.SurfaceView) -> Bool {
+        videoTokens.contains { placements[$0]?.view === view }
+    }
+
+    /// Whether the token's box shows its stream: a frame in it, or the last
+    /// one, kept while the stream attaches again at a new size.
+    private func showsVideo(_ token: String, _ placement: Placement) -> Bool {
+        placement.view != nil && streams[token] != nil && placement.layer.contents != nil
+    }
+
+    /// Posts `videoDidChange` if the boxes that show a stream changed. Called
+    /// on the way out of every way in (messages, notices, placing, an
+    /// owner's end, a window's move, a kept frame's end), so after every
+    /// frame: it compares without allocating, and lists them again only
+    /// when they changed.
+    private func noteVideo() {
+        var showing = 0
+        for (token, placement) in placements where showsVideo(token, placement) {
+            guard videoTokens.contains(token) else { showing = -1; break }
+            showing += 1
+        }
+        guard showing != videoTokens.count else { return }
+        videoTokens = Set(placements.filter { showsVideo($0.key, $0.value) }.keys)
+        NotificationCenter.default.post(name: Self.videoDidChange, object: self)
+    }
 
     /// Registers the port and listens on the main queue. Call it before any
     /// surface starts, so every shell gets PEPPER_PORT.
@@ -262,6 +294,7 @@ final class PepperServer {
     /// of `view`, or takes it away when `pixels` is empty. Called on the
     /// main thread for `OSC 777;pepper`.
     func place(token: String, pixels: CGRect, in view: Ghostty.SurfaceView) {
+        defer { noteVideo() }
         guard !pixels.isEmpty else {
             if let placement = placements.removeValue(forKey: token) {
                 remove(placement.layer)
@@ -316,6 +349,7 @@ final class PepperServer {
     /// keep their size in points, so their pixels follow the scale, and each
     /// client hears of its box's pixels and display.
     private func windowMoved(_ window: NSWindow) {
+        defer { noteVideo() }
         let scale = window.backingScaleFactor
         // Read again at each: a report can end a client's streams, and their
         // placements with them.
@@ -401,6 +435,7 @@ final class PepperServer {
     // MARK: Streaming
 
     private func drain() {
+        defer { noteVideo() }
         for _ in 0..<Self.drainBatch {
             let kr = mach_msg(
                 header,
@@ -441,6 +476,7 @@ final class PepperServer {
 
     /// The kernel's notices, on `notifyPort`.
     private func drainNotices() {
+        defer { noteVideo() }
         while true {
             let kr = mach_msg(
                 notice,
@@ -657,6 +693,7 @@ final class PepperServer {
             guard let self, let stream = self.streams[token],
                   stream.serial == serial, stream.slot == nil else { return }
             self.show(token)
+            self.noteVideo()
         }
         report(token)
         Self.logger.info("attached \(surfaces.count) surfaces")
@@ -710,6 +747,7 @@ final class PepperServer {
     /// The owner exited or ran another program: its streams go, and their
     /// boxes, which nothing will show in again.
     private func ownerGone(_ owner: Sender) {
+        defer { noteVideo() }
         var ended = 0
         for (token, stream) in streams where stream.owner == owner {
             dropStream(token)
