@@ -60,8 +60,10 @@ class HiddenTitlebarTerminalWindow: TerminalWindow {
         standardWindowButton(.miniaturizeButton)?.isHidden = true
         standardWindowButton(.zoomButton)?.isHidden = true
 
-        // Disallow tabbing if the titlebar is hidden, since that will (should) also hide the tab bar.
-        tabbingMode = .disallowed
+        // pepper: tabs stay with the titlebar hidden: Pepper draws their bar
+        // (PepperTabBar.swift), from macOS 15. Before, as Ghostty: no tabs,
+        // since their bar is hidden with the titlebar.
+        if #unavailable(macOS 15.0) { tabbingMode = .disallowed }
 
         // Nuke it from orbit -- hide the titlebar container entirely, just in case. There are
         // some operations that appear to bring back the titlebar visibility so this ensures
@@ -73,6 +75,18 @@ class HiddenTitlebarTerminalWindow: TerminalWindow {
     }
 
     // MARK: NSWindow
+
+    // pepper: macOS's tab bar takes no room under Pepper's.
+    override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
+        super.addTitlebarAccessoryViewController(childViewController)
+        if isTabBar(childViewController) { childViewController.isHidden = true }
+    }
+
+    // pepper: Pepper's tab bar takes the terminal's colors again too.
+    override func syncAppearance(_ surfaceConfig: Ghostty.SurfaceView.DerivedConfig) {
+        super.syncAppearance(surfaceConfig)
+        NotificationCenter.default.post(name: PepperTabs.appearanceDidChange, object: self)
+    }
 
     override var title: String {
         didSet {

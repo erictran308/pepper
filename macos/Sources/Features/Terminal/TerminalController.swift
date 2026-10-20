@@ -1038,14 +1038,18 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // Initialize our content view to the SwiftUI root
         let container = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            // pepper: Pepper's tab bar over the hidden titlebar (PepperTabBar.swift).
+            PepperTabbed(controller: self) {
+                TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            }
         }
 
         // Set the initial content size on the container so that
         // intrinsicContentSize returns the correct value immediately,
         // without waiting for @FocusedValue to propagate through the
         // SwiftUI focus chain.
-        container.initialContentSize = focusedSurface?.initialSize
+        // pepper: with Pepper's tab bar's height, so the terminal keeps its rows.
+        container.initialContentSize = PepperTabs.contentSize(focusedSurface?.initialSize, self)
 
         window.contentView = container
 

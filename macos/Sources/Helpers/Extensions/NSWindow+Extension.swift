@@ -87,7 +87,10 @@ extension NSWindow {
 
     /// Returns the [private] NSTabBar view, if it exists.
     var tabBarView: NSView? {
-        titlebarView?.firstDescendant(withClassName: "NSTabBar")
+        // pepper: the hidden titlebar's tab bar is hidden under Pepper's
+        // (PepperTabBar.swift): none to click, rename in or lay out.
+        if self is HiddenTitlebarTerminalWindow { return nil }
+        return titlebarView?.firstDescendant(withClassName: "NSTabBar")
     }
 
     /// Returns tab button views in visual order from left to right.
