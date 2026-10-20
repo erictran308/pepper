@@ -60,13 +60,21 @@ struct PepperTabbed<Content: View>: View {
 /// group, so goto_tab, move_tab, restoring and AppleScript work as before;
 /// only the bar is Pepper's, where the hidden titlebar was. Each tab shows
 /// what goes on in it: video Pepper shows, a progress report (OSC 9;4), a
-/// bell.
+/// bell. It's always there, even with one tab, so a second tab doesn't move
+/// the terminal down.
 ///
 /// Every window of a group has a bar, but only the selected tab's window is
-/// on screen: only its bar keeps up, the others wait until theirs is.
+/// on screen: only its bar keeps up, the others catch up when theirs is.
 @available(macOS 15.0, *)
 struct PepperTabBar: View {
     @StateObject private var model: Model
+    /// The bar's width, which says how many tabs fit.
+    @State private var width: CGFloat = 0
+
+    private static let padding: CGFloat = 10
+    private static let newTabWidth: CGFloat = 26
+    /// The least empty space kept for moving the window.
+    private static let dragRoom: CGFloat = 40
 
     init(controller: TerminalController) {
         _model = StateObject(wrappedValue: Model(controller: controller))
@@ -74,8 +82,8 @@ struct PepperTabBar: View {
 
     var body: some View {
         HStack(alignment: .bottom, spacing: TabRow.spacing) {
-            TabRow(selected: model.selectedIndex) {
-                ForEach(model.tabs) { tab in
+            TabRow {
+                ForEach(shownTabs) { tab in
                     Item(tab: tab, model: model)
                 }
             }
@@ -83,23 +91,26 @@ struct PepperTabBar: View {
             Button(action: model.newTab) {
                 Image(systemName: "plus")
                     .font(.system(size: 12, weight: .medium))
-                    .frame(width: 26, height: 26)
+                    .frame(width: Self.newTabWidth, height: Self.newTabWidth)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .foregroundStyle(model.foreground.opacity(0.6))
             .padding(.bottom, 3)
             .help("New Tab")
-            Spacer(minLength: 40)
+            Spacer(minLength: Self.dragRoom)
         }
-        .padding(.horizontal, 10)
+        .padding(.horizontal, Self.padding)
         .frame(height: PepperTabs.barHeight, alignment: .bottom)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .coordinateSpace(.named(Model.space))
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .background {
             // The bar's empty space moves the window, as a titlebar does.
             Color.clear
                 .contentShape(Rectangle())
                 .gesture(WindowDragGesture())
+                .simultaneousGesture(TapGesture().onEnded { model.refocus() })
                 .allowsWindowActivationEvents(true)
         }
         .background(Color(nsColor: model.barColor))
@@ -108,38 +119,41 @@ struct PepperTabBar: View {
         .compositingGroup()
     }
 
-    /// The tabs at one width, up to `maxTabWidth`, narrower to fit the bar
-    /// down to `minTabWidth`. Past that, as many as fit show, the selected
-    /// one among them. It needs no width of its own, so many tabs never
-    /// widen the window.
+    /// As many tabs as fit at `TabRow.minTabWidth`, the selected one among
+    /// them; the others aren't drawn at all.
+    private var shownTabs: ArraySlice<Model.Tab> {
+        let tabs = model.tabs
+        guard width > 0, !tabs.isEmpty else { return tabs[...] }
+        let room = width - 2 * Self.padding - Self.newTabWidth - Self.dragRoom - 2 * TabRow.spacing
+        let fitting = max(1, Int((room + TabRow.spacing) / (TabRow.minTabWidth + TabRow.spacing)))
+        let count = min(tabs.count, fitting)
+        let selected = tabs.firstIndex { $0.isSelected } ?? 0
+        let first = min(max(0, selected - count + 1), tabs.count - count)
+        return tabs[first..<first + count]
+    }
+
+    /// The tabs at one width, up to `maxTabWidth`, narrower down to
+    /// `minTabWidth` to fit. It asks for no width of its own (none ideal), so
+    /// tabs never widen the window, or its default size.
     private struct TabRow: Layout {
         static let spacing: CGFloat = 2
         static let maxTabWidth: CGFloat = 200
         static let minTabWidth: CGFloat = 64
         static let tabHeight: CGFloat = 31
 
-        let selected: Int
-
         func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
             let count = CGFloat(subviews.count)
-            let ideal = max(0, count * Self.maxTabWidth + (count - 1) * Self.spacing)
-            return CGSize(width: min(proposal.width ?? ideal, ideal), height: Self.tabHeight)
+            let widest = max(0, count * Self.maxTabWidth + (count - 1) * Self.spacing)
+            return CGSize(width: min(proposal.width ?? 0, widest), height: Self.tabHeight)
         }
 
         func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
             guard !subviews.isEmpty else { return }
-            let fitting = max(1, Int((bounds.width + Self.spacing) / (Self.minTabWidth + Self.spacing)))
-            let shown = min(subviews.count, fitting)
-            let first = min(max(0, selected - shown + 1), subviews.count - shown)
-            let width = (bounds.width - CGFloat(shown - 1) * Self.spacing) / CGFloat(shown)
+            let count = CGFloat(subviews.count)
+            let width = (bounds.width - (count - 1) * Self.spacing) / count
             let each = min(Self.maxTabWidth, max(Self.minTabWidth, width))
             var x = bounds.minX
-            for (index, subview) in subviews.enumerated() {
-                guard (first..<first + shown).contains(index) else {
-                    // Off the bar: nothing is drawn or clicked there.
-                    subview.place(at: CGPoint(x: -100_000, y: bounds.minY), proposal: .zero)
-                    continue
-                }
+            for subview in subviews {
                 subview.place(
                     at: CGPoint(x: x, y: bounds.minY),
                     proposal: ProposedViewSize(width: each, height: bounds.height)
@@ -160,6 +174,10 @@ struct PepperTabBar: View {
 
         private var textColor: Color {
             model.foreground.opacity(tab.isSelected ? 0.95 : 0.65)
+        }
+
+        private var dragOffset: CGFloat? {
+            model.dragging?.id == tab.id ? model.dragging?.offset : nil
         }
 
         var body: some View {
@@ -187,13 +205,21 @@ struct PepperTabBar: View {
                 if tab.isSelected { shape.fill(.black).blendMode(.destinationOut) }
             }
             .contentShape(shape)
-            .onTapGesture { model.select(tab) }
-            .onHover { hovering = $0 }
-            .draggable(tab.dragPayload)
-            .dropDestination(for: String.self) { items, _ in
-                guard let payload = items.first else { return false }
-                return model.move(payload, to: tab)
+            .onGeometryChange(for: CGRect.self) { $0.frame(in: .named(Model.space)) } action: {
+                model.frames[tab.id] = $0
             }
+            .onDisappear { model.frames[tab.id] = nil }
+            // Dragged within the bar only: never a system drag, which the
+            // terminal under the bar (or another app) would take as text.
+            .offset(x: dragOffset ?? 0)
+            .zIndex(dragOffset == nil ? 0 : 1)
+            .onTapGesture { model.select(tab) }
+            .gesture(
+                DragGesture(minimumDistance: 4, coordinateSpace: .named(Model.space))
+                    .onChanged { model.drag(tab, by: $0.translation.width) }
+                    .onEnded { model.drop(tab, at: $0.location.x) }
+            )
+            .onHover { hovering = $0 }
             .contextMenu { menu }
             .help(tab.fullTitle)
             .accessibilityAddTraits(tab.isSelected ? [.isButton, .isSelected] : .isButton)
@@ -311,11 +337,11 @@ struct PepperTabBar: View {
     /// The group's tabs, read again whenever something a tab shows changes,
     /// while this bar's window is the selected tab's.
     final class Model: ObservableObject {
-        struct Tab: Identifiable {
+        struct Tab: Identifiable, Equatable {
             let id: ObjectIdentifier
             weak var window: NSWindow?
             let title: String
-            /// The window's title, whole, for the tooltip.
+            /// The tab's title, whole, for the tooltip.
             let fullTitle: String
             let isSelected: Bool
             let isLast: Bool
@@ -324,18 +350,30 @@ struct PepperTabBar: View {
             let progress: Ghostty.Action.ProgressReport?
             let tabColor: TerminalTabColor
 
-            /// What a dragged tab carries: its window's number, looked for
-            /// only among this group's windows when it's dropped.
-            var dragPayload: String { "\(Model.dragPrefix)\(window?.windowNumber ?? 0)" }
+            static func == (a: Tab, b: Tab) -> Bool {
+                a.id == b.id && a.title == b.title && a.fullTitle == b.fullTitle
+                    && a.isSelected == b.isSelected && a.isLast == b.isLast
+                    && a.video == b.video && a.bell == b.bell && a.tabColor == b.tabColor
+                    && a.progress?.state == b.progress?.state
+                    && a.progress?.progress == b.progress?.progress
+            }
         }
 
-        fileprivate static let dragPrefix = "pepper-tab:"
+        struct Dragging {
+            let id: ObjectIdentifier
+            var offset: CGFloat
+        }
+
+        /// The bar's coordinate space, where tabs are found under a drag.
+        static let space = "PepperTabBar"
 
         @Published private(set) var tabs: [Tab] = []
         /// The terminal's background, which the selected tab is.
         @Published private(set) var background: NSColor = .windowBackgroundColor
-
-        var selectedIndex: Int { tabs.firstIndex { $0.isSelected } ?? 0 }
+        /// The tab being dragged, and how far.
+        @Published private(set) var dragging: Dragging?
+        /// Where each tab drawn is, in the bar: where a dragged one lands.
+        var frames: [ObjectIdentifier: CGRect] = [:]
 
         var barColor: NSColor {
             let shaded = background.withAlphaComponent(1).blended(withFraction: 0.3, of: .black)
@@ -356,19 +394,26 @@ struct PepperTabBar: View {
         init(controller: TerminalController) {
             self.controller = controller
             let center = NotificationCenter.default
-            // This window shown again (its tab selected), or its colors
-            // changed; video in any window's terminals.
-            let names: [(Notification.Name, NSWindow?)] = [
-                (NSWindow.didBecomeMainNotification, controller.window),
-                (PepperTabs.appearanceDidChange, controller.window),
+            let window = controller.window
+            // This window shown again (its tab selected, made main or not):
+            // at once, so it never shows an old bar.
+            for name in [NSWindow.didBecomeMainNotification, NSWindow.didChangeOcclusionStateNotification] {
+                notices.append(center.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                    self?.update()
+                })
+            }
+            // Its colors changed; video in any window's terminals.
+            let later: [(Notification.Name, NSWindow?)] = [
+                (PepperTabs.appearanceDidChange, window),
                 (PepperServer.videoDidChange, nil),
             ]
-            for (name, object) in names {
+            for (name, object) in later {
                 notices.append(center.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
                     self?.queueUpdate()
                 })
             }
-            queueUpdate()
+            // Filled now, so a new tab's bar never shows empty.
+            update()
         }
 
         deinit {
@@ -381,6 +426,7 @@ struct PepperTabBar: View {
             guard let window = tab.window else { return }
             window.tabGroup?.selectedWindow = window
             window.makeKeyAndOrderFront(nil)
+            refocus(window)
         }
 
         func newTab() {
@@ -395,6 +441,7 @@ struct PepperTabBar: View {
                 onScreen(tab) { $0.closeTab(nil) }
             } else {
                 controller.closeTab(nil)
+                refocus()
             }
         }
 
@@ -419,27 +466,47 @@ struct PepperTabBar: View {
             queueUpdate()
         }
 
-        /// Moves the dragged tab to `target`'s place, if it's a tab of this
-        /// group; anything else dropped is refused.
-        func move(_ payload: String, to target: Tab) -> Bool {
-            guard payload.hasPrefix(Self.dragPrefix),
-                  let number = Int(payload.dropFirst(Self.dragPrefix.count)),
+        func drag(_ tab: Tab, by offset: CGFloat) {
+            dragging = Dragging(id: tab.id, offset: offset)
+        }
+
+        /// The dragged tab goes to the place of the tab it's let go over
+        /// (the first or last, past the ends).
+        func drop(_ tab: Tab, at x: CGFloat) {
+            dragging = nil
+            defer { refocus() }
+            let placed = tabs.compactMap { tab in frames[tab.id].map { (tab, $0) } }
+            guard let first = placed.first, let last = placed.last else { return }
+            let target = placed.first { $0.1.minX <= x && x <= $0.1.maxX }?.0
+                ?? (x < first.1.minX ? first.0 : last.0)
+            guard target.id != tab.id,
+                  let moving = tab.window,
                   let targetWindow = target.window,
                   let group = targetWindow.tabGroup,
-                  let moving = group.windows.first(where: { $0.windowNumber == number }),
-                  moving !== targetWindow,
                   let from = group.windows.firstIndex(of: moving),
                   let to = group.windows.firstIndex(of: targetWindow)
-            else { return false }
+            else { return }
             let selected = group.selectedWindow
             // As TerminalController's move_tab does.
             NSAnimationContext.beginGrouping()
             NSAnimationContext.current.duration = 0
             group.removeWindow(moving)
-            targetWindow.addTabbedWindowSafely(moving, ordered: from < to ? .above : .below)
+            if !targetWindow.addTabbedWindowSafely(moving, ordered: from < to ? .above : .below) {
+                // Kept in the group, at its end, rather than left a window
+                // of its own.
+                group.addWindow(moving)
+            }
             (selected ?? moving).makeKeyAndOrderFront(nil)
             NSAnimationContext.endGrouping()
-            return true
+        }
+
+        /// Gives the terminal back the keyboard after a click in the bar: the
+        /// bar and the terminal share a hosting view, which a click can make
+        /// first responder.
+        func refocus(_ window: NSWindow? = nil) {
+            let target = (window ?? controller?.window)?.windowController as? BaseTerminalController
+            guard let surface = target?.focusedSurface else { return }
+            Ghostty.moveFocus(to: surface)
         }
 
         /// Selects the tab, then acts on its controller: its sheets show on
@@ -466,7 +533,7 @@ struct PepperTabBar: View {
 
         private func update() {
             // Only the selected tab's window is on screen: another's bar
-            // stops watching until its window is main again.
+            // stops watching until its window is shown again.
             guard let window = controller?.window,
                   (window.tabGroup?.selectedWindow ?? window) === window
             else {
@@ -475,9 +542,13 @@ struct PepperTabBar: View {
                 return
             }
             let windows = window.tabbedWindows ?? [window]
-            tabs = windows.enumerated().map { index, tabWindow in
+            let bells = controller?.ghostty.config.bellFeatures.contains(.title) ?? true
+            let tabs = windows.enumerated().map { index, tabWindow in
                 let tabController = tabWindow.windowController as? BaseTerminalController
-                let title = Self.withoutBell(tabWindow.title)
+                // The title without the bell Ghostty puts before it: the
+                // tab shows its own.
+                let title = tabController.map { $0.titleOverride ?? $0.focusedSurface?.title ?? tabWindow.title }
+                    ?? tabWindow.title
                 return Tab(
                     id: ObjectIdentifier(tabWindow),
                     window: tabWindow,
@@ -486,12 +557,14 @@ struct PepperTabBar: View {
                     isSelected: tabWindow === window,
                     isLast: index == windows.count - 1,
                     video: tabController?.surfaceTree.contains { PepperServer.shared.showsVideo(in: $0) } ?? false,
-                    bell: tabController?.bell ?? false,
+                    bell: bells && (tabController?.bell ?? false),
                     progress: tabController?.surfaceTree.lazy.compactMap(\.progressReport).first { $0.state != .remove },
                     tabColor: (tabWindow as? TerminalWindow)?.tabColor ?? .none
                 )
             }
-            background = terminalColor((window as? TerminalWindow)?.preferredBackgroundColor ?? .windowBackgroundColor)
+            if tabs != self.tabs { self.tabs = tabs }
+            let background = terminalColor((window as? TerminalWindow)?.preferredBackgroundColor ?? .windowBackgroundColor)
+            if background != self.background { self.background = background }
             let ids = windows.map { ObjectIdentifier($0) }
             if ids != watched {
                 watch(window, windows)
@@ -538,6 +611,8 @@ struct PepperTabBar: View {
             )
         }
 
+        /// A config value by name, as Ghostty.Config reads its enums; it has
+        /// no getter for this one.
         private static func configString(_ config: ghostty_config_t?, _ key: String) -> String? {
             guard let config else { return nil }
             var v: UnsafePointer<Int8>?
@@ -546,15 +621,11 @@ struct PepperTabBar: View {
             return String(cString: v)
         }
 
-        /// Ghostty puts a bell before the title (`bell-features = title`);
-        /// the tab shows its own.
-        private static func withoutBell(_ title: String) -> String {
-            title.hasPrefix("🔔 ") ? String(title.dropFirst(2)) : title
-        }
-
-        /// A title that's a path (Ghostty's fallback when the shell sets
-        /// none, or zsh integration's at a prompt) shows its last folder, as
-        /// a prompt does: `~` for home.
+        /// A title that's a folder (Ghostty's fallback when the shell sets
+        /// none, or zsh integration's at a prompt) shows its last part, as a
+        /// prompt does: `~` for home. A command typed with its program's
+        /// path (zsh integration's title while it runs) shows the program's
+        /// name, then the rest: `/bin/rm -rf x` is `rm -rf x`.
         private static func shortTitle(_ title: String) -> String {
             guard !title.isEmpty else { return "Terminal" }
             let home = NSHomeDirectory()
@@ -564,8 +635,21 @@ struct PepperTabBar: View {
             }
             // "…/Personal/tuitube" is zsh integration's title for a deep folder.
             guard path.hasPrefix("/") || path.hasPrefix("~") || path.hasPrefix("…/") else { return title }
+            if path.contains(" "), !path.hasPrefix("…/"), !isFolder(path, home) {
+                let words = path.split(separator: " ", maxSplits: 1)
+                let program = (String(words[0]) as NSString).lastPathComponent
+                return words.count > 1 ? "\(program) \(words[1])" : program
+            }
             while path.count > 1, path.hasSuffix("/") { path.removeLast() }
             return path == "~" ? path : (path as NSString).lastPathComponent
+        }
+
+        /// Whether `path` (`~` for home) is a folder: only asked of a title
+        /// with a space, a folder's or a command's.
+        private static func isFolder(_ path: String, _ home: String) -> Bool {
+            let full = path.hasPrefix("~") ? home + path.dropFirst() : path
+            var folder: ObjCBool = false
+            return FileManager.default.fileExists(atPath: full, isDirectory: &folder) && folder.boolValue
         }
     }
 }

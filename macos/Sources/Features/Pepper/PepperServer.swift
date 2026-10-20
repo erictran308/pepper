@@ -184,15 +184,19 @@ final class PepperServer {
     /// The processes that have streams, each watched, so that its streams end
     /// when it exits or runs another program.
     private var owners: [Sender: DispatchSourceProcess] = [:]
-    /// The tokens whose box shows its stream, as `videoDidChange` last told.
-    private var videoTokens: Set<String> = []
+    /// The view of each box that shows its stream, by token, as
+    /// `videoDidChange` last told.
+    private var videoBoxes: [String: ObjectIdentifier] = [:]
 
-    /// Posted when the boxes that show a stream change: their tabs show it.
+    /// Posted when the boxes that show a stream change, or their views: their
+    /// tabs show it.
     static let videoDidChange = Notification.Name("PepperVideoDidChange")
 
     /// Whether a stream shows in `view`.
     func showsVideo(in view: Ghostty.SurfaceView) -> Bool {
-        videoTokens.contains { placements[$0]?.view === view }
+        videoBoxes.contains { token, id in
+            id == ObjectIdentifier(view) && placements[token]?.view === view
+        }
     }
 
     /// Whether the token's box shows its stream: a frame in it, or the last
@@ -201,19 +205,25 @@ final class PepperServer {
         placement.view != nil && streams[token] != nil && placement.layer.contents != nil
     }
 
-    /// Posts `videoDidChange` if the boxes that show a stream changed. Called
-    /// on the way out of every way in (messages, notices, placing, an
-    /// owner's end, a window's move, a kept frame's end), so after every
-    /// frame: it compares without allocating, and lists them again only
-    /// when they changed.
+    /// Posts `videoDidChange` if the boxes that show a stream changed, or
+    /// the views they're in. Called on the way out of every way in
+    /// (messages, notices, placing, an owner's end, a window's move, a kept
+    /// frame's end), so after every frame: it compares without allocating,
+    /// and lists them again only when they changed.
     private func noteVideo() {
         var showing = 0
         for (token, placement) in placements where showsVideo(token, placement) {
-            guard videoTokens.contains(token) else { showing = -1; break }
+            guard let view = placement.view, videoBoxes[token] == ObjectIdentifier(view) else {
+                showing = -1
+                break
+            }
             showing += 1
         }
-        guard showing != videoTokens.count else { return }
-        videoTokens = Set(placements.filter { showsVideo($0.key, $0.value) }.keys)
+        guard showing != videoBoxes.count else { return }
+        videoBoxes = [:]
+        for (token, placement) in placements where showsVideo(token, placement) {
+            if let view = placement.view { videoBoxes[token] = ObjectIdentifier(view) }
+        }
         NotificationCenter.default.post(name: Self.videoDidChange, object: self)
     }
 

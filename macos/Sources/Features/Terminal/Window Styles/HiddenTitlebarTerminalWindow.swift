@@ -88,8 +88,12 @@ class HiddenTitlebarTerminalWindow: TerminalWindow {
 
     // MARK: NSWindow
 
-    // pepper: macOS's tab bar takes no room under Pepper's.
+    // pepper: macOS's tab bar takes no room under Pepper's. And no titlebar
+    // shows, so neither do its accessories: Ghostty's reset-zoom one (on the
+    // right) is left out, which must not sit beside a tab bar (see
+    // TerminalWindow.tabBarDidAppear).
     override func addTitlebarAccessoryViewController(_ childViewController: NSTitlebarAccessoryViewController) {
+        if childViewController.layoutAttribute == .right && !isTabBar(childViewController) { return }
         super.addTitlebarAccessoryViewController(childViewController)
         if isTabBar(childViewController) { childViewController.isHidden = true }
     }
