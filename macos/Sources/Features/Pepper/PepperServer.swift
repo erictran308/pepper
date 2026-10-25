@@ -438,6 +438,8 @@ final class PepperServer {
         layer.sublayers = nil
         let box = CGRect(origin: .zero, size: cut.size)
         guard cut.pieces != [box] else { return nil }
+        // Its pieces show the frames now.
+        layer.contents = nil
         let scale = cut.scale
         return cut.pieces.map { piece in
             // In points from the box's bottom left, as the layer has them.
@@ -592,7 +594,6 @@ final class PepperServer {
     /// a transaction.
     private func showFrame(of placement: Placement) {
         if let pictures = placement.pictures {
-            placement.layer.contents = nil
             for picture in pictures { picture.contents = placement.shown }
         } else {
             placement.layer.contents = placement.shown

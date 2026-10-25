@@ -774,6 +774,12 @@ pub const PepperPlace = struct {
         len: u8 = 0,
 
         const holes_max = terminal.osc.Command.PepperPlace.holes_max;
+
+        comptime {
+            // ghostty.h's `list[4]`: Swift reads `len` past exactly 4.
+            assert(holes_max == 4);
+            assert(@sizeOf(Holes) == 34);
+        }
     };
 
     // Sync with: ghostty_action_pepper_place_s
