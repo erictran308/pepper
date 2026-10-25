@@ -216,12 +216,20 @@ func owner(_ arguments: [String]) -> Never {
     let lock = NSLock()
     var portGone = false
     Thread.detachNewThread {
-        while let line = readLine(), line == "die-port" {
-            lock.lock()
-            portGone = true
-            mach_port_mod_refs(mach_task_self_, port, MACH_PORT_RIGHT_RECEIVE, -1)
-            lock.unlock()
-            say("port-gone")
+        while let line = readLine() {
+            if line == "die-port" {
+                lock.lock()
+                portGone = true
+                mach_port_mod_refs(mach_task_self_, port, MACH_PORT_RIGHT_RECEIVE, -1)
+                lock.unlock()
+                say("port-gone")
+            } else if line.hasPrefix("attach "), let surface = surfacePort(bytesPerElement: bytesPerElement) {
+                // Again, as when its box's size changes; presenting nothing.
+                let token = String(line.dropFirst("attach ".count))
+                say("sent again \(token) \(attach(token, to: server, reply: reply.0, replyBits: reply.1, surface: surface))")
+            } else {
+                break
+            }
         }
         exit(0)
     }
@@ -479,7 +487,40 @@ func holeChecks() {
         "without holes, the box shows the frame itself again",
         onMain { box?.sublayers == nil && box?.contents != nil && boxLayer(in: view) === box }
     )
+    // The same place again keeps its layers; a place while the stream
+    // attaches again (within the kept frame's 2 seconds) keeps that frame.
+    let corner = [CGRect(x: 60, y: 30, width: 80, height: 40)]
+    place("h1", in: view, holes: corner)
+    let first = onMain { box?.sublayers ?? [] }
+    place("h1", in: view, holes: corner)
+    check(
+        "the same holes again keep their layers",
+        first.count == 2 && onMain { (box?.sublayers ?? []).elementsEqual(first, by: ===) }
+    )
+    holed.tell("attach h1")
+    holed.await("sent again h1")
+    pause(0.3)
+    place("h1", in: view, holes: [CGRect(x: 0, y: 0, width: 10, height: 10)])
+    check("a place while its stream attaches again keeps the last frame", onMain {
+        let pictures = (box?.sublayers ?? []).compactMap { $0.sublayers?.first }
+        return pictures.count == 2 && pictures.allSatisfy { $0.contents != nil }
+    })
     holed.end()
+
+    // The core's action: its holes stop at its list's end.
+    let boxes = (0..<4).map { ghostty_action_pepper_box_s(x: UInt16($0), y: 1, width: 2, height: 3) }
+    func holes(_ len: UInt8) -> [CGRect] {
+        let list = ghostty_action_pepper_holes_s(list: (boxes[0], boxes[1], boxes[2], boxes[3]), len: len)
+        return withUnsafePointer(to: list) {
+            PepperServer.holes(of: ghostty_action_pepper_place_s(token: nil, x: 0, y: 0, width: 1, height: 1, holes: $0))
+        }
+    }
+    check("an action's holes are read", holes(2) == [CGRect(x: 0, y: 1, width: 2, height: 3), CGRect(x: 1, y: 1, width: 2, height: 3)])
+    check("an action's holes stop at its list's end", holes(9).count == 4 && holes(9).last == CGRect(x: 3, y: 1, width: 2, height: 3))
+    check(
+        "an action without a list has no holes",
+        PepperServer.holes(of: ghostty_action_pepper_place_s(token: nil, x: 0, y: 0, width: 1, height: 1, holes: nil)).isEmpty
+    )
 }
 
 func pause(_ seconds: TimeInterval) {
