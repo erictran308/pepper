@@ -816,7 +816,8 @@ pub const PepperPlace = struct {
 
     /// Boxes in pixels from the surface's top left too, where the stream
     /// doesn't show, so what the terminal draws there does (a popup).
-    /// Behind a pointer, which keeps `CValue` its size.
+    /// Behind a pointer, which keeps `CValue` its size; like `token`, it's
+    /// valid only while the action is handled.
     holes: *const Holes,
 
     // Sync with: ghostty_action_pepper_box_s
