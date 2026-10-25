@@ -14,4 +14,4 @@ trap 'rm -rf "$build"' EXIT
     "$here/main.swift" "$here/Stubs.swift" \
     "$here/../Sources/Features/Pepper/PepperServer.swift" \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$here/Info.plist"
-env -u PEPPER_PORT -u PEPPER_PLAY "$build/check"
+env -u PEPPER_PORT -u PEPPER_PLAY -u PEPPER_FEATURES "$build/check"

@@ -1842,8 +1842,13 @@ pub const StreamHandler = struct {
     }
 
     fn pepperPlace(self: *StreamHandler, value: terminal.StreamAction.PepperPlace) void {
-        // The parser checked the holes, so none are lost here.
-        const holes = terminal.osc.Command.PepperPlace.readHoles(value.holes) orelse .{};
+        // The parser checked the holes. Any other way here that doesn't is
+        // refused as the parser refuses them: shown without its holes, the
+        // video would cover what they were for.
+        const holes = terminal.osc.Command.PepperPlace.readHoles(value.holes) orelse {
+            log.warn("pepper place with holes that don't read, not placed", .{});
+            return;
+        };
         self.surfaceMessageWriter(.{ .pepper_place = .{
             .token = pepperToken(value.token),
             .col = value.col,

@@ -2,6 +2,10 @@ import AppKit
 import IOSurface
 import OSLog
 import QuartzCore
+#if canImport(GhosttyKit)
+// The core's action; PepperServerCheck, built without it, has stand-ins.
+import GhosttyKit
+#endif
 
 /// pepper: shows video frames that another process hands over as IOSurfaces,
 /// in a layer over a box of a terminal surface, so macOS composites them with
@@ -167,8 +171,19 @@ final class PepperServer {
         /// shows, clipped to its piece (none when the holes cover it all);
         /// nil without.
         var pictures: [CALayer]?
+        /// What the layers were last cut for, so the same place again
+        /// keeps them.
+        var cut: Cut?
         /// The frame its layers show, or keep showing.
         var shown: IOSurface?
+    }
+
+    /// The pieces of a box that show, from its top left in pixels, at its
+    /// size and scale.
+    private struct Cut: Equatable {
+        var size: CGSize
+        var pieces: [CGRect]
+        var scale: CGFloat
     }
 
     private struct BoxSize: Equatable {
@@ -214,7 +229,8 @@ final class PepperServer {
     }
 
     /// Whether the token's box shows its stream: a frame in it, or the last
-    /// one, kept while the stream attaches again at a new size.
+    /// one, kept while the stream attaches again at a new size. A box its
+    /// holes cover all of still does: its video plays on under them.
     private func showsVideo(_ token: String, _ placement: Placement) -> Bool {
         placement.view != nil && streams[token] != nil && placement.shown != nil
     }
@@ -353,10 +369,20 @@ final class PepperServer {
         }
         guard var current = placement else { return }
         current.pixels = pixels.size
-        current.shown = currentSurface(token)
+        // The frame showing; while the stream attaches again, the one kept.
+        if let surface = currentSurface(token) {
+            current.shown = surface
+        } else if streams[token] == nil {
+            current.shown = nil
+        }
         let layer = current.layer
 
         let scale = host.contentsScale
+        let cut = Cut(
+            size: pixels.size,
+            pieces: Self.pieces(of: pixels.size, holes: holes.map { $0.offsetBy(dx: -pixels.minX, dy: -pixels.minY) }),
+            scale: scale
+        )
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         let box = container(in: host)
@@ -367,24 +393,52 @@ final class PepperServer {
             height: pixels.height / scale
         )
         if layer.superlayer !== box { box.addSublayer(layer) }
-        current.pictures = cut(layer, pixels: pixels, holes: holes, scale: scale)
+        if cut != current.cut {
+            current.pictures = makePictures(in: layer, for: cut)
+            current.cut = cut
+        }
         placements[token] = current
         showFrame(of: current)
         CATransaction.commit()
         report(token)
     }
 
-    /// Cuts `holes` out of the box `layer` shows at `pixels` (both from the
-    /// surface's top left). Returns nil when none is in the box, which then
-    /// shows its frames itself; otherwise the pictures of the whole box it
-    /// now holds, one in each piece that shows, clipped to its piece. Call
-    /// it inside a transaction.
-    private func cut(_ layer: CALayer, pixels: CGRect, holes: [CGRect], scale: CGFloat) -> [CALayer]? {
+    /// `place`, for the core's action.
+    func place(_ action: ghostty_action_pepper_place_s, in view: Ghostty.SurfaceView) {
+        guard let token = action.token else { return }
+        place(
+            token: String(cString: token),
+            pixels: CGRect(
+                x: CGFloat(action.x),
+                y: CGFloat(action.y),
+                width: CGFloat(action.width),
+                height: CGFloat(action.height)
+            ),
+            holes: Self.holes(of: action),
+            in: view
+        )
+    }
+
+    /// The action's holes: at most its list's length, whatever `len` says.
+    static func holes(of action: ghostty_action_pepper_place_s) -> [CGRect] {
+        guard let list = action.holes?.pointee else { return [] }
+        return withUnsafeBytes(of: list.list) { raw in
+            raw.assumingMemoryBound(to: ghostty_action_pepper_box_s.self)
+                .prefix(Int(list.len))
+                .map { CGRect(x: CGFloat($0.x), y: CGFloat($0.y), width: CGFloat($0.width), height: CGFloat($0.height)) }
+        }
+    }
+
+    /// Lays out the box `layer` for `cut`. Returns nil when no hole is in
+    /// the box, which then shows its frames itself; otherwise the pictures
+    /// of the whole box it now holds, one in each piece that shows, clipped
+    /// to its piece. Call it inside a transaction.
+    private func makePictures(in layer: CALayer, for cut: Cut) -> [CALayer]? {
         layer.sublayers = nil
-        let box = CGRect(origin: .zero, size: pixels.size)
-        let pieces = Self.pieces(of: box.size, holes: holes.map { $0.offsetBy(dx: -pixels.minX, dy: -pixels.minY) })
-        guard pieces != [box] else { return nil }
-        return pieces.map { piece in
+        let box = CGRect(origin: .zero, size: cut.size)
+        guard cut.pieces != [box] else { return nil }
+        let scale = cut.scale
+        return cut.pieces.map { piece in
             // In points from the box's bottom left, as the layer has them.
             let clip = CALayer()
             clip.masksToBounds = true
