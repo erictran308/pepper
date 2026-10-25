@@ -516,6 +516,8 @@ final class PepperServer {
                 width: (placement.layer.frame.width * scale).rounded(),
                 height: (placement.layer.frame.height * scale).rounded()
             )
+            // Cut for the old scale: the next place cuts it again.
+            placement.cut = nil
             placements[token] = placement
             report(token)
         }
