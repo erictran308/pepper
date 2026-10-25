@@ -10,7 +10,9 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 build=$(mktemp -d "${TMPDIR:-/tmp}/pepper-server-check.XXXXXX")
 trap 'rm -rf "$build"' EXIT
+# ghostty.h, the app's own, gives PepperServer.swift the core's action.
 /usr/bin/xcrun swiftc -O -o "$build/check" \
+    -import-objc-header "$here/../../include/ghostty.h" \
     "$here/main.swift" "$here/Stubs.swift" \
     "$here/../Sources/Features/Pepper/PepperServer.swift" \
     -Xlinker -sectcreate -Xlinker __TEXT -Xlinker __info_plist -Xlinker "$here/Info.plist"

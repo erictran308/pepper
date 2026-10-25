@@ -3,7 +3,7 @@ import IOSurface
 import OSLog
 import QuartzCore
 #if canImport(GhosttyKit)
-// The core's action; PepperServerCheck, built without it, has stand-ins.
+// The core's action. PepperServerCheck has it from ghostty.h itself.
 import GhosttyKit
 #endif
 
@@ -18,8 +18,9 @@ import GhosttyKit
 ///   Each view (tab or split) holds at most `maxPlacementsPerView` boxes, so
 ///   no tab's output can use up another's, and a box never shows outside its
 ///   view. A place can end in up to 4 holes, `;COL,ROW,COLS,ROWS` each: cells
-///   of the box where frames don't show, so what the terminal draws there
-///   does (a popup over the video).
+///   (from the top left of the screen, as the box) where frames don't show,
+///   so what the terminal draws there does (a popup over the video). The
+///   core gives them to `place` in pixels too.
 /// - Streaming: a process sends IOSurfaces over the Mach port named in
 ///   `PEPPER_PORT`, with the same token. Frames show only where that token
 ///   has been placed.

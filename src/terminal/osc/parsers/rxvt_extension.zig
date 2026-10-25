@@ -48,8 +48,10 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
 /// pepper: `777;pepper;place;TOKEN;COL;ROW;COLS;ROWS` puts the video stream
 /// with that token over those cells, and `777;pepper;remove;TOKEN` takes it
 /// away. A place can end in up to 4 holes, `;COL,ROW,COLS,ROWS` each: cells
-/// where the stream doesn't show, so a popup drawn there does. `data` is
-/// what follows `pepper;`, ending in the 0 written above.
+/// (from the top left of the screen, as the box) where the stream doesn't
+/// show, so a popup drawn there does. A place whose holes don't read takes
+/// the box away: shown whole, the video would cover what they were for.
+/// `data` is what follows `pepper;`, ending in the 0 written above.
 fn parsePepper(parser: *Parser, data: []u8) ?*Command {
     const rest = data[0 .. data.len - 1];
     const op_end = std.mem.indexOfScalar(u8, rest, ';') orelse
@@ -75,12 +77,15 @@ fn parsePepper(parser: *Parser, data: []u8) ?*Command {
             const s = it.next() orelse return invalidPepper(parser, "missing cells");
             v.* = Command.PepperPlace.cellCount(s) orelse return invalidPepper(parser, "bad cell");
         }
+        if (cells[2] == 0 or cells[3] == 0) return invalidPepper(parser, "empty box");
         if (it.index != null) {
             holes = it.rest();
-            if (holes.len == 0 or Command.PepperPlace.readHoles(holes) == null)
-                return invalidPepper(parser, "bad holes");
+            if (holes.len == 0 or Command.PepperPlace.readHoles(holes) == null) {
+                log.warn("invalid pepper extension: bad holes, so the box is taken away", .{});
+                holes = "";
+                cells = @splat(0);
+            }
         }
-        if (cells[2] == 0 or cells[3] == 0) return invalidPepper(parser, "empty box");
     } else if (std.mem.eql(u8, op, "remove")) {
         if (token_end != rest.len) return invalidPepper(parser, "too many fields");
     } else {
@@ -193,6 +198,37 @@ test "OSC: OSC 777 pepper remove" {
     try testing.expectEqual(0, cmd.pepper_place.rows);
 }
 
+test "OSC: OSC 777 pepper place with bad holes takes the box away" {
+    const testing = std.testing;
+
+    const inputs = [_][]const u8{
+        "777;pepper;place;tok;1;2;3;4;",
+        "777;pepper;place;tok;1;2;3;4;5",
+        "777;pepper;place;tok;1;2;3;4;5,6,7",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,8,9",
+        "777;pepper;place;tok;1;2;3;4;5,6,0,8",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,0",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,8;",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,8;;5,6,7,8",
+        "777;pepper;place;tok;1;2;3;4;5,,7,8",
+        "777;pepper;place;tok;1;2;3;4; 5,6,7,8",
+        "777;pepper;place;tok;1;2;3;4;+5,6,7,8",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,70000",
+        "777;pepper;place;tok;1;2;3;4;5;6;7;8",
+        "777;pepper;place;tok;1;2;3;4;1,1,1,1;1,1,1,1;1,1,1,1;1,1,1,1;1,1,1,1",
+    };
+    for (inputs) |input| {
+        var p: Parser = .init(null);
+        for (input) |ch| p.next(ch);
+        const cmd = p.end('\x1b').?.*;
+        try testing.expect(cmd == .pepper_place);
+        try testing.expectEqualStrings("tok", cmd.pepper_place.token);
+        try testing.expectEqual(0, cmd.pepper_place.cols);
+        try testing.expectEqual(0, cmd.pepper_place.rows);
+        try testing.expectEqualStrings("", cmd.pepper_place.holes);
+    }
+}
+
 test "OSC: OSC 777 pepper invalid" {
     const testing = std.testing;
 
@@ -201,7 +237,6 @@ test "OSC: OSC 777 pepper invalid" {
         "777;pepper;place",
         "777;pepper;place;tok",
         "777;pepper;place;tok;1;2;3",
-        "777;pepper;place;tok;1;2;3;4;5",
         "777;pepper;place;tok;1;2;0;4",
         "777;pepper;place;tok;1;2;3;70000",
         "777;pepper;place;tok;+1;2;3;4",
@@ -216,19 +251,6 @@ test "OSC: OSC 777 pepper invalid" {
         "777;pepper;remove;tok;1",
         "777;pepper;move;tok",
         "777;pepper;remove;" ++ "x" ** 65,
-        "777;pepper;place;tok;1;2;3;4;",
-        "777;pepper;place;tok;1;2;3;4;5,6,7",
-        "777;pepper;place;tok;1;2;3;4;5,6,7,8,9",
-        "777;pepper;place;tok;1;2;3;4;5,6,0,8",
-        "777;pepper;place;tok;1;2;3;4;5,6,7,0",
-        "777;pepper;place;tok;1;2;3;4;5,6,7,8;",
-        "777;pepper;place;tok;1;2;3;4;5,6,7,8;;5,6,7,8",
-        "777;pepper;place;tok;1;2;3;4;5,,7,8",
-        "777;pepper;place;tok;1;2;3;4; 5,6,7,8",
-        "777;pepper;place;tok;1;2;3;4;+5,6,7,8",
-        "777;pepper;place;tok;1;2;3;4;5,6,7,70000",
-        "777;pepper;place;tok;1;2;3;4;5;6;7;8",
-        "777;pepper;place;tok;1;2;3;4;1,1,1,1;1,1,1,1;1,1,1,1;1,1,1,1;1,1,1,1",
         "777;pepper;place;tok;1;2;0;4;5,6,7,8",
     };
     for (inputs) |input| {
