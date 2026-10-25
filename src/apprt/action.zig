@@ -814,6 +814,27 @@ pub const PepperPlace = struct {
     width: u16,
     height: u16,
 
+    /// Boxes in pixels from the surface's top left too, where the stream
+    /// doesn't show, so what the terminal draws there does (a popup).
+    /// Behind a pointer, which keeps `CValue` its size.
+    holes: *const Holes,
+
+    // Sync with: ghostty_action_pepper_box_s
+    pub const Box = extern struct {
+        x: u16 = 0,
+        y: u16 = 0,
+        width: u16 = 0,
+        height: u16 = 0,
+    };
+
+    // Sync with: ghostty_action_pepper_holes_s
+    pub const Holes = extern struct {
+        list: [holes_max]Box = [_]Box{.{}} ** holes_max,
+        len: u8 = 0,
+
+        const holes_max = terminal.osc.Command.PepperPlace.holes_max;
+    };
+
     // Sync with: ghostty_action_pepper_place_s
     pub const C = extern struct {
         token: [*:0]const u8,
@@ -821,6 +842,7 @@ pub const PepperPlace = struct {
         y: u16,
         width: u16,
         height: u16,
+        holes: *const Holes,
     };
 
     pub fn cval(self: PepperPlace) C {
@@ -830,6 +852,7 @@ pub const PepperPlace = struct {
             .y = self.y,
             .width = self.width,
             .height = self.height,
+            .holes = self.holes,
         };
     }
 };

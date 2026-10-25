@@ -234,6 +234,9 @@ pub const Command = union(Key) {
         /// The longest token accepted.
         pub const token_max = 64;
 
+        /// The most holes a box takes.
+        pub const holes_max = 4;
+
         /// Ties the box to the stream whose Mach messages carry the same
         /// token (macos/Sources/Features/Pepper/PepperServer.swift).
         token: [:0]const u8,
@@ -244,6 +247,56 @@ pub const Command = union(Key) {
         row: u16 = 0,
         cols: u16 = 0,
         rows: u16 = 0,
+
+        /// Boxes of cells, from the top left of the screen too, where the
+        /// stream doesn't show, so what the terminal draws there does (a
+        /// popup over the video). The text the parser checked,
+        /// `COL,ROW,COLS,ROWS` each with `;` between, which keeps
+        /// `Command` small: `readHoles` reads it.
+        holes: []const u8 = "",
+
+        pub const Cells = struct {
+            col: u16 = 0,
+            row: u16 = 0,
+            cols: u16 = 0,
+            rows: u16 = 0,
+        };
+
+        pub const Holes = struct {
+            list: [holes_max]Cells = [_]Cells{.{}} ** holes_max,
+            len: u8 = 0,
+
+            pub fn slice(self: *const Holes) []const Cells {
+                return self.list[0..self.len];
+            }
+        };
+
+        /// Reads holes written as `holes` holds them, or returns null for
+        /// anything else: too many, a number that isn't one, an empty hole.
+        pub fn readHoles(text: []const u8) ?Holes {
+            var out: Holes = .{};
+            if (text.len == 0) return out;
+            var it = std.mem.splitScalar(u8, text, ';');
+            while (it.next()) |hole| {
+                if (out.len == holes_max) return null;
+                var fields = std.mem.splitScalar(u8, hole, ',');
+                var v: [4]u16 = undefined;
+                for (&v) |*n| n.* = cellCount(fields.next() orelse return null) orelse return null;
+                if (fields.next() != null) return null;
+                if (v[2] == 0 or v[3] == 0) return null;
+                out.list[out.len] = .{ .col = v[0], .row = v[1], .cols = v[2], .rows = v[3] };
+                out.len += 1;
+            }
+            return out;
+        }
+
+        /// A number of cells, digits only: parseInt alone also takes "+5",
+        /// "-0" and "1_0".
+        pub fn cellCount(s: []const u8) ?u16 {
+            if (s.len == 0 or s.len > 5) return null;
+            for (s) |c| if (!std.ascii.isDigit(c)) return null;
+            return std.fmt.parseInt(u16, s, 10) catch null;
+        }
     };
 
     /// An OSC sequence whose number this parser does not implement. For

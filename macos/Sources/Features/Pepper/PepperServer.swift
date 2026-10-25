@@ -13,7 +13,9 @@ import QuartzCore
 ///   `place`, so only a program that can write to that tab places video there.
 ///   Each view (tab or split) holds at most `maxPlacementsPerView` boxes, so
 ///   no tab's output can use up another's, and a box never shows outside its
-///   view.
+///   view. A place can end in up to 4 holes, `;COL,ROW,COLS,ROWS` each: cells
+///   of the box where frames don't show, so what the terminal draws there
+///   does (a popup over the video).
 /// - Streaming: a process sends IOSurfaces over the Mach port named in
 ///   `PEPPER_PORT`, with the same token. Frames show only where that token
 ///   has been placed.
@@ -48,8 +50,10 @@ import QuartzCore
 /// The kernel's notices that a client died come on a port of their own, which
 /// no other process can send to.
 ///
-/// Every shell gets the port's name as `PEPPER_PORT`, and pepper-play's path
-/// (the player in `Contents/Helpers`) as `PEPPER_PLAY`.
+/// Every shell gets the port's name as `PEPPER_PORT`, pepper-play's path
+/// (the player in `Contents/Helpers`) as `PEPPER_PLAY`, and what this Pepper
+/// takes beyond the first `OSC 777;pepper` as `PEPPER_FEATURES` (comma
+/// separated; `holes`), so a program knows before it sends them.
 final class PepperServer {
     static let shared = PepperServer()
 
@@ -112,6 +116,8 @@ final class PepperServer {
     private static let queueLimit: mach_port_msgcount_t = 256
     /// The layer each view's boxes go in.
     private static let containerName = "pepper"
+    /// What shells get as `PEPPER_FEATURES`.
+    private static let features = "holes"
 
     /// bootstrap_check_in isn't in any Swift module, so it's looked up.
     private typealias BootstrapCheckIn = @convention(c) (
@@ -150,11 +156,19 @@ final class PepperServer {
     /// Where a token's frames show.
     private struct Placement {
         weak var view: Ghostty.SurfaceView?
+        /// The box. Its frames show in it, or, when it has holes, in
+        /// `pictures`.
         let layer: CALayer
         /// When it was made, to find a view's oldest.
         let order: Int
         /// The box's size in pixels.
         var pixels: CGSize = .zero
+        /// With holes, a picture of the whole box in each piece of it that
+        /// shows, clipped to its piece (none when the holes cover it all);
+        /// nil without.
+        var pictures: [CALayer]?
+        /// The frame its layers show, or keep showing.
+        var shown: IOSurface?
     }
 
     private struct BoxSize: Equatable {
@@ -202,7 +216,7 @@ final class PepperServer {
     /// Whether the token's box shows its stream: a frame in it, or the last
     /// one, kept while the stream attaches again at a new size.
     private func showsVideo(_ token: String, _ placement: Placement) -> Bool {
-        placement.view != nil && streams[token] != nil && placement.layer.contents != nil
+        placement.view != nil && streams[token] != nil && placement.shown != nil
     }
 
     /// Posts `videoDidChange` if the boxes that show a stream changed, or
@@ -235,6 +249,7 @@ final class PepperServer {
         // if checking in fails.
         unsetenv("PEPPER_PORT")
         unsetenv("PEPPER_PLAY")
+        unsetenv("PEPPER_FEATURES")
         guard let checkIn = Self.bootstrapCheckIn else {
             Self.logger.error("bootstrap_check_in not found")
             return
@@ -273,6 +288,7 @@ final class PepperServer {
             Self.logger.warning("the port's queue stays at the default: \(limited)")
         }
         setenv("PEPPER_PORT", name, 1)
+        setenv("PEPPER_FEATURES", Self.features, 1)
         let play = Bundle.main.bundleURL
             .appendingPathComponent("Contents/Helpers/Pepper.app/Contents/MacOS/pepper-play")
         if FileManager.default.isExecutableFile(atPath: play.path) {
@@ -301,9 +317,10 @@ final class PepperServer {
     // MARK: Placing
 
     /// Shows the token's stream over `pixels` (from the surface's top left)
-    /// of `view`, or takes it away when `pixels` is empty. Called on the
-    /// main thread for `OSC 777;pepper`.
-    func place(token: String, pixels: CGRect, in view: Ghostty.SurfaceView) {
+    /// of `view`, but not over `holes` (pixels from the surface's top left
+    /// too), or takes it away when `pixels` is empty. Called on the main
+    /// thread for `OSC 777;pepper`.
+    func place(token: String, pixels: CGRect, holes: [CGRect] = [], in view: Ghostty.SurfaceView) {
         defer { noteVideo() }
         guard !pixels.isEmpty else {
             if let placement = placements.removeValue(forKey: token) {
@@ -336,7 +353,7 @@ final class PepperServer {
         }
         guard var current = placement else { return }
         current.pixels = pixels.size
-        placements[token] = current
+        current.shown = currentSurface(token)
         let layer = current.layer
 
         let scale = host.contentsScale
@@ -350,9 +367,81 @@ final class PepperServer {
             height: pixels.height / scale
         )
         if layer.superlayer !== box { box.addSublayer(layer) }
-        layer.contents = currentSurface(token)
+        current.pictures = cut(layer, pixels: pixels, holes: holes, scale: scale)
+        placements[token] = current
+        showFrame(of: current)
         CATransaction.commit()
         report(token)
+    }
+
+    /// Cuts `holes` out of the box `layer` shows at `pixels` (both from the
+    /// surface's top left). Returns nil when none is in the box, which then
+    /// shows its frames itself; otherwise the pictures of the whole box it
+    /// now holds, one in each piece that shows, clipped to its piece. Call
+    /// it inside a transaction.
+    private func cut(_ layer: CALayer, pixels: CGRect, holes: [CGRect], scale: CGFloat) -> [CALayer]? {
+        layer.sublayers = nil
+        let box = CGRect(origin: .zero, size: pixels.size)
+        let pieces = Self.pieces(of: box.size, holes: holes.map { $0.offsetBy(dx: -pixels.minX, dy: -pixels.minY) })
+        guard pieces != [box] else { return nil }
+        return pieces.map { piece in
+            // In points from the box's bottom left, as the layer has them.
+            let clip = CALayer()
+            clip.masksToBounds = true
+            clip.frame = CGRect(
+                x: piece.minX / scale,
+                y: (box.height - piece.maxY) / scale,
+                width: piece.width / scale,
+                height: piece.height / scale
+            )
+            let picture = CALayer()
+            picture.contentsGravity = .resizeAspect
+            picture.frame = CGRect(
+                x: -clip.frame.minX,
+                y: -clip.frame.minY,
+                width: box.width / scale,
+                height: box.height / scale
+            )
+            clip.addSublayer(picture)
+            layer.addSublayer(clip)
+            return picture
+        }
+    }
+
+    /// The parts of a box of `size` that no hole covers, as rectangles: the
+    /// box is cut into bands at the holes' tops and bottoms, each band where
+    /// holes cross it, and a piece joins the one above when their sides line
+    /// up. Whole pixels in, whole pixels out, so the pieces meet with no
+    /// seam.
+    static func pieces(of size: CGSize, holes: [CGRect]) -> [CGRect] {
+        let box = CGRect(origin: .zero, size: size)
+        let cuts = holes.map { $0.intersection(box) }.filter { !$0.isEmpty }
+        guard !cuts.isEmpty else { return [box] }
+        let edges = Set([0, size.height] + cuts.flatMap { [$0.minY, $0.maxY] }).sorted()
+        var pieces: [CGRect] = []
+        // The pieces that reach the bottom of the band before.
+        var open: [Int] = []
+        for (top, bottom) in zip(edges, edges.dropFirst()) {
+            var spans: [(left: CGFloat, right: CGFloat)] = []
+            var x: CGFloat = 0
+            for cut in cuts.filter({ $0.minY < bottom && $0.maxY > top }).sorted(by: { $0.minX < $1.minX }) {
+                if cut.minX > x { spans.append((x, cut.minX)) }
+                x = max(x, cut.maxX)
+            }
+            if x < size.width { spans.append((x, size.width)) }
+            var reaching: [Int] = []
+            for span in spans {
+                if let i = open.first(where: { pieces[$0].minX == span.left && pieces[$0].maxX == span.right }) {
+                    pieces[i].size.height = bottom - pieces[i].minY
+                    reaching.append(i)
+                } else {
+                    reaching.append(pieces.count)
+                    pieces.append(CGRect(x: span.left, y: top, width: span.right - span.left, height: bottom - top))
+                }
+            }
+            open = reaching
+        }
+        return pieces
     }
 
     /// A window went to another display, or its scale changed: its boxes
@@ -426,20 +515,33 @@ final class PepperServer {
         return stream.surfaces[slot]
     }
 
-    /// Puts the token's current frame (or nothing) in its placement's layer.
+    /// Puts the token's current frame (or nothing) in its placement's layers.
     /// A placement whose view has gone goes instead.
     private func show(_ token: String) {
-        guard let placement = placements[token] else { return }
+        guard var placement = placements[token] else { return }
         guard placement.view != nil else {
             placements.removeValue(forKey: token)
             remove(placement.layer)
             report(token)
             return
         }
+        placement.shown = currentSurface(token)
+        placements[token] = placement
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        placement.layer.contents = currentSurface(token)
+        showFrame(of: placement)
         CATransaction.commit()
+    }
+
+    /// Puts the placement's frame in the layers that show it. Call it inside
+    /// a transaction.
+    private func showFrame(of placement: Placement) {
+        if let pictures = placement.pictures {
+            placement.layer.contents = nil
+            for picture in pictures { picture.contents = placement.shown }
+        } else {
+            placement.layer.contents = placement.shown
+        }
     }
 
     // MARK: Streaming

@@ -2245,6 +2245,19 @@ extension Ghostty {
                   let surface = target.target.surface,
                   let surfaceView = self.surfaceView(from: surface),
                   let token = v.token else { return }
+            // At most the list's length, whatever `len` says.
+            var holes: [CGRect] = []
+            if let list = v.holes?.pointee {
+                holes = withUnsafeBytes(of: list.list) { raw in
+                    raw.bindMemory(to: ghostty_action_pepper_box_s.self)
+                        .prefix(Int(list.len))
+                        .map { CGRect(
+                            x: CGFloat($0.x),
+                            y: CGFloat($0.y),
+                            width: CGFloat($0.width),
+                            height: CGFloat($0.height)) }
+                }
+            }
             PepperServer.shared.place(
                 token: String(cString: token),
                 pixels: CGRect(
@@ -2252,6 +2265,7 @@ extension Ghostty {
                     y: CGFloat(v.y),
                     width: CGFloat(v.width),
                     height: CGFloat(v.height)),
+                holes: holes,
                 in: surfaceView)
         }
 

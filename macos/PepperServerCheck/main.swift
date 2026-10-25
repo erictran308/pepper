@@ -51,6 +51,7 @@ func ownVersion() -> UInt32 {
 }
 
 let msgAttach: Int32 = 0x7070_0001
+let msgPresent: Int32 = 0x7070_0002
 let msgHello: Int32 = 0x7070_0004
 let msgSize: Int32 = 0x7070_0101
 let msgRefused: Int32 = 0x7070_0102
@@ -110,6 +111,15 @@ func attach(_ token: String, to server: mach_port_t, reply: mach_port_t, replyBi
     message.u32(0)
     message.bytes += [0, 0, UInt8(MACH_MSG_TYPE_MOVE_SEND), 0]
     message.token(token)
+    return message.send()
+}
+
+/// Shows the token's surface in `slot`.
+func present(_ token: String, slot: UInt32, to server: mach_port_t) -> kern_return_t {
+    var message = Writer()
+    message.header(bits: UInt32(MACH_MSG_TYPE_COPY_SEND), remote: server, local: 0, id: msgPresent)
+    message.token(token)
+    message.u32(slot)
     return message.send()
 }
 
@@ -173,15 +183,21 @@ func pepper() -> mach_port_t {
 
 // MARK: Clients
 
-/// `owner [--keeper NAME] [--bpe N] TOKEN...`: attaches each token, with its
-/// own port as the client (or the keeper's), then says what the server sends
-/// it, and on stdin takes `die-port` (its port goes, it stays).
+/// `owner [--keeper NAME] [--bpe N] [--present] TOKEN...`: attaches each
+/// token, with its own port as the client (or the keeper's), and presents
+/// its surface if asked, then says what the server sends it, and on stdin
+/// takes `die-port` (its port goes, it stays).
 func owner(_ arguments: [String]) -> Never {
     var arguments = arguments
     var keeper: String?
     var bytesPerElement = 4
+    var presents = false
     while let first = arguments.first, first.hasPrefix("--") {
         arguments.removeFirst()
+        if first == "--present" {
+            presents = true
+            continue
+        }
         let value = arguments.removeFirst()
         if first == "--keeper" { keeper = value } else { bytesPerElement = Int(value)! }
     }
@@ -195,6 +211,7 @@ func owner(_ arguments: [String]) -> Never {
             continue
         }
         say("sent \(token) \(attach(token, to: server, reply: reply.0, replyBits: reply.1, surface: surface))")
+        if presents { say("presented \(token) \(present(token, slot: 0, to: server))") }
     }
     let lock = NSLock()
     var portGone = false
@@ -339,10 +356,130 @@ func makeView() -> Ghostty.SurfaceView {
     return view
 }
 
-func place(_ token: String, in view: Ghostty.SurfaceView, width: CGFloat = 100, height: CGFloat = 50) {
+func place(
+    _ token: String,
+    in view: Ghostty.SurfaceView,
+    width: CGFloat = 100,
+    height: CGFloat = 50,
+    holes: [CGRect] = []
+) {
     onMain {
-        PepperServer.shared.place(token: token, pixels: CGRect(x: 0, y: 0, width: width, height: height), in: view)
+        PepperServer.shared.place(
+            token: token,
+            pixels: CGRect(x: 0, y: 0, width: width, height: height),
+            holes: holes,
+            in: view
+        )
     }
+}
+
+/// The layer of the first box placed in `view`.
+func boxLayer(in view: Ghostty.SurfaceView) -> CALayer? {
+    view.layer?.sublayers?.first { $0.name == "pepper" }?.sublayers?.first
+}
+
+/// Whether `pieces` cover each pixel of a box of `size` that no hole covers
+/// once, and the others never.
+func coversRest(_ pieces: [CGRect], of size: CGSize, holes: [CGRect]) -> Bool {
+    for y in 0..<Int(size.height) {
+        for x in 0..<Int(size.width) {
+            let pixel = CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5)
+            let shows = !holes.contains { $0.contains(pixel) }
+            if pieces.filter({ $0.contains(pixel) }).count != (shows ? 1 : 0) { return false }
+        }
+    }
+    return true
+}
+
+func holeChecks() {
+    check("shells hear that boxes take holes", getenv("PEPPER_FEATURES").map { String(cString: $0) } == "holes")
+    let size = CGSize(width: 100, height: 50)
+    let whole = CGRect(origin: .zero, size: size)
+    check("no hole leaves the box whole", PepperServer.pieces(of: size, holes: []) == [whole])
+    check(
+        "a hole outside the box leaves it whole",
+        PepperServer.pieces(of: size, holes: [CGRect(x: 100, y: 0, width: 10, height: 10)]) == [whole]
+    )
+    check(
+        "a hole over all of it leaves nothing",
+        PepperServer.pieces(of: size, holes: [CGRect(x: -5, y: -5, width: 200, height: 200)]).isEmpty
+    )
+    check(
+        "a hole over a corner leaves two pieces",
+        PepperServer.pieces(of: size, holes: [CGRect(x: 60, y: 30, width: 80, height: 40)]) == [
+            CGRect(x: 0, y: 0, width: 100, height: 30),
+            CGRect(x: 0, y: 30, width: 60, height: 20),
+        ]
+    )
+    check(
+        "a hole in the middle leaves four",
+        PepperServer.pieces(of: size, holes: [CGRect(x: 20, y: 10, width: 30, height: 20)]) == [
+            CGRect(x: 0, y: 0, width: 100, height: 10),
+            CGRect(x: 0, y: 10, width: 20, height: 20),
+            CGRect(x: 50, y: 10, width: 50, height: 20),
+            CGRect(x: 0, y: 30, width: 100, height: 20),
+        ]
+    )
+    check(
+        "a piece beside two holes, one under the other, is one piece",
+        PepperServer.pieces(of: size, holes: [
+            CGRect(x: 50, y: 0, width: 50, height: 20),
+            CGRect(x: 50, y: 20, width: 50, height: 30),
+        ]) == [CGRect(x: 0, y: 0, width: 50, height: 50)]
+    )
+
+    // Random holes, some overlapping and some past the box's sides, on a
+    // small box, pixel by pixel. The same each run.
+    var seed: UInt64 = 0x7065_7070_6572
+    func next(_ bound: Int) -> CGFloat {
+        seed = seed &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+        return CGFloat(Int((seed >> 33) % UInt64(bound)))
+    }
+    let small = CGSize(width: 23, height: 17)
+    var bad: [CGRect]?
+    for _ in 0..<500 where bad == nil {
+        let holes = (0..<(1 + Int(next(4)))).map { _ in
+            CGRect(x: next(30) - 4, y: next(24) - 4, width: 1 + next(15), height: 1 + next(12))
+        }
+        if !coversRest(PepperServer.pieces(of: small, holes: holes), of: small, holes: holes) { bad = holes }
+    }
+    check("random holes leave exactly the rest of the box" + (bad.map { ": wrong for \($0)" } ?? ""), bad == nil)
+
+    // A box with holes shows its frames in the pieces around them, and in
+    // itself again without them. The view's scale is 1: points are pixels.
+    let holed = Child(["owner", "--present", "h1"])
+    holed.await("presented h1")
+    pause(0.3)
+    let view = onMain { makeView() }
+    place("h1", in: view, holes: [CGRect(x: 60, y: 30, width: 80, height: 40)])
+    let (box, clips, pictures) = onMain { () -> (CALayer?, [CALayer], [CALayer]) in
+        let box = boxLayer(in: view)
+        let clips = box?.sublayers ?? []
+        return (box, clips, clips.compactMap { $0.sublayers?.first })
+    }
+    check("a box with holes shows nothing itself", box != nil && onMain { box?.contents == nil })
+    check(
+        "its pieces are clipped, in points from its bottom left",
+        clips.allSatisfy(\.masksToBounds) && clips.map(\.frame) == [
+            CGRect(x: 0, y: 20, width: 100, height: 30),
+            CGRect(x: 0, y: 0, width: 60, height: 20),
+        ]
+    )
+    check(
+        "each piece shows the frame, laid over the whole box",
+        pictures.count == 2 && onMain { pictures.allSatisfy { $0.contents != nil } } && pictures.map(\.frame) == [
+            CGRect(x: 0, y: -20, width: 100, height: 50),
+            CGRect(x: 0, y: 0, width: 100, height: 50),
+        ]
+    )
+    place("h1", in: view, holes: [CGRect(x: 0, y: 0, width: 100, height: 50)])
+    check("a box its holes cover shows nothing", onMain { box?.sublayers == nil && box?.contents == nil })
+    place("h1", in: view)
+    check(
+        "without holes, the box shows the frame itself again",
+        onMain { box?.sublayers == nil && box?.contents != nil && boxLayer(in: view) === box }
+    )
+    holed.end()
 }
 
 func pause(_ seconds: TimeInterval) {
@@ -350,6 +487,8 @@ func pause(_ seconds: TimeInterval) {
 }
 
 func checks() {
+    holeChecks()
+
     let hello = Child(["hello"])
     hello.end()
     check("a hello is answered, by the server's own process", hello.saw("sent 0; answer \(getpid()) \(ownVersion())"))

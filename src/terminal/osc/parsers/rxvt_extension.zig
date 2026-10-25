@@ -47,7 +47,9 @@ pub fn parse(parser: *Parser, _: ?u8) ?*Command {
 
 /// pepper: `777;pepper;place;TOKEN;COL;ROW;COLS;ROWS` puts the video stream
 /// with that token over those cells, and `777;pepper;remove;TOKEN` takes it
-/// away. `data` is what follows `pepper;`, ending in the 0 written above.
+/// away. A place can end in up to 4 holes, `;COL,ROW,COLS,ROWS` each: cells
+/// where the stream doesn't show, so a popup drawn there does. `data` is
+/// what follows `pepper;`, ending in the 0 written above.
 fn parsePepper(parser: *Parser, data: []u8) ?*Command {
     const rest = data[0 .. data.len - 1];
     const op_end = std.mem.indexOfScalar(u8, rest, ';') orelse
@@ -65,17 +67,19 @@ fn parsePepper(parser: *Parser, data: []u8) ?*Command {
     }
 
     var cells: [4]u16 = @splat(0);
+    var holes: []const u8 = "";
     if (std.mem.eql(u8, op, "place")) {
         if (token_end == rest.len) return invalidPepper(parser, "missing cells");
         var it = std.mem.splitScalar(u8, rest[token_end + 1 ..], ';');
         for (&cells) |*v| {
             const s = it.next() orelse return invalidPepper(parser, "missing cells");
-            // Digits only: parseInt alone also takes "+5", "-0" and "1_0".
-            if (s.len == 0 or s.len > 5) return invalidPepper(parser, "bad cell");
-            for (s) |c| if (!std.ascii.isDigit(c)) return invalidPepper(parser, "bad cell");
-            v.* = std.fmt.parseInt(u16, s, 10) catch return invalidPepper(parser, "bad cell");
+            v.* = Command.PepperPlace.cellCount(s) orelse return invalidPepper(parser, "bad cell");
         }
-        if (it.next() != null) return invalidPepper(parser, "too many fields");
+        if (it.index != null) {
+            holes = it.rest();
+            if (holes.len == 0 or Command.PepperPlace.readHoles(holes) == null)
+                return invalidPepper(parser, "bad holes");
+        }
         if (cells[2] == 0 or cells[3] == 0) return invalidPepper(parser, "empty box");
     } else if (std.mem.eql(u8, op, "remove")) {
         if (token_end != rest.len) return invalidPepper(parser, "too many fields");
@@ -91,6 +95,7 @@ fn parsePepper(parser: *Parser, data: []u8) ?*Command {
             .row = cells[1],
             .cols = cells[2],
             .rows = cells[3],
+            .holes = holes,
         },
     };
     return &parser.command;
@@ -131,6 +136,46 @@ test "OSC: OSC 777 pepper place, a 64-byte token" {
     const cmd = p.end('\x1b').?.*;
     try testing.expect(cmd == .pepper_place);
     try testing.expectEqualStrings(token, cmd.pepper_place.token);
+    try testing.expectEqualStrings("", cmd.pepper_place.holes);
+}
+
+test "OSC: OSC 777 pepper place with holes" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+
+    const input = "777;pepper;place;tok;4;5;60;17;10,12,30,8;0,0,65535,1";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .pepper_place);
+    try testing.expectEqualStrings("tok", cmd.pepper_place.token);
+    try testing.expectEqual(17, cmd.pepper_place.rows);
+    const holes = Command.PepperPlace.readHoles(cmd.pepper_place.holes).?;
+    try testing.expectEqual(2, holes.len);
+    try testing.expectEqual(
+        Command.PepperPlace.Cells{ .col = 10, .row = 12, .cols = 30, .rows = 8 },
+        holes.slice()[0],
+    );
+    try testing.expectEqual(
+        Command.PepperPlace.Cells{ .col = 0, .row = 0, .cols = 65535, .rows = 1 },
+        holes.slice()[1],
+    );
+}
+
+test "OSC: OSC 777 pepper place with the most holes" {
+    const testing = std.testing;
+
+    var p: Parser = .init(null);
+
+    const input = "777;pepper;place;tok;0;0;9;9;1,1,1,1;2,2,1,1;3,3,1,1;4,4,1,1";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end('\x1b').?.*;
+    try testing.expect(cmd == .pepper_place);
+    const holes = Command.PepperPlace.readHoles(cmd.pepper_place.holes).?;
+    try testing.expectEqual(Command.PepperPlace.holes_max, holes.len);
+    try testing.expectEqual(4, holes.slice()[3].row);
 }
 
 test "OSC: OSC 777 pepper remove" {
@@ -171,6 +216,20 @@ test "OSC: OSC 777 pepper invalid" {
         "777;pepper;remove;tok;1",
         "777;pepper;move;tok",
         "777;pepper;remove;" ++ "x" ** 65,
+        "777;pepper;place;tok;1;2;3;4;",
+        "777;pepper;place;tok;1;2;3;4;5,6,7",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,8,9",
+        "777;pepper;place;tok;1;2;3;4;5,6,0,8",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,0",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,8;",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,8;;5,6,7,8",
+        "777;pepper;place;tok;1;2;3;4;5,,7,8",
+        "777;pepper;place;tok;1;2;3;4; 5,6,7,8",
+        "777;pepper;place;tok;1;2;3;4;+5,6,7,8",
+        "777;pepper;place;tok;1;2;3;4;5,6,7,70000",
+        "777;pepper;place;tok;1;2;3;4;5;6;7;8",
+        "777;pepper;place;tok;1;2;3;4;1,1,1,1;1,1,1,1;1,1,1,1;1,1,1,1;1,1,1,1",
+        "777;pepper;place;tok;1;2;0;4;5,6,7,8",
     };
     for (inputs) |input| {
         var p: Parser = .init(null);
