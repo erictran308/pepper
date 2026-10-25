@@ -78,7 +78,7 @@ fn parsePepper(parser: *Parser, data: []u8) ?*Command {
             v.* = Command.PepperPlace.cellCount(s) orelse return invalidPepper(parser, "bad cell");
         }
         if (cells[2] == 0 or cells[3] == 0) return invalidPepper(parser, "empty box");
-        if (it.index != null) {
+        if (it.peek() != null) {
             holes = it.rest();
             if (holes.len == 0 or Command.PepperPlace.readHoles(holes) == null) {
                 log.warn("invalid pepper extension: bad holes, so the box is taken away", .{});
