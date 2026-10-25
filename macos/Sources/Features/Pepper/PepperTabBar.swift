@@ -412,8 +412,14 @@ struct PepperTabBar: View {
                     self?.queueUpdate()
                 })
             }
-            // Filled now, so a new tab's bar never shows empty.
-            update()
+            // Filled now, so a new tab's bar never shows empty, but with this
+            // window alone: asking AppKit for the window's tab group can make
+            // one, which lays the window out, and so SwiftUI, in the middle of
+            // the SwiftUI update that makes this model (an AttributeGraph
+            // crash, as with window-width and window-height set). The group
+            // comes on the next turn.
+            update(alone: true)
+            queueUpdate()
         }
 
         deinit {
@@ -531,17 +537,19 @@ struct PepperTabBar: View {
             }
         }
 
-        private func update() {
+        /// The bar from the window's tab group, or from the window `alone`,
+        /// which touches no tab group: see `init`.
+        private func update(alone: Bool = false) {
             // Only the selected tab's window is on screen: another's bar
             // stops watching until its window is shown again.
             guard let window = controller?.window,
-                  (window.tabGroup?.selectedWindow ?? window) === window
+                  alone || (window.tabGroup?.selectedWindow ?? window) === window
             else {
                 watching = []
                 watched = []
                 return
             }
-            let windows = window.tabbedWindows ?? [window]
+            let windows = alone ? [window] : window.tabbedWindows ?? [window]
             let bells = controller?.ghostty.config.bellFeatures.contains(.title) ?? true
             let tabs = windows.enumerated().map { index, tabWindow in
                 let tabController = tabWindow.windowController as? BaseTerminalController
@@ -566,7 +574,7 @@ struct PepperTabBar: View {
             let background = terminalColor((window as? TerminalWindow)?.preferredBackgroundColor ?? .windowBackgroundColor)
             if background != self.background { self.background = background }
             let ids = windows.map { ObjectIdentifier($0) }
-            if ids != watched {
+            if !alone, ids != watched {
                 watch(window, windows)
                 watched = ids
             }
