@@ -367,6 +367,7 @@ func makeView() -> Ghostty.SurfaceView {
 func place(
     _ token: String,
     in view: Ghostty.SurfaceView,
+    at origin: CGPoint = .zero,
     width: CGFloat = 100,
     height: CGFloat = 50,
     holes: [CGRect] = []
@@ -374,7 +375,7 @@ func place(
     onMain {
         PepperServer.shared.place(
             token: token,
-            pixels: CGRect(x: 0, y: 0, width: width, height: height),
+            pixels: CGRect(origin: origin, size: CGSize(width: width, height: height)),
             holes: holes,
             in: view
         )
@@ -504,6 +505,16 @@ func holeChecks() {
     check("a place while its stream attaches again keeps the last frame", onMain {
         let pictures = (box?.sublayers ?? []).compactMap { $0.sublayers?.first }
         return pictures.count == 2 && pictures.allSatisfy { $0.contents != nil }
+    })
+
+    // A box away from the surface's top left: its holes are from there too.
+    place("h1", in: view, at: CGPoint(x: 30, y: 20), holes: [CGRect(x: 90, y: 50, width: 80, height: 40)])
+    check("holes are cut where they are on the surface, not from the box's corner", onMain {
+        box?.frame.minX == 30 && box?.frame.size == CGSize(width: 100, height: 50)
+            && (box?.sublayers ?? []).map(\.frame) == [
+                CGRect(x: 0, y: 20, width: 100, height: 30),
+                CGRect(x: 0, y: 0, width: 60, height: 20),
+            ]
     })
     holed.end()
 
