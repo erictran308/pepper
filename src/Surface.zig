@@ -1107,10 +1107,8 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .pepper_place => |v| self.pepperPlace(
             std.mem.sliceTo(&v.token, 0),
-            v.col,
-            v.row,
-            v.cols,
-            v.rows,
+            .{ .col = v.col, .row = v.row, .cols = v.cols, .rows = v.rows },
+            &v.holes,
         ),
 
         .selection_scroll_tick => |active| {
@@ -2072,16 +2070,40 @@ fn resolvePathForOpening(
 }
 
 /// pepper: tells the apprt where to show the video stream with this token,
-/// turning the box of cells into pixels from the surface's top left
-/// (padding included). An empty box takes the stream away.
+/// and where in its box it doesn't show, as pixels. An empty box takes the
+/// stream away.
 fn pepperPlace(
     self: *Surface,
     token: [:0]const u8,
-    col: u16,
-    row: u16,
-    cols: u16,
-    rows: u16,
+    box: terminal.osc.Command.PepperPlace.Cells,
+    holes: *const terminal.osc.Command.PepperPlace.Holes,
 ) void {
+    const place = self.pepperPixels(box);
+    var hole_pixels: apprt.action.PepperPlace.Holes = .{};
+    for (holes.slice(), 0..) |hole, i| hole_pixels.list[i] = self.pepperPixels(hole);
+    hole_pixels.len = holes.len;
+    _ = self.rt_app.performAction(
+        .{ .surface = self },
+        .pepper_place,
+        .{
+            .token = token,
+            .x = place.x,
+            .y = place.y,
+            .width = place.width,
+            .height = place.height,
+            .holes = &hole_pixels,
+        },
+    ) catch |err| {
+        log.warn("apprt failed to place pepper stream err={}", .{err});
+    };
+}
+
+/// pepper: a box of cells as pixels from the surface's top left (padding
+/// included).
+fn pepperPixels(
+    self: *const Surface,
+    box: terminal.osc.Command.PepperPlace.Cells,
+) apprt.action.PepperPlace.Box {
     const cell = self.size.cell;
     const padding = self.size.padding;
     const px = struct {
@@ -2089,20 +2111,13 @@ fn pepperPlace(
             return @intCast(@min(v, std.math.maxInt(u16)));
         }
     }.f;
-    _ = self.rt_app.performAction(
-        .{ .surface = self },
-        .pepper_place,
-        .{
-            .token = token,
-            // Saturating: a large enough cell or padding (the user's config)
-            // mustn't overflow.
-            .x = px(padding.left +| @as(u32, col) *| cell.width),
-            .y = px(padding.top +| @as(u32, row) *| cell.height),
-            .width = px(@as(u32, cols) *| cell.width),
-            .height = px(@as(u32, rows) *| cell.height),
-        },
-    ) catch |err| {
-        log.warn("apprt failed to place pepper stream err={}", .{err});
+    return .{
+        // Saturating: a large enough cell or padding (the user's config)
+        // mustn't overflow.
+        .x = px(padding.left +| @as(u32, box.col) *| cell.width),
+        .y = px(padding.top +| @as(u32, box.row) *| cell.height),
+        .width = px(@as(u32, box.cols) *| cell.width),
+        .height = px(@as(u32, box.rows) *| cell.height),
     };
 }
 

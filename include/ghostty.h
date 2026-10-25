@@ -630,6 +630,20 @@ typedef enum {
   GHOSTTY_READONLY_ON,
 } ghostty_action_readonly_e;
 
+// apprt.action.PepperPlace.Box
+typedef struct {
+  uint16_t x;
+  uint16_t y;
+  uint16_t width;
+  uint16_t height;
+} ghostty_action_pepper_box_s;
+
+// apprt.action.PepperPlace.Holes
+typedef struct {
+  ghostty_action_pepper_box_s list[4];
+  uint8_t len;
+} ghostty_action_pepper_holes_s;
+
 // apprt.action.PepperPlace.C
 typedef struct {
   const char* token;
@@ -637,6 +651,7 @@ typedef struct {
   uint16_t y;
   uint16_t width;
   uint16_t height;
+  const ghostty_action_pepper_holes_s* holes;
 } ghostty_action_pepper_place_s;
 
 // apprt.action.DesktopNotification.C

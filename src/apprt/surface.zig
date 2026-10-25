@@ -93,6 +93,7 @@ pub const Message = union(enum) {
         row: u16,
         cols: u16,
         rows: u16,
+        holes: terminal.osc.Command.PepperPlace.Holes,
     },
 
     /// The terminal encountered a bell character.

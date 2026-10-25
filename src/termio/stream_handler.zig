@@ -1444,12 +1444,15 @@ pub const StreamHandler = struct {
     }
 
     fn pepperPlace(self: *StreamHandler, value: terminal.StreamAction.PepperPlace) void {
+        // The parser checked the holes, so none are lost here.
+        const holes = terminal.osc.Command.PepperPlace.readHoles(value.holes) orelse .{};
         self.surfaceMessageWriter(.{ .pepper_place = .{
             .token = pepperToken(value.token),
             .col = value.col,
             .row = value.row,
             .cols = value.cols,
             .rows = value.rows,
+            .holes = holes,
         } });
     }
 

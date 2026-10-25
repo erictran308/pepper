@@ -357,6 +357,8 @@ pub const Action = union(Key) {
         row: u16,
         cols: u16,
         rows: u16,
+        /// As `osc.Command.PepperPlace.holes` holds them.
+        holes: []const u8,
 
         pub const C = extern struct {
             token: lib.String,
@@ -364,6 +366,7 @@ pub const Action = union(Key) {
             row: u16,
             cols: u16,
             rows: u16,
+            holes: lib.String,
         };
 
         pub fn cval(self: PepperPlace) PepperPlace.C {
@@ -373,6 +376,7 @@ pub const Action = union(Key) {
                 .row = self.row,
                 .cols = self.cols,
                 .rows = self.rows,
+                .holes = .init(self.holes),
             };
         }
     };
@@ -2061,6 +2065,7 @@ pub fn Stream(comptime Handler: type) type {
                         .row = v.row,
                         .cols = v.cols,
                         .rows = v.rows,
+                        .holes = v.holes,
                     });
                 },
 
