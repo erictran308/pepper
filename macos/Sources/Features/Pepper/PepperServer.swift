@@ -399,7 +399,7 @@ final class PepperServer {
             current.cut = cut
         }
         placements[token] = current
-        showFrame(of: current)
+        showFrame(current.shown, in: current)
         CATransaction.commit()
         report(token)
     }
@@ -575,28 +575,29 @@ final class PepperServer {
     /// Puts the token's current frame (or nothing) in its placement's layers.
     /// A placement whose view has gone goes instead.
     private func show(_ token: String) {
-        guard var placement = placements[token] else { return }
+        guard let placement = placements[token] else { return }
         guard placement.view != nil else {
             placements.removeValue(forKey: token)
             remove(placement.layer)
             report(token)
             return
         }
-        placement.shown = currentSurface(token)
-        placements[token] = placement
+        // In place: this runs at every frame.
+        let surface = currentSurface(token)
+        placements[token]?.shown = surface
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        showFrame(of: placement)
+        showFrame(surface, in: placement)
         CATransaction.commit()
     }
 
-    /// Puts the placement's frame in the layers that show it. Call it inside
-    /// a transaction.
-    private func showFrame(of placement: Placement) {
+    /// Puts `surface` (or nothing) in the layers of `placement` that show
+    /// its frames. Call it inside a transaction.
+    private func showFrame(_ surface: IOSurface?, in placement: Placement) {
         if let pictures = placement.pictures {
-            for picture in pictures { picture.contents = placement.shown }
+            for picture in pictures { picture.contents = surface }
         } else {
-            placement.layer.contents = placement.shown
+            placement.layer.contents = surface
         }
     }
 
