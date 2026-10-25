@@ -467,20 +467,18 @@ func holeChecks() {
         return (box, clips, clips.compactMap { $0.sublayers?.first })
     }
     check("a box with holes shows nothing itself", box != nil && onMain { box?.contents == nil })
-    check(
-        "its pieces are clipped, in points from its bottom left",
+    check("its pieces are clipped, in points from its bottom left", onMain {
         clips.allSatisfy(\.masksToBounds) && clips.map(\.frame) == [
             CGRect(x: 0, y: 20, width: 100, height: 30),
             CGRect(x: 0, y: 0, width: 60, height: 20),
         ]
-    )
-    check(
-        "each piece shows the frame, laid over the whole box",
-        pictures.count == 2 && onMain { pictures.allSatisfy { $0.contents != nil } } && pictures.map(\.frame) == [
+    })
+    check("each piece shows the frame, laid over the whole box", onMain {
+        pictures.count == 2 && pictures.allSatisfy { $0.contents != nil } && pictures.map(\.frame) == [
             CGRect(x: 0, y: -20, width: 100, height: 50),
             CGRect(x: 0, y: 0, width: 100, height: 50),
         ]
-    )
+    })
     place("h1", in: view, holes: [CGRect(x: 0, y: 0, width: 100, height: 50)])
     check("a box its holes cover shows nothing", onMain { box?.sublayers == nil && box?.contents == nil })
     place("h1", in: view)
@@ -539,8 +537,6 @@ func pause(_ seconds: TimeInterval) {
 }
 
 func checks() {
-    holeChecks()
-
     let hello = Child(["hello"])
     hello.end()
     check("a hello is answered, by the server's own process", hello.saw("sent 0; answer \(getpid()) \(ownVersion())"))
@@ -630,6 +626,10 @@ func checks() {
         check("a surface of 1 byte a pixel is refused", odd.await("refused u1"))
     }
     odd.end()
+
+    // Last, so its stream, which the server drops after its process ends,
+    // counts toward no limit checked above.
+    holeChecks()
 }
 
 // MARK: Main
