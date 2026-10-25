@@ -651,6 +651,7 @@ typedef struct {
   uint16_t y;
   uint16_t width;
   uint16_t height;
+  // Like token, valid only while the action is handled: copy what's kept.
   const ghostty_action_pepper_holes_s* holes;
 } ghostty_action_pepper_place_s;
 

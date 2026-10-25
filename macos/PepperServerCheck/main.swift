@@ -223,9 +223,13 @@ func owner(_ arguments: [String]) -> Never {
                 mach_port_mod_refs(mach_task_self_, port, MACH_PORT_RIGHT_RECEIVE, -1)
                 lock.unlock()
                 say("port-gone")
-            } else if line.hasPrefix("attach "), let surface = surfacePort(bytesPerElement: bytesPerElement) {
+            } else if line.hasPrefix("attach ") {
                 // Again, as when its box's size changes; presenting nothing.
                 let token = String(line.dropFirst("attach ".count))
+                guard let surface = surfacePort(bytesPerElement: bytesPerElement) else {
+                    say("no surface again \(token)")
+                    continue
+                }
                 say("sent again \(token) \(attach(token, to: server, reply: reply.0, replyBits: reply.1, surface: surface))")
             } else {
                 break

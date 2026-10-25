@@ -33,20 +33,22 @@ Pepper sets these in every shell:
 | --- | --- |
 | `PEPPER_PORT` | Pepper's Mach port, by name. Set: the terminal is Pepper. |
 | `PEPPER_PLAY` | pepper-play's path. |
+| `PEPPER_FEATURES` | What this Pepper's escape sequence takes beyond the first one, comma separated: `holes` (below). Not set: an older Pepper. |
 
-Inside tmux they're set too, but tmux keeps Pepper's escape sequences from the terminal: check that `TMUX` isn't set.
+Inside tmux they're set too, but tmux keeps Pepper's escape sequences from the terminal: check that `TMUX` isn't set. A program started from a Pepper shell inherits them all, a terminal too.
 
 ### Placing the box
 
 Pepper shows a stream only where it was placed, by an escape sequence written to the terminal:
 
 ```text
-ESC ] 777 ; pepper ; place ; TOKEN ; COL ; ROW ; COLS ; ROWS ESC \
+ESC ] 777 ; pepper ; place ; TOKEN ; COL ; ROW ; COLS ; ROWS [ ; HOLE … ] ESC \
 ESC ] 777 ; pepper ; remove ; TOKEN ESC \
 ```
 
 - `COL`, `ROW`: the box's top left cell, from 0. `COLS`, `ROWS`: its size in cells. Place it again to move or resize it.
 - `TOKEN`: 1 to 64 of `A-Z a-z 0-9 _ -`; use a random one per playback (32 hex digits of `/dev/urandom`). Only a program that can write to the tab and knows the token can put video there, so keep it off command lines and out of logs.
+- `HOLE`: `COL,ROW,COLS,ROWS`, cells counted as the box's are (from the screen's top left, not the box's), where the video doesn't show, so what the terminal draws there does: a popup over the video. Up to 4, none empty; the part of one outside the box does nothing. A place whose holes don't read (a fifth, an empty one, a stray `;` at the end) takes the box away. Send them only when `PEPPER_FEATURES` lists `holes`: an older Pepper refuses a place with holes, and the box stays where it was.
 - The video is drawn at the box's size in pixels, which Pepper tells pepper-play; the app never works out pixels. The picture keeps its shape, with black bars where the box's shape differs.
 - Other terminals ignore both sequences.
 
@@ -62,7 +64,7 @@ There are two ways to do it:
 
    pepper-play makes its own token unless it was given one, and takes the box away when it ends.
 
-A box drawn over by a popup should be taken away while the popup is open, and placed again after.
+A popup drawn over the box: place the box again with the popup's cells as a hole, and again without it when the popup closes (the app writes the sequences: `pepper-place` takes no holes). Without `holes` in `PEPPER_FEATURES`, take the box away while the popup is open, and place it again after.
 
 ### Controlling it
 
