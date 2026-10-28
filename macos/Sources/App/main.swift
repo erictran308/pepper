@@ -4,7 +4,8 @@ import GhosttyKit
 
 // pepper: before ghostty_init, which keeps a copy of the process environment
 // that every shell's is made from: Pepper's variables (PEPPER_PORT) go in it.
-PepperServer.shared.start()
+// Not for a CLI action, which runs and exits without the app.
+if !PepperServer.isCLIAction(CommandLine.arguments) { PepperServer.shared.start() }
 
 // Initialize Ghostty global state. We do this once right away because the
 // CLI APIs require it and it lets us ensure it is done immediately for the

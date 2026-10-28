@@ -258,6 +258,23 @@ final class PepperServer {
         NotificationCenter.default.post(name: Self.videoDidChange, object: self)
     }
 
+    /// Whether these arguments run a CLI action (`ghostty +list-fonts`,
+    /// `--version`, `--help`), which ghostty_cli_try_action runs before
+    /// exiting, with no app: as Ghostty's detectIter (src/cli/action.zig)
+    /// finds one. A CLI action gets no server: its port would die with it,
+    /// and a program it starts (`+edit-config`'s editor) would get that
+    /// port as PEPPER_PORT.
+    static func isCLIAction(_ arguments: [String]) -> Bool {
+        var help = false
+        for arg in arguments.dropFirst() {
+            // `ghostty -e ghostty +action`: what follows is the command's.
+            if arg == "-e" { return false }
+            if arg == "--version" || arg.hasPrefix("+") { return true }
+            if arg == "--help" || arg == "-h" { help = true }
+        }
+        return help
+    }
+
     /// Registers the port and listens on the main queue. Call it before
     /// ghostty_init: the core keeps a copy of the environment, taken then,
     /// that every shell's is made from, so the variables set here must be

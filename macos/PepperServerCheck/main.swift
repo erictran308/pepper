@@ -406,6 +406,11 @@ func coversRest(_ pieces: [CGRect], of size: CGSize, holes: [CGRect]) -> Bool {
 
 func holeChecks() {
     check("shells hear that boxes take holes", getenv("PEPPER_FEATURES").map { String(cString: $0) } == "holes")
+    let cli = { (args: String) in PepperServer.isCLIAction(["ghostty"] + args.split(separator: " ").map(String.init)) }
+    check("a CLI action gets no server", cli("+edit-config") && cli("--version") && cli("--help")
+        && cli("-h") && cli("--font-size=12 +list-fonts") && cli("+ssh -e x"))
+    check("the app does", !cli("") && !cli("--command=direct:/bin/sh --window-save-state=never")
+        && !cli("-e ghostty +list-fonts") && !cli("--help -e x") && !cli("-psn_0_12345"))
     let size = CGSize(width: 100, height: 50)
     let whole = CGRect(origin: .zero, size: size)
     check("no hole leaves the box whole", PepperServer.pieces(of: size, holes: []) == [whole])
