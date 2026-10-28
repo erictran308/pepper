@@ -26,26 +26,25 @@
   <sub><code>pepper-play</code> in a Pepper tab; <code>f</code> fills the tab. Big Buck Bunny © Blender Foundation, <a href="https://creativecommons.org/licenses/by/3.0/">CC BY 3.0</a>.</sub>
 </p>
 
-Pepper is [Ghostty](https://ghostty.org) 1.3.1, the terminal, with one thing added: a program can play a video in a box of cells inside a tab. The video goes straight from the graphics chip to the screen, with no copies. In a Pepper tab, a 1080p video at 30 frames a second costs about half the CPU and under half the memory of mpv playing it in its own window with the same settings (decoded on the graphics chip, timed to the display), and Pepper itself adds 1–2% of a core ([measured](pepper-play/README.md#performance)).
+Pepper is [Ghostty](https://ghostty.org) 1.4.0, the terminal, with one thing added: a program can play a video in a box of cells inside a tab. The video goes straight from the graphics chip to the screen, with no copies. In a Pepper tab, a 1080p video at 30 frames a second costs about half the CPU and under half the memory of mpv playing it in its own window with the same settings (decoded on the graphics chip, timed to the display), and Pepper itself adds 1–2% of a core ([measured](pepper-play/README.md#performance)).
 
 It's named after Pepper's ghost, the stage trick that lays a picture over the live scene.
 
 ## Ghostty's terminal, untouched
 
-Pepper is Ghostty. It draws text, reads your keys and runs your shell with Ghostty's own code, unchanged. In what programs print, it understands one more escape sequence. Its only other change of its own to Ghostty's core is in the Metal renderer, which keeps custom shaders' textures once per split instead of once per frame in flight (1.7 GB less with two cursor shaders and five splits on a 6K screen). It also carries 21 fixes taken early from Ghostty's own later code, 17 for security and 4 for performance ([the list](notes/upstream-backports.md)). It reads your Ghostty config (`~/.config/ghostty/config`), and it installs next to Ghostty, which keeps working as before.
+Pepper is Ghostty. It draws text, reads your keys and runs your shell with Ghostty's own code, unchanged. In what programs print, it understands one more escape sequence. Its only other change of its own to Ghostty's core is in the Metal renderer, which keeps custom shaders' textures once per split instead of once per frame in flight (1.7 GB less with two cursor shaders and five splits on a 6K screen). It reads your Ghostty config (`~/.config/ghostty/config`), and it installs next to Ghostty, which keeps working as before.
 
-Everything Pepper adds to Ghostty 1.3.1 is in this table, and in [a handful of commits](https://github.com/ghostty-org/ghostty/compare/v1.3.1...erictran308:pepper:pepper) you can read in an evening:
+Everything Pepper adds to Ghostty 1.4.0 is in this table, and in [a handful of commits](https://github.com/ghostty-org/ghostty/compare/v1.4.0...erictran308:pepper:pepper) you can read in an evening:
 
 | Where | What Pepper adds | Size |
 | --- | --- | --- |
-| Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box (with holes, so a popup over it shows); custom shaders' textures kept once per split; and most of the fixes from Ghostty's later code (next rows). | 1,581 lines added and 263 taken out, tests included; the fixes are 903 and 171 of them |
-| The macOS app (Swift) | Two new files: [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box, and [`PepperTabBar.swift`](macos/Sources/Features/Pepper/PepperTabBar.swift), a tab bar for `macos-titlebar-style = hidden` that shows what goes on in each tab (video, a progress report, a bell). | 1,105 and 663 lines, plus 45 that hook them in |
-| Fixes from Ghostty's later code | 21 fixes Ghostty made after 1.3.1, taken before a release has them: [the list](notes/upstream-backports.md). Most are in the core, counted above. In the app, a link from terminal output is checked before it opens, in two new files ([`UntrustedURL.swift`](macos/Sources/Helpers/UntrustedURL.swift), [`UntrustedURLAlert.swift`](macos/Sources/Helpers/UntrustedURLAlert.swift)), and three crashes are fixed. | 612 lines added and 13 taken out in the app, tests included |
+| Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box (with holes, so a popup over it shows), and custom shaders' textures kept once per split. | 680 lines added and 92 taken out, tests included |
+| The macOS app (Swift) | Two new files: [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box, and [`PepperTabBar.swift`](macos/Sources/Features/Pepper/PepperTabBar.swift), a tab bar for `macos-titlebar-style = hidden` that shows what goes on in each tab (video, a progress report, a bell). | 1,105 and 663 lines, plus 46 that hook them in |
 | Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says where new releases are. | About 2,100 lines fewer |
 | The player (Rust) | [`pepper-play`](pepper-play/), a program of its own inside the app. Pepper never starts it: you do, or a program you run does. | Separate program |
 | A helper for AI agents (Rust) | [`pepper-agent`](pepper-agent/), a program of its own inside the app: a viewer pane you run, and commands an AI agent runs to show you video or a live page there. Pepper never starts it either. | Separate program |
 | The name and icon | "Pepper" in menus, About and alerts, its own app id and icon, so it can't be confused with Ghostty or replace it. | Text and images |
-| The build | Builds with Zig 0.15.2 on Apple's newest SDKs, plus one fix from Ghostty's own later code. Signs Pepper and its player with macOS's hardened runtime, and checks what their signatures allow. | Build files only |
+| The build | Signs Pepper and its player with macOS's hardened runtime, and checks what their signatures allow. | Build files only |
 
 Nothing else changes. Pepper adds no new way to run a command, and it doesn't update itself.
 
@@ -122,7 +121,7 @@ A review of pepper-agent before its first release found four more, all fixed bef
 3. `--human` printed the names in a page's own data raw.
 4. A page kept to this machine could still reach link-local addresses on the network.
 
-A third review, of everything Pepper adds as it stood after those (October 2026, from the source alone: it ran none of it), found 26 ways it might be misused that it couldn't confirm without running them. All are fixed as if real, not released yet:
+A third review, of everything Pepper adds as it stood after those (October 2026, from the source alone: it ran none of it), found 26 ways it might be misused that it couldn't confirm without running them. All are fixed as if real, since 1.3.1-pepper.3:
 
 1. Files in a project could get their own code run: a `yt-dlp.conf` when an agent opened a web video, a library when it transcribed. The tools now run from `/`.
 2. A project's playlist, list of files or link, or a page from a file, could make pepper-agent show the agent other files of yours, under the name of the one it asked for; and the MCP server attached any picture a page's script named.
@@ -136,13 +135,11 @@ Found a security problem in what Pepper adds? Please report it privately through
 
 ## Build it yourself
 
-Needs full Xcode (with its Metal Toolchain), Zig 0.15.2 exactly, Rust, and `brew install gettext`.
+Needs full Xcode (with its Metal Toolchain), Zig 0.17.0 exactly, Rust, and `brew install gettext`.
 
 ```sh
 ./pepper-build.sh        # → zig-out/Pepper.app
 ```
-
-`pepper-build.sh` explains why plain `zig build` doesn't work with Apple's newest SDKs, and what it does about it.
 
 ## Credits and licence
 
