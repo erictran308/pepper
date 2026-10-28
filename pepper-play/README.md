@@ -149,14 +149,14 @@ pepper-play sets these among its own options, before yours, so yours win (it rea
 
 And, with no option: frames are drawn into a ring of four IOSurfaces tagged sRGB, so a wide-gamut display shows mpv's colours as they are; a frame that only repeats the one on screen isn't drawn again; new surfaces aren't made at every size while a window is being dragged, but once the size settles.
 
-Measured on an Apple M5 Pro (macOS 27.2, mpv 0.41.0), test clips in a 1926×1058 px box, 60 s each: CPU as a share of one core, and memory as Activity Monitor counts it. mpv's own window is the same size with the same settings (`--hwdec=auto-safe --video-sync=display-resample`).
+Measured on an Apple M5 Pro (macOS 27.2, mpv 0.41.0, Pepper 1.4.0-pepper.1), test clips in a 1926×1058 px box, 60 s each: CPU as a share of one core, and memory as Activity Monitor counts it. mpv's own window is the same size with the same settings (`--hwdec=auto-safe --video-sync=display-resample`).
 
 | Clip | pepper-play before these defaults | pepper-play | mpv's window | pepper-play memory | mpv's window memory |
 | --- | --- | --- | --- | --- | --- |
-| 1080p24 H.264 | 26.4% | 9.2% | 17.8% | 304 MB | 691 MB |
-| 1080p30 H.264 | 33.2% | 10.0% | 20.8% | 305 MB | 761 MB |
-| 1080p60 H.264 | 48.7% | 17.8% | 24.6% | 305 MB | 1000 MB |
-| 2160p30 HEVC | 69.9% | 12.4% | 19.6% | 565 MB | 910 MB |
+| 1080p24 H.264 | 26.4% | 8.7% | 18.9% | 312 MB | 678 MB |
+| 1080p30 H.264 | 33.2% | 10.3% | 20.7% | 305 MB | 682 MB |
+| 1080p60 H.264 | 48.7% | 16.2% | 26.1% | 305 MB | 969 MB |
+| 2160p30 HEVC | 69.9% | 11.9% | 21.6% | 568 MB | 889 MB |
 
 `bench/run.sh --new-pepper` measures it on yours, in a Pepper of its own (`bench/run.sh --help`); `notes/player-perf.md` has every number and what each change did.
 

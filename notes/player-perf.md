@@ -156,6 +156,25 @@ Everything kept (10.1, 10.3, 10.4, 10.6), the full bench (`bench/run.sh --new-pe
 - This run is noisy past its first clip: from there Pepper's own CPU fell from 5.8% to about 1%, which happens only when its window isn't on screen (the Mac was in use: another workspace or app in front), and both players dropped or mistimed frames in some clips (pepper-play 21 in 1080p60 HEVC, mpv's window 25 mistimed in 2160p30 HEVC). The runs for each item, with the machine left alone, had none, and their CPU agrees with this run's to within 1%. Pepper's own cost is from those: 5.5–6.5% while its box plays at 60 fps against 4.6–4.7% idle, 1–2% of a core.
 - The README's sentence ("about half the CPU and under half the memory … at 30 frames a second", "1–2% of a core") is from these numbers.
 
+## On Ghostty 1.4.0 (1.4.0-pepper.1, 2026-10-28)
+
+Pepper moved onto Ghostty 1.4.0, with pepper-play unchanged (0.3.0). The full bench (`bench/run.sh --new-pepper --label 1.4.0-pepper.1`) on the release build (`3c5be3341`), with the Mac left alone; macOS 27.2 (26B118), mpv 0.41.0, Rust 1.99.1, the same config as above:
+
+| Clip | pepper-play % (p95) | mpv window % (p95) | pepper-play MB rss / footprint | mpv window MB rss / footprint |
+| --- | --- | --- | --- | --- |
+| 1080p24 H.264 | 8.7 (9.0) | 18.9 (19.8) | 168 / 312 | 515 / 678 |
+| 1080p30 H.264 | 10.3 (10.8) | 20.7 (21.6) | 169 / 305 | 529 / 682 |
+| 1080p30 HEVC | 10.5 (11.1) | 19.6 (21.0) | 174 / 318 | 675 / 846 |
+| 1080p60 H.264 | 16.2 (16.9) | 26.1 (27.2) | 171 / 305 | 675 / 969 |
+| 1080p60 HEVC | 16.5 (17.2) | 26.2 (27.3) | 179 / 313 | 714 / 1009 |
+| 2160p30 H.264 | 11.7 (12.2) | 21.2 (21.9) | 259 / 551 | 633 / 878 |
+| 2160p30 HEVC | 11.9 (12.4) | 21.6 (22.8) | 275 / 568 | 659 / 889 |
+
+- pepper-play's CPU is within 1.6% of a core of the 1.3.1 run's, and 37–54% under mpv's window (about half at 24–30 fps, 37–38% less at 60), with 31–64% of its footprint.
+- Pepper itself: 4.9% idle, 5.7–7.4% while its box played (its window on screen the whole run): about +1% at 24–30 fps, +2.5% at 60. WindowServer 44–46% (the see-through window), as before.
+- Frame timing: at 1080p, at most 1 frame dropped and 4 late a clip. At 4K this run had pepper-play drop 2–4 and show about 2% of its frames late (24–28 mistimed, 30–34 delayed), mpv's window at most 4; a second run of the two 4K clips (`--label 1.4.0-4k-recheck`) had pepper-play at 0 dropped and 9/14 and 1/4 mistimed/delayed, against mpv's window's 3–4 and 5–8: noise, not a change.
+- The README's sentence still holds on 1.4.0.
+
 ## Repeating it
 
 - The whole bench: `pepper-play/bench/run.sh --new-pepper` (about 17 minutes; leave the Mac alone, with the test window on screen). One item's clips: `--clips 1080p60-h264,2160p30-hevc --no-window --no-idle`. A change against what's built now: build it elsewhere and pass `--player PATH`.
