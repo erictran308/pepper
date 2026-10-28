@@ -179,9 +179,6 @@ class AppDelegate: NSObject,
     // MARK: - NSApplicationDelegate
 
     func applicationWillFinishLaunching(_ notification: Notification) {
-        // pepper: before any surface starts, so every shell gets PEPPER_PORT.
-        PepperServer.shared.start()
-
         #if DEBUG
         if
             let suite = UserDefaults.ghosttySuite,

@@ -258,8 +258,12 @@ final class PepperServer {
         NotificationCenter.default.post(name: Self.videoDidChange, object: self)
     }
 
-    /// Registers the port and listens on the main queue. Call it before any
-    /// surface starts, so every shell gets PEPPER_PORT.
+    /// Registers the port and listens on the main queue. Call it before
+    /// ghostty_init: the core keeps a copy of the environment, taken then,
+    /// that every shell's is made from, so the variables set here must be
+    /// in it. Set later, they'd be missing from shells, and the copy would
+    /// point into an `environ` array that unsetenv shifted (a null where
+    /// it expects a variable) or setenv moved.
     func start() {
         guard source == nil else { return }
         // What Pepper was started with isn't its own: no shell gets it, even
