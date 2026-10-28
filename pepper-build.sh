@@ -1,98 +1,26 @@
 #!/bin/sh
-# Builds Pepper with Zig 0.15.2 against Apple's 26.4+ SDKs.
-#
-# Those SDKs' .tbd stubs list only arm64e-macos, and Zig 0.15.2 links only
-# against stubs naming arm64-macos, so every libc symbol comes out undefined.
-# Zig 0.16 fixes it (ziglang/zig#31673), but Ghostty 1.3.x needs 0.15.2.
-# Xcode 27's math.h also expects INFINITY and NAN from a float.h newer than
-# Zig's (Ghostty fixed it upstream in 1c861e3c4, after moving to Zig 0.16).
-#
-# So this keeps a clone of the SDK whose stubs also list arm64-macos and whose
-# math.h supplies the two macros, and puts an xcrun first on PATH that gives
-# its path to Zig. xcodebuild keeps using the real SDK.
-#
-# Then it builds pepper-play (pepper-play/, Rust) and puts it in the app as
-# Contents/Helpers/Pepper.app, and pepper-agent (pepper-agent/, Rust) as
-# Contents/MacOS/pepper-agent, signs them all ad hoc with the hardened runtime
-# and entitlements of their own (pepper-agent: none), and checks what the
-# signatures say.
+# Builds Pepper: Ghostty's build (Zig 0.17.0, which links against Apple's
+# 26.4+ SDKs as they are), then pepper-play (pepper-play/, Rust), put in the
+# app as Contents/Helpers/Pepper.app, and pepper-agent (pepper-agent/, Rust)
+# as Contents/MacOS/pepper-agent. It signs them all ad hoc with the hardened
+# runtime and entitlements of their own (pepper-agent: none), and checks what
+# the signatures say.
 #
 # Usage: ./pepper-build.sh [zig build options]   (default: -Doptimize=ReleaseFast)
 set -eu
 cd "$(dirname "$0")"
-path_before=$PATH
 
 # Pepper's version: Ghostty's, then Pepper's own count on it. The build
 # number counts Pepper's releases.
 pepper_version=1.3.1-pepper.4
 pepper_build=4
 
-zig_want=0.15.2
+zig_want=0.17.0
 zig_have=$(zig version 2>/dev/null || true)
 if [ "$zig_have" != "$zig_want" ]; then
     echo "pepper-build: needs zig $zig_want, found '${zig_have:-none}'" >&2
     exit 1
 fi
-
-export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-sdk=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
-sdk_ver=$(/usr/bin/xcrun --sdk macosx --show-sdk-version)
-sdk_build=$(/usr/bin/xcrun --sdk macosx --show-sdk-build-version)
-cache="${XDG_CACHE_HOME:-$HOME/.cache}/pepper"
-view="$cache/sdk/MacOSX$sdk_ver-$sdk_build.sdk"
-# This user's alone: what's in it goes into every build.
-mkdir -p "$cache"
-chmod 700 "$cache"
-
-# Made again unless it was made from this very SDK.
-if [ "$(cat "$view/.pepper-sdk" 2>/dev/null || true)" != "$sdk" ]; then
-    echo "pepper-build: making SDK view $view" >&2
-    mkdir -p "$cache/sdk"
-    tmp="$view.tmp"
-    rm -rf "$tmp"
-    # -c clones on APFS: only the files changed below take space.
-    cp -cR "$sdk/." "$tmp"
-    # Adds arm64-macos to each [ ... ] target list that has arm64e-macos only.
-    rg -l -uu --null 'arm64e-macos' -g '*.tbd' "$tmp" |
-        xargs -0 perl -0777 -i -pe '
-            s{\[([^\]]*)\]}{
-                my $l = $1;
-                ($l =~ /\barm64e-macos\b/ && $l !~ /\barm64-macos\b/)
-                    ? "[" . ($l =~ s/\barm64e-macos\b/arm64-macos, arm64e-macos/r) . "]"
-                    : "[$l]"
-            }ge'
-    cat >>"$tmp/usr/include/math.h" <<'EOF'
-
-/* pepper: Zig 0.15.2's float.h lacks __need_infinity_nan (see pepper-build.sh). */
-#ifndef INFINITY
-#define INFINITY (__builtin_inff())
-#endif
-#ifndef NAN
-#define NAN (__builtin_nanf(""))
-#endif
-EOF
-    echo "$sdk" >"$tmp/.pepper-sdk"
-    rm -rf "$view"
-    mv "$tmp" "$view"
-fi
-
-mkdir -p "$cache/bin"
-# Written under a name of its own, then moved over the old one: a link left
-# at the shim's path is replaced, not written through.
-shim="$cache/bin/.xcrun.$$"
-rm -f "$shim"
-cat >"$shim" <<'EOF'
-#!/bin/sh
-# pepper-build.sh's xcrun: Zig asks exactly this to find the SDK.
-if [ "$#" -eq 3 ] && [ "$1" = --sdk ] && [ "$2" = macosx ] &&
-    [ "$3" = --show-sdk-path ] && [ -n "${PEPPER_SDK:-}" ]; then
-    printf '%s\n' "$PEPPER_SDK"
-    exit 0
-fi
-exec /usr/bin/xcrun "$@"
-EOF
-chmod +x "$shim"
-mv -f "$shim" "$cache/bin/xcrun"
 
 [ "$#" -gt 0 ] || set -- -Doptimize=ReleaseFast
 # The build copies the app over the one already in zig-out, keeping files
@@ -102,7 +30,7 @@ case " $* " in
 *emit-macos-app=false*) app=no ;;
 *) rm -rf zig-out/Pepper.app ;;
 esac
-PEPPER_SDK="$view" PATH="$cache/bin:$PATH" zig build "$@"
+zig build "$@"
 
 # Built without the app (-Demit-macos-app=false): nothing to put it in.
 [ "$app" = yes ] || exit 0
@@ -110,7 +38,7 @@ app=zig-out/Pepper.app
 [ -d "$app" ] || exit 0
 
 echo "pepper-build: building pepper-play" >&2
-PATH="$path_before" cargo build --release --locked --manifest-path pepper-play/Cargo.toml
+cargo build --release --locked --manifest-path pepper-play/Cargo.toml
 helper="$app/Contents/Helpers/Pepper.app"
 rm -rf "$app/Contents/Helpers"
 mkdir -p "$helper/Contents/MacOS" "$helper/Contents/Resources"
@@ -125,7 +53,7 @@ if [ -n "$icon" ] && [ -f "$app/Contents/Resources/$icon.icns" ]; then
 fi
 
 echo "pepper-build: building pepper-agent" >&2
-PATH="$path_before" cargo build --release --locked --manifest-path pepper-agent/Cargo.toml
+cargo build --release --locked --manifest-path pepper-agent/Cargo.toml
 # On every shell's PATH, next to pepper-play.
 cp pepper-agent/target/release/pepper-agent "$app/Contents/MacOS/pepper-agent"
 agent_version=$("$app/Contents/MacOS/pepper-agent" --version | cut -d' ' -f2)
