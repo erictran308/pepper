@@ -134,13 +134,13 @@ test "OSC: OSC 777 pepper place, a 64-byte token" {
 
     var p: Parser = .init(null);
 
-    const token = "t" ** 64;
+    const token: [64]u8 = @splat('t');
     const input = "777;pepper;place;" ++ token ++ ";0;0;1;1";
     for (input) |ch| p.next(ch);
 
     const cmd = p.end('\x1b').?.*;
     try testing.expect(cmd == .pepper_place);
-    try testing.expectEqualStrings(token, cmd.pepper_place.token);
+    try testing.expectEqualStrings(&token, cmd.pepper_place.token);
     try testing.expectEqualStrings("", cmd.pepper_place.holes);
 }
 
@@ -250,7 +250,7 @@ test "OSC: OSC 777 pepper invalid" {
         "777;pepper;place;;1;2;3;4",
         "777;pepper;remove;tok;1",
         "777;pepper;move;tok",
-        "777;pepper;remove;" ++ "x" ** 65,
+        "777;pepper;remove;" ++ @as([65]u8, @splat('x')),
         "777;pepper;place;tok;1;2;0;4;5,6,7,8",
     };
     for (inputs) |input| {

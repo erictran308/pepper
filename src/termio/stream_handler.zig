@@ -2045,7 +2045,7 @@ test "kitty clipboard write: oversized text replies EFBIG" {
 /// pepper: a token as a surface message holds it: NUL padded, cut at the
 /// longest the parser takes (it refuses longer ones already).
 fn pepperToken(token: []const u8) [terminal.osc.Command.PepperPlace.token_max:0]u8 {
-    var out = [_:0]u8{0} ** terminal.osc.Command.PepperPlace.token_max;
+    var out: [terminal.osc.Command.PepperPlace.token_max:0]u8 = @splat(0);
     const len = @min(token.len, out.len);
     @memcpy(out[0..len], token[0..len]);
     return out;
@@ -2058,10 +2058,12 @@ test "pepper token" {
     const short = pepperToken("ab_1");
     try testing.expectEqualStrings("ab_1", std.mem.sliceTo(&short, 0));
 
-    const full = pepperToken("z" ** max);
-    try testing.expectEqualStrings("z" ** max, std.mem.sliceTo(&full, 0));
+    const zs: [max]u8 = @splat('z');
+    const full = pepperToken(&zs);
+    try testing.expectEqualStrings(&zs, std.mem.sliceTo(&full, 0));
     try testing.expectEqual(0, full[max]);
 
-    const long = pepperToken("y" ** (max + 8));
-    try testing.expectEqualStrings("y" ** max, std.mem.sliceTo(&long, 0));
+    const ys: [max + 8]u8 = @splat('y');
+    const long = pepperToken(&ys);
+    try testing.expectEqualStrings(ys[0..max], std.mem.sliceTo(&long, 0));
 }

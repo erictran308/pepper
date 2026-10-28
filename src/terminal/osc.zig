@@ -263,7 +263,7 @@ pub const Command = union(Key) {
         };
 
         pub const Holes = struct {
-            list: [holes_max]Cells = [_]Cells{.{}} ** holes_max,
+            list: [holes_max]Cells = @splat(.{}),
             len: u8 = 0,
 
             pub fn slice(self: *const Holes) []const Cells {

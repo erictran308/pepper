@@ -830,7 +830,7 @@ pub const PepperPlace = struct {
 
     // Sync with: ghostty_action_pepper_holes_s
     pub const Holes = extern struct {
-        list: [holes_max]Box = [_]Box{.{}} ** holes_max,
+        list: [holes_max]Box = @splat(.{}),
         len: u8 = 0,
 
         const holes_max = terminal.osc.Command.PepperPlace.holes_max;
