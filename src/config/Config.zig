@@ -3259,6 +3259,18 @@ keybind: Keybinds = .{},
 /// will use more CPU per terminal surface and can become quite expensive
 /// depending on the shader and your terminal usage.
 ///
+/// This can also be set to `cursor` (Pepper only: Ghostty itself reports it
+/// as an invalid value), which runs the animation loop only while the
+/// terminal is focused, and only for a second after the cursor moves or
+/// changes size or color, or the terminal gains focus: when the shader's
+/// `iTimeCursorChange` or `iTimeFocus` changes (a blink, or hiding and
+/// showing the cursor, doesn't count). It suits shaders that animate
+/// the cursor (from `iTimeCursorChange` or `iTimeFocus`): they animate as
+/// with `true`, but a terminal at rest isn't redrawn. The second is fixed: a
+/// cursor or focus animation longer than that stops where it is at one
+/// second, and a shader that animates on its own, from `iTime` alone, stops
+/// a second after the last change. Use `true` for those.
+///
 /// This can be changed at runtime and will affect all open terminals.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
@@ -5513,6 +5525,8 @@ pub const CustomShaderAnimation = enum(c_int) {
     false,
     true,
     always,
+    /// pepper: only for a while after the cursor or focus changes.
+    cursor,
 };
 
 /// Valid values for macos-non-native-fullscreen

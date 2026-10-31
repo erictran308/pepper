@@ -146,6 +146,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// shaders to update their state.
         custom_shader_focused_changed: bool = false,
 
+        /// pepper: until when `custom-shader-animation = cursor` animates,
+        /// in `shadertoy.monotonicNs` (0: not since it started). Pushed
+        /// later (`startCustomShaderWindow`) on the render thread as the
+        /// cursor, the focus or the config changes, just before the display
+        /// link and the animation timer are set, and again by whichever
+        /// thread draws the frame whose uniforms take the change (a sync
+        /// draw runs on the main thread), hence atomic.
+        custom_shader_animate_until: std.atomic.Value(u64) = .init(0),
+
+        /// pepper: the custom shaders' cursor as last seen by
+        /// `noteCustomShaderCursor`, to tell when it changes.
+        custom_shader_cursor_seen: ?shadertoy.CursorInputs = null,
+
         /// The most recent scrollbar state. We use this as a cache to
         /// determine if we need to notify the apprt that there was a
         /// scrollbar change.
@@ -1156,6 +1169,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .false => null,
                     .always => draw_interval_ms,
                     .true => if (self.focused) draw_interval_ms else null,
+                    // pepper: only for a while after the cursor or the
+                    // focus changes.
+                    .cursor => if (self.focused and shadertoy.cursorAnimating(
+                        self.custom_shader_animate_until.load(.monotonic),
+                        shadertoy.monotonicNs(),
+                    )) draw_interval_ms else null,
                 };
             };
 
@@ -1213,6 +1232,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Flag that we need to update our custom shaders
             self.custom_shader_focused_changed = true;
+
+            // pepper: a focus gained starts `custom-shader-animation =
+            // cursor`'s window, before the display link is synced below
+            // and the render thread re-arms the animation timer.
+            if (focus) self.startCustomShaderWindow();
 
             self.syncDisplayLink(null, null);
         }
@@ -1723,6 +1747,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update custom shader uniforms that depend on terminal state.
                 self.updateCustomShaderUniformsFromState();
+
+                // pepper: `custom-shader-animation = cursor` starts here,
+                // before the display link is synced below.
+                self.noteCustomShaderCursor();
             }
 
             // Start the display link now that the rebuilt frame is ready.
@@ -2253,6 +2281,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const old_blending = self.config.blending;
             const custom_shaders_changed = !self.config.custom_shaders.equal(config.custom_shaders);
+            // pepper: for `custom-shader-animation = cursor`, below.
+            const old_animation = self.config.custom_shader_animation;
 
             self.config.deinit();
             self.config = config.*;
@@ -2281,6 +2311,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (custom_shaders_changed) {
                 self.reinitialize_shaders = true;
             }
+
+            // pepper: another shader, or `cursor` just chosen, gets
+            // `custom-shader-animation = cursor`'s window, so its first
+            // second animates. Other config changes don't.
+            if (self.focused and (custom_shaders_changed or old_animation != .cursor))
+                self.startCustomShaderWindow();
         }
 
         /// Resize the screen.
@@ -2467,6 +2503,55 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             uniforms.current_cursor_style = @as(i32, @backingInt(cursor_style));
         }
 
+        /// pepper: for `custom-shader-animation = cursor`, starts the
+        /// animation window when what the custom shaders' cursor uniforms
+        /// are made of changes (`shadertoy.CursorInputs`), as the next
+        /// frame's uniforms will see it. A blink doesn't count.
+        ///
+        /// Called on the render thread in `updateFrame`, with the draw
+        /// mutex held, after the cells are rebuilt.
+        fn noteCustomShaderCursor(self: *Self) void {
+            // Not needed otherwise. A shader or this mode coming back
+            // starts the window from `changeConfig`.
+            if (!self.has_custom_shaders or
+                self.config.custom_shader_animation != .cursor) return;
+            const glyph: ?shadertoy.CursorGlyph = if (self.cells.getCursorGlyph()) |g| .{
+                .grid_pos = g.grid_pos,
+                .glyph_size = g.glyph_size,
+                .bearings = g.bearings,
+                .color = g.color,
+            } else null;
+            const seen = shadertoy.cursorInputs(glyph, .{
+                .cell = .{ self.size.cell.width, self.size.cell.height },
+                .padding = .{ self.size.padding.left, self.size.padding.top },
+                .screen_height = shadertoy.cursorScreenHeight(
+                    GraphicsAPI.custom_shader_y_is_down,
+                    self.size.screen.height,
+                ),
+            }) orelse return;
+            if (self.custom_shader_cursor_seen) |last| {
+                if (std.meta.eql(last, seen)) return;
+            }
+            self.custom_shader_cursor_seen = seen;
+            if (self.focused) self.startCustomShaderWindow();
+        }
+
+        /// pepper: starts (or extends) `custom-shader-animation = cursor`'s
+        /// window: a second from now. Its end is the latest of every start,
+        /// so the first one seen (before the loop is set) and the one the
+        /// frame's uniforms stamp (the shader's own clock, a refresh or so
+        /// later) both get their full second. Any thread. The render
+        /// thread's callers start it only while focused; the uniforms'
+        /// stamps don't look, and `animationWake` runs the loop only while
+        /// focused either way.
+        fn startCustomShaderWindow(self: *Self) void {
+            if (self.config.custom_shader_animation != .cursor) return;
+            _ = self.custom_shader_animate_until.fetchMax(
+                shadertoy.cursorAnimationEnd(shadertoy.monotonicNs()),
+                .monotonic,
+            );
+        }
+
         /// Update per-frame custom shader uniforms.
         ///
         /// This should be called exactly once per frame, inside `drawFrame`.
@@ -2575,6 +2660,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     uniforms.current_cursor = new_cursor;
                     uniforms.current_cursor_color = cursor_color;
                     uniforms.cursor_change_time = uniforms.time;
+                    // pepper: the shader's clock stamps it now.
+                    self.startCustomShaderWindow();
                 }
             }
 
@@ -2588,6 +2675,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // since it comes async from a message.
             if (self.custom_shader_focused_changed and self.focused) {
                 uniforms.time_focus = uniforms.time;
+                // pepper: the shader's clock stamps it now.
+                self.startCustomShaderWindow();
                 self.custom_shader_focused_changed = false;
             }
         }

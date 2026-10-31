@@ -346,6 +346,81 @@ fn spvCross(
     return try alloc.dupeSentinel(u8, std.mem.sliceTo(result, 0), 0);
 }
 
+/// pepper: how long `custom-shader-animation = cursor` keeps the animation
+/// loop running after the cursor or the focus last changed.
+pub const cursor_animation_ns: u64 = std.time.ns_per_s;
+
+/// pepper: the monotonic clock (`.awake`) in nanoseconds, for
+/// `custom-shader-animation = cursor`'s window. A reading that doesn't fit
+/// (it can't) is 0, which never animates.
+pub fn monotonicNs() u64 {
+    const now: std.Io.Timestamp = .now(global.io(), .awake);
+    return std.math.cast(u64, now.nanoseconds) orelse 0;
+}
+
+/// pepper: when `custom-shader-animation = cursor`'s window ends, for a
+/// change at `now_ns`; none (0) for a clock that couldn't be read (0).
+pub fn cursorAnimationEnd(now_ns: u64) u64 {
+    if (now_ns == 0) return 0;
+    return now_ns +| cursor_animation_ns;
+}
+
+/// pepper: whether `custom-shader-animation = cursor` animates at `now_ns`,
+/// for a window that ends at `end_ns` (0: none yet). Never for a clock that
+/// couldn't be read (0).
+pub fn cursorAnimating(end_ns: u64, now_ns: u64) bool {
+    return now_ns != 0 and now_ns < end_ns;
+}
+
+/// pepper: the cursor glyph's part of `CursorInputs`.
+pub const CursorGlyph = struct {
+    grid_pos: [2]u16 = .{ 0, 0 },
+    glyph_size: [2]u32 = .{ 0, 0 },
+    bearings: [2]i16 = .{ 0, 0 },
+    color: [4]u8 = .{ 0, 0, 0, 0 },
+};
+
+/// pepper: the rest of `CursorInputs`, from the renderer's size.
+pub const CursorFrame = struct {
+    /// The cell's width and height.
+    cell: [2]u32,
+    /// The padding's left and top.
+    padding: [2]u32,
+    /// The screen's height where +Y is up (OpenGL), which the cursor's
+    /// position is flipped against; 0 where +Y is down (Metal).
+    screen_height: u32,
+};
+
+/// pepper: what generic.zig's `updateCustomShaderUniformsForFrame` makes
+/// the cursor uniforms from, whose change stamps `iTimeCursorChange`:
+/// `custom-shader-animation = cursor` animates for a while after any of it
+/// changes. Hiding or showing the cursor, or a new style that keeps the
+/// glyph's size (a hollow block for a block), stamps no time a shader could
+/// animate from, so it doesn't count (a TUI that hides the cursor around
+/// each redraw would otherwise keep the loop running); a bar for a block
+/// changes the size, so it does. Seen
+/// on the render thread before the loop is set; the uniforms' own stamp
+/// starts the window too.
+pub const CursorInputs = struct {
+    glyph: CursorGlyph,
+    frame: CursorFrame,
+};
+
+/// pepper: `CursorFrame.screen_height` for a graphics API: the screen's
+/// height where +Y is up, which the cursor's pixels are flipped against,
+/// and 0 where +Y is down, where a resize alone doesn't move them.
+pub fn cursorScreenHeight(y_is_down: bool, height: u32) u32 {
+    return if (y_is_down) 0 else height;
+}
+
+/// pepper: the cursor inputs now, or null while no cursor glyph is drawn
+/// (`glyph` null: blinked off, or hidden): the uniforms keep their last
+/// cursor then and stamp nothing, so nothing is seen either, and the next
+/// cursor drawn is compared with the last one seen, as the uniforms do.
+pub fn cursorInputs(glyph: ?CursorGlyph, frame: CursorFrame) ?CursorInputs {
+    return .{ .glyph = glyph orelse return null, .frame = frame };
+}
+
 /// Convert ShaderToy shader to null-terminated glsl for testing.
 fn testGlslZ(alloc: Allocator, src: []const u8) ![:0]const u8 {
     var buf: std.Io.Writer.Allocating = .init(alloc);
@@ -487,6 +562,96 @@ test "shadertoy to glsl" {
     defer alloc.free(glsl);
 
     // log.warn("glsl={s}", .{glsl});
+}
+
+test "cursorAnimating: for a second after a change, never before one" {
+    const testing = std.testing;
+    const at: u64 = 5 * std.time.ns_per_s;
+    const end = cursorAnimationEnd(at);
+
+    // No change yet (0): no animation, whenever it is.
+    try testing.expect(!cursorAnimating(0, 0));
+    try testing.expect(!cursorAnimating(0, at));
+    // From the change itself up to just before the second is out.
+    try testing.expect(cursorAnimating(end, at));
+    try testing.expect(cursorAnimating(end, at + std.time.ns_per_ms));
+    try testing.expect(cursorAnimating(end, at + cursor_animation_ns - 1));
+    // From the second on, until the next change.
+    try testing.expect(!cursorAnimating(end, at + cursor_animation_ns));
+    try testing.expect(!cursorAnimating(end, at + 3600 * std.time.ns_per_s));
+    // A change at the clock's very end doesn't wrap around to the past.
+    try testing.expectEqual(std.math.maxInt(u64), cursorAnimationEnd(std.math.maxInt(u64) - 1));
+    // A clock that couldn't be read (0) never starts or keeps a window.
+    try testing.expectEqual(@as(u64, 0), cursorAnimationEnd(0));
+    try testing.expect(!cursorAnimating(end, 0));
+    // The clock reads as a real time (not 0, which means no change).
+    try testing.expect(monotonicNs() > 0);
+}
+
+test "cursorInputs: what starts custom-shader-animation = cursor" {
+    const testing = std.testing;
+    const glyph: CursorGlyph = .{
+        .grid_pos = .{ 3, 4 },
+        .glyph_size = .{ 18, 40 },
+        .bearings = .{ 0, 38 },
+        .color = .{ 255, 255, 255, 255 },
+    };
+    const frame: CursorFrame = .{
+        .cell = .{ 18, 42 },
+        .padding = .{ 4, 4 },
+        .screen_height = 0,
+    };
+    const changed = struct {
+        /// As generic.zig's `noteCustomShaderCursor`: a frame without a
+        /// glyph is skipped, and the next one is compared with the last
+        /// one seen.
+        fn by(last: CursorInputs, g: ?CursorGlyph, f: CursorFrame) bool {
+            const now = cursorInputs(g, f) orelse return false;
+            return !std.meta.eql(last, now);
+        }
+    }.by;
+    const first = cursorInputs(glyph, frame).?;
+
+    // The same cursor in the same frame: no change.
+    try testing.expect(!changed(first, glyph, frame));
+    // No glyph drawn (a blink, or hidden with DECTCEM): nothing seen, and
+    // shown again where it was, no change, so a TUI hiding the cursor
+    // around each redraw doesn't keep the loop running.
+    try testing.expect(cursorInputs(null, frame) == null);
+    try testing.expect(!changed(first, null, frame));
+    // Hidden while the padding changed, then shown: the uniforms see it
+    // moved, and so does this.
+    var padded = frame;
+    padded.padding = .{ 10, 4 };
+    try testing.expect(!changed(first, null, padded));
+    try testing.expect(changed(first, glyph, padded));
+
+    // Moved, recolored, or another size (a bar).
+    var moved = glyph;
+    moved.grid_pos = .{ 4, 4 };
+    try testing.expect(changed(first, moved, frame));
+    var recolored = glyph;
+    recolored.color = .{ 255, 0, 0, 255 };
+    try testing.expect(changed(first, recolored, frame));
+    var bar = glyph;
+    bar.glyph_size = .{ 2, 40 };
+    try testing.expect(changed(first, bar, frame));
+
+    // The cell size moves the cursor's pixels: a change.
+    var bigger = frame;
+    bigger.cell = .{ 20, 46 };
+    try testing.expect(changed(first, glyph, bigger));
+    // The screen's height counts only where +Y is up (OpenGL: the cursor's
+    // pixels are flipped against it), so a window resize alone is a change
+    // there and not where +Y is down (Metal).
+    inline for (.{ false, true }) |y_is_down| {
+        var short = frame;
+        short.screen_height = cursorScreenHeight(y_is_down, 900);
+        var tall = frame;
+        tall.screen_height = cursorScreenHeight(y_is_down, 1000);
+        const before = cursorInputs(glyph, short).?;
+        try testing.expectEqual(!y_is_down, changed(before, glyph, tall));
+    }
 }
 
 const test_crt = @embedFile("shaders/test_shadertoy_crt.glsl");
