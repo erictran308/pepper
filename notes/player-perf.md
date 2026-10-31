@@ -175,6 +175,39 @@ Pepper moved onto Ghostty 1.4.0, with pepper-play unchanged (0.3.0). The full be
 - Frame timing: at 1080p, at most 1 frame dropped and 4 late a clip. At 4K this run had pepper-play drop 2–4 and show about 2% of its frames late (24–28 mistimed, 30–34 delayed), mpv's window at most 4; a second run of the two 4K clips (`--label 1.4.0-4k-recheck`) had pepper-play at 0 dropped and 9/14 and 1/4 mistimed/delayed, against mpv's window's 3–4 and 5–8: noise, not a change.
 - The README's sentence still holds on 1.4.0.
 
+## Upscaling: bilinear, no sigmoid (2026-10-31)
+
+Full screen on this Mac's 6016×3384 display, pepper-play draws the video at the box's size (6003×3249 px), so a 4K video is upscaled 1.56×. With mpv's defaults (`scale=lanczos`, `sigmoid-upscaling=yes`, a 16-bit FBO) it didn't keep up. Measured with `notes/fullscreen-bench/bench.py --variants` (untracked): 4K YouTube `KLuTLF3x9sA` (`--ytdl-format=401+251`, AV1 8-bit SDR, decoded by VideoToolbox) in a full-screen test Pepper with `custom-shader-animation = false`; each setting alone, 20 s of warmup, then 120 s measured, a cooldown between runs; medians of the whole Mac's power (SMC `PSTR`) against a full-screen test Pepper idle at a prompt (9.12 W). One run each; the browsers were left open (the same load in every run).
+
+| Settings | W over idle | GPU W | Dropped / late frames | Display link | GPU wait a frame | Footprint MB |
+| --- | --- | --- | --- | --- | --- | --- |
+| mpv's defaults | 4.58 | 2.55 | 226 / 519 | 52.9 fps | 7.9 ms | 1154 |
+| `--sigmoid-upscaling=no` | 4.03 | 2.44 | 258 / 541 | 53.4 fps | 8.5 ms | 1154 |
+| `--scale=bilinear` | 2.81 | 1.91 | 12 / 101 | 59.1 fps | 4.2 ms | 945 |
+| `--fbo-format=rgba8` | 3.54 | 2.45 | 207 / 510 | 53.9 fps | 8.0 ms | 961 |
+| `--scale=bilinear --sigmoid-upscaling=no` | 2.84 | 1.89 | 0 / 5 | 59.9 fps | 3.9 ms | 996 |
+| `--profile=fast --fbo-format=rgba8` | 1.66 | 2.08 | 0 / 0 | 60.0 fps | 2.0 ms | 703 |
+
+- The bilinear filter carries the saving; without the sigmoid pass too, no frame dropped. These two are now pepper-play's own options, before the user's and the app's, which still win (`--scale=lanczos --sigmoid-upscaling=yes` brings mpv's back).
+- Both only change upscaling. A video in a box smaller than it (tuitube's usual case, 4K in about 1926×1058) keeps mpv's downscaling (`dscale`, `correct-downscaling`, `linear-downscaling`), which `--profile=fast` would have changed.
+- What's left between them and the profile, about 1.2 W, is `rgba8` and `dither=no`, which apply at every size and risk banding on 10-bit and HDR video: not taken.
+
+The full bench with them (`bench/run.sh --new-pepper --label new-upscale-defaults`), the Mac left alone:
+
+| Clip | pepper-play % (p95) | mpv window % (p95) | pepper-play MB rss / footprint | mpv window MB rss / footprint |
+| --- | --- | --- | --- | --- |
+| 1080p24 H.264 | 8.6 (9.5) | 7.3 (17.8) | 172 / 287 | 563 / 765 |
+| 1080p30 H.264 | 9.8 (10.3) | 17.8 (19.4) | 168 / 276 | 719 / 867 |
+| 1080p30 HEVC | 10.2 (10.9) | 17.5 (19.7) | 172 / 288 | 676 / 837 |
+| 1080p60 H.264 | 16.6 (18.0) | 25.3 (26.3) | 170 / 283 | 556 / 948 |
+| 1080p60 HEVC | 15.8 (16.8) | 24.7 (25.9) | 178 / 291 | 773 / 1065 |
+| 2160p30 H.264 | 11.3 (11.8) | 20.0 (22.1) | 254 / 446 | 612 / 1078 |
+| 2160p30 HEVC | 11.6 (12.3) | 21.0 (21.9) | 271 / 463 | 782 / 1168 |
+
+- pepper-play's CPU is within 0.7% of a core of the 1.4.0-pepper.1 run's (its box, 1909×1083 px this time, barely scales 1080p; 4K is downscaled), its footprint 25–30 MB less at 1080p and about 105 MB less at 4K. No frame dropped; at most 2 mistimed and 3 delayed a clip (the 1.4.0 run's 4K clips had 2–4 dropped and about 30 late).
+- Not a clean run past its first clip: Pepper's own CPU fell from 6.0% to about 1%, as it does when its window isn't on screen (seen once before, "After Phase 0"); the cause wasn't found (the user was away). mpv's window dropped 23–33 frames at 1080p60, and its 1080p24 median (7.3%) is far under its p95 (17.8%). pepper-play's options don't reach mpv's window (`--no-config`, only `hwdec` and `video-sync` passed).
+- Pepper itself: 4.8% idle; WindowServer 46% (the user's cursor shader animating, `custom-shader-animation` not set in the test Pepper).
+
 ## Repeating it
 
 - The whole bench: `pepper-play/bench/run.sh --new-pepper` (about 17 minutes; leave the Mac alone, with the test window on screen). One item's clips: `--clips 1080p60-h264,2160p30-hevc --no-window --no-idle`. A change against what's built now: build it elsewhere and pass `--player PATH`.

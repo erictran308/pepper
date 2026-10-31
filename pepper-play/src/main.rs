@@ -515,6 +515,14 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             // is no, and it doesn't read the user's mpv.conf: `--hwdec=no`
             // turns it off.
             ("hwdec", "auto-safe"),
+            // Upscaling with mpv's bilinear filter, without its sigmoid
+            // pass: a 4K video full screen on a 6K display took 4.6 W over
+            // idle and dropped 226 frames in 2 minutes with mpv's defaults
+            // (lanczos, sigmoid), 2.8 W and none with these. Downscaling,
+            // a video in a smaller box, keeps mpv's defaults.
+            // `--scale=lanczos --sigmoid-upscaling=yes` brings them back.
+            ("scale", "bilinear"),
+            ("sigmoid-upscaling", "no"),
         ];
         if mode == Mode::Shell {
             own.extend([
@@ -1768,6 +1776,8 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             let (options, ipc) = mpv_options(Mode::Shell, &args, Some(60.0)).unwrap();
             assert_eq!(options[0], ("vo".into(), "libmpv".into()));
             assert_eq!(last(&options, "hwdec").as_deref(), Some("auto-safe"));
+            assert_eq!(last(&options, "scale").as_deref(), Some("bilinear"));
+            assert_eq!(last(&options, "sigmoid-upscaling").as_deref(), Some("no"));
             assert_eq!(
                 last(&options, "video-sync").as_deref(),
                 Some("display-resample")
@@ -1800,6 +1810,7 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
             .unwrap();
             let (options, ipc) = mpv_options(Mode::App, &args, None).unwrap();
             assert_eq!(last(&options, "hwdec").as_deref(), Some("no"));
+            assert_eq!(last(&options, "scale").as_deref(), Some("bilinear"));
             assert_eq!(ipc, vec![("input-ipc-client".into(), "fd://3".into())]);
             assert!(last(&options, "force-window").is_none());
             assert!(last(&options, "terminal").is_none());
@@ -1817,6 +1828,17 @@ https://github.com/erictran308/pepper/tree/pepper/pepper-play
                 Some("all=no,ffmpeg=v")
             );
             assert!(last(&options, "cover-art-auto").is_none());
+
+            // The user's scaler wins over this program's.
+            let args = parse_args(&strings(&[
+                "--scale=ewa_lanczossharp",
+                "--sigmoid-upscaling=yes",
+                "a.mp4",
+            ]))
+            .unwrap();
+            let (options, _) = mpv_options(Mode::Shell, &args, None).unwrap();
+            assert_eq!(last(&options, "scale").as_deref(), Some("ewa_lanczossharp"));
+            assert_eq!(last(&options, "sigmoid-upscaling").as_deref(), Some("yes"));
 
             let args = parse_args(&strings(&["--vo=gpu"])).unwrap();
             assert!(mpv_options(Mode::App, &args, None).is_err());
