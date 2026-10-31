@@ -146,6 +146,7 @@ pepper-play sets these among its own options, before yours, so yours win (it rea
 | --- | --- | --- |
 | `--hwdec=auto-safe` | Decodes on the graphics chip (VideoToolbox) what it can: H.264, HEVC, ProRes, VP9, and AV1 on M3 and later; the CPU decodes the rest. mpv hands the decoded frames to its render pass with no copy. A video from the web is then parsed by Apple's decoder, as in mpv's own window with this setting or in Safari. | `--hwdec=no` |
 | `--video-sync=display-resample` | Shows each frame at one of the display's refreshes and plays the sound a hair faster or slower to match, as mpv's own window can: a steady cadence, a 24 fps film too. pepper-play tells mpv the display's rate (`--display-fps-override`, the main display's). | `--video-sync=audio` |
+| `--scale=bilinear`, `--sigmoid-upscaling=no` | Scale a video up (into a box bigger than it, full screen on a large display) with the plain bilinear filter, without the sigmoid pass. With mpv's lanczos and sigmoid, a 4K video full screen on a 6K display (1.56×) took 7.9 ms of graphics chip a frame and dropped about 2 frames a second; this way 3.9 ms, none dropped, 1.7 W less. Scaling down (a box smaller than the video) is mpv's as it was. | `--scale=lanczos --sigmoid-upscaling=yes` |
 
 And, with no option: frames are drawn into a ring of four IOSurfaces tagged sRGB, so a wide-gamut display shows mpv's colours as they are; a frame that only repeats the one on screen isn't drawn again; new surfaces aren't made at every size while a window is being dragged, but once the size settles.
 

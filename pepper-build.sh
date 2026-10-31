@@ -17,8 +17,8 @@ cd "$(dirname "$0")"
 
 # Pepper's version: Ghostty's, then Pepper's own count on it. The build
 # number counts Pepper's releases.
-pepper_version=1.4.0-pepper.1
-pepper_build=5
+pepper_version=1.4.0-pepper.2
+pepper_build=6
 
 zig_want=0.17.0
 zig_have=$(zig version 2>/dev/null || true)
