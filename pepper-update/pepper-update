@@ -1,0 +1,350 @@
+#!/bin/sh
+# pepper-update: updates Pepper to its latest release on GitHub.
+#
+#   pepper-update              install the latest release, if it's a later build
+#   pepper-update --check      only say which release is the latest
+#   pepper-update --zip FILE   install FILE (a release's Pepper.zip) instead
+#   pepper-update --reinstall  also install the same build again
+#   pepper-update --app PATH   update the Pepper at PATH (by default the one
+#                              this comes with)
+#
+# A release installs only if its app is signed as the Pepper it replaces
+# (its designated requirement: the same certificate) and is a later build,
+# so whatever the network or GitHub gives, nothing but Pepper's own builds
+# gets in. Its Pepper.zip must also match the release's Pepper.zip.sha256.
+#
+# Pepper can't be replaced while it runs. Once the new app is checked, a
+# process of its own, which outlives the tab, waits for every Pepper
+# running from that app to quit (for up to 12 hours), puts the new app in
+# its place whole, and opens it again (unless PEPPER_UPDATE_REOPEN=no, for
+# tests). So quit Pepper when you're ready. What it did goes to
+# ~/Library/Logs/pepper-update.log.
+set -eu
+umask 077
+# The system's tools, whatever the shell's PATH holds.
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+# cd goes where it's told (links_inside), not through the shell's CDPATH.
+unset CDPATH
+
+repo=erictran308/pepper
+bundle_id=io.github.erictran308.pepper
+log="$HOME/Library/Logs/pepper-update.log"
+lock="$HOME/Library/Caches/pepper-update.lock"
+nl='
+'
+
+say() { printf 'pepper-update: %s\n' "$*" >&2; }
+die() {
+    say "$*"
+    exit 1
+}
+note() { printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"; }
+# A key of an app's Info.plist, or nothing.
+plist() { /usr/libexec/PlistBuddy -c "Print :$2" "$1/Contents/Info.plist" 2>/dev/null || true; }
+# An app's designated requirement, as text, or nothing. codesign marks an
+# implicit one (ad hoc's) as a comment: `# designated => cdhash H"…"`.
+requirement() { codesign -d -r- -- "$1" 2>/dev/null | sed -n 's/^\(# \)\{0,1\}designated => //p'; }
+# Whether every symbolic link in app $1 points inside it, and no path in it
+# holds a line break. codesign leaves some paths out of the seal (PkgInfo, a
+# .lproj's locversion.plist), so a link there could point anywhere.
+links_inside() {
+    root=$(cd "$1" && pwd -P) || return 1
+    [ -z "$(find "$1" -name "*$nl*" -print)" ] || return 1
+    find "$1" -type l | while IFS= read -r link; do
+        target=$(readlink -- "$link") || exit 1
+        case "$target" in '' | /*) exit 1 ;; esac
+        # Where it leads, its folder resolved (links in it followed).
+        dir=$(cd "$(dirname -- "$link")" && cd "$(dirname -- "$target")" 2>/dev/null && pwd -P) || exit 1
+        case "$dir/" in "$root"/*) ;; *) exit 1 ;; esac
+    done
+}
+# Gives app $1 the modes an install of Pepper has, whatever the zip said: a
+# signature doesn't cover modes, owners or ACLs, so a zip of Pepper's own
+# signed app could still make it writable by others. No ACLs, nothing
+# writable but by this user, everything readable (and runnable where it
+# was). Links are left alone: chmod -R -N would change what they point to.
+own_modes() {
+    find "$1" ! -type l -exec chmod -N {} + 2>/dev/null || true
+    find "$1" ! -type l -exec chmod u+rwX,go-w,go+rX {} +
+}
+# Whether $1 is Pepper, sealed whole and signed so it meets requirement $2.
+signed_as() {
+    [ -d "$1" ] && [ ! -L "$1" ] || return 1
+    [ "$(plist "$1" CFBundleIdentifier)" = "$bundle_id" ] || return 1
+    codesign --verify --deep --strict -R "=$2" -- "$1" 2>/dev/null || return 1
+    nested_as_sealed "$1"
+}
+# Whether each program nested in app $1 (pepper-play's app, pepper-agent, the
+# dock tile) is the very one the app's seal recorded. --verify --deep checks
+# one only against the requirement the seal names for it, which every build
+# signed with the same certificate meets, so an older pepper-agent would
+# pass; the seal, which the app's signature covers, also records each one's
+# code directory hash, and that's compared here.
+nested_as_sealed() {
+    seal="$1/Contents/_CodeSignature/CodeResources"
+    names=$(plutil -extract files2 xml1 -o - -- "$seal" 2>/dev/null |
+        awk '/^\t<key>/ { k = $0 } /^\t\t<key>cdhash<\/key>/ { print k }' |
+        sed 's/^\t<key>\(.*\)<\/key>$/\1/')
+    # Pepper always has nested programs: none means the seal didn't read.
+    [ -n "$names" ] || return 1
+    printf '%s\n' "$names" | while IFS= read -r name; do
+        case "$name" in '' | *[!A-Za-z0-9._/-]* | ../* | */../* | */..) exit 1 ;; esac
+        sealed=$(/usr/libexec/PlistBuddy -c "Print :files2:${name}:cdhash" "$seal" 2>/dev/null |
+            head -c 20 | xxd -p | tr -d '\n')
+        actual=$(codesign -dvvv -- "$1/Contents/${name}" 2>&1 | sed -n 's/^CDHash=//p')
+        [ -n "$sealed" ] && [ "$sealed" = "$actual" ] || exit 1
+    done
+}
+# The programs of app $1 that processes of this user run, a path a line:
+# Pepper, pepper-agent and pepper-play, whatever name they were started by
+# and from wherever (another terminal, an MCP host). lsof sees each one
+# mapped; it can't see other users' processes.
+programs_in() {
+    lsof -Fn -- "$1/Contents/MacOS/ghostty" "$1/Contents/MacOS/pepper-agent" \
+        "$1/Contents/Helpers/Pepper.app/Contents/MacOS/pepper-play" 2>/dev/null |
+        sed -n 's/^n//p'
+}
+# Whether process $1 is a pepper-update (either half), so a lock left by
+# one that's gone isn't kept by a process that got its id since.
+updating() {
+    case "$(ps -o command= -p "$1" 2>/dev/null)" in
+    *pepper-update*) return 0 ;;
+    esac
+    return 1
+}
+# A Pepper version (Ghostty's, then Pepper's own count: 1.4.0-pepper.2) as a
+# string that sorts as the versions do, or nothing for another shape.
+version_key() {
+    printf '%s\n' "$1" | awk -F'[.-]' 'NF == 5 && $4 == "pepper" && ($1 $2 $3 $5) ~ /^[0-9]+$/ {
+        printf "%06d%06d%06d%06d\n", $1, $2, $3, $5 }'
+}
+# Whether string $1 sorts before string $2.
+before() { awk -v a="$1" -v b="$2" 'BEGIN { exit !((a "") < (b "")) }'; }
+# Lets go of the lock if process $1 holds it.
+unlock() { [ "$(readlink -- "$lock" 2>/dev/null)" != "$1" ] || rm -f -- "$lock"; }
+
+# The second half, run by the first under nohup: waits for Pepper to quit,
+# checks the new app once more, and swaps it in. $1: the folder the first
+# half made (holding new/Pepper.app), $2: the app to replace.
+finish() {
+    tmp=$1
+    app=$2
+    new=$tmp/new/Pepper.app
+    trap '' HUP
+    # The lock is this process's from here on (the first half hands it over
+    # too).
+    ln -sfn "$$" "$lock"
+    trap 'unlock $$' EXIT
+    want=$(requirement "$app")
+    [ -n "$want" ] || {
+        note "can't read $app's signature; nothing installed"
+        rm -rf "$tmp"
+        exit 1
+    }
+    # Every program from the app must be gone before it's moved, not only
+    # Pepper; Pepper opens again only if it was running.
+    was_running=
+    waiting=
+    tries=0
+    while :; do
+        using=$(programs_in "$app")
+        [ -n "$using" ] || break
+        case "$nl$using$nl" in
+        *"$nl$app/Contents/MacOS/ghostty$nl"*) was_running=yes ;;
+        esac
+        if [ -z "$waiting" ]; then
+            waiting=yes
+            note "waiting for Pepper and the programs from it ($app) to quit"
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -gt 21600 ]; then
+            note "Pepper (or a program from it) didn't quit for 12 hours; nothing installed"
+            rm -rf "$tmp"
+            exit 1
+        fi
+        sleep 2
+    done
+    # The app it was checked against may have changed since: check again,
+    # links and modes too.
+    if ! links_inside "$new"; then
+        note "the new Pepper has a link that points out of it; nothing installed"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    own_modes "$new"
+    if ! signed_as "$new" "$want"; then
+        note "the new Pepper isn't signed as $app is any more; nothing installed"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    if ! mv -- "$app" "$tmp/old.app"; then
+        note "couldn't move $app away (if it says 'Operation not permitted': System Settings → Privacy & Security → App Management, turn on the app pepper-update was run in, Pepper or a terminal); nothing installed"
+        rm -rf "$tmp"
+        exit 1
+    fi
+    if ! mv -- "$new" "$app"; then
+        if mv -- "$tmp/old.app" "$app"; then
+            note "couldn't put the new Pepper in place; the old one is back"
+            rm -rf "$tmp"
+        else
+            note "couldn't put the new Pepper in place, nor the old one back: it's in $tmp/old.app"
+        fi
+        exit 1
+    fi
+    note "installed Pepper $(plist "$app" CFBundleShortVersionString) (build $(plist "$app" CFBundleVersion)) at $app"
+    rm -rf "$tmp"
+    [ -z "$was_running" ] || [ "${PEPPER_UPDATE_REOPEN:-yes}" = no ] || open "$app"
+}
+
+mode=install
+zip=
+reinstall=
+app=
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+    --check) mode=check ;;
+    --zip)
+        [ "$#" -ge 2 ] || die "--zip FILE"
+        zip=$2 && shift
+        ;;
+    --reinstall) reinstall=yes ;;
+    --app)
+        [ "$#" -ge 2 ] || die "--app PATH"
+        app=$2 && shift
+        ;;
+    --finish)
+        [ "$#" -eq 3 ] || die "--finish is pepper-update's own"
+        finish "$2" "$3"
+        exit 0
+        ;;
+    -h | --help)
+        sed -n '2,/^set -eu$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+        exit 0
+        ;;
+    *) die "unknown option $1 (--help)" ;;
+    esac
+    shift
+done
+
+# The app this comes with: Contents/MacOS/pepper-update is a link to
+# Contents/Resources/pepper-update, and both are two folders down.
+[ -n "$app" ] || app=$(dirname -- "$0")/../..
+app=$(cd -- "$app" 2>/dev/null && pwd -P) || die "no app at $app"
+case "$app" in *.app) ;; *) die "$app isn't an app" ;; esac
+[ "$(plist "$app" CFBundleIdentifier)" = "$bundle_id" ] || die "$app isn't Pepper"
+have_version=$(plist "$app" CFBundleShortVersionString)
+have_build=$(plist "$app" CFBundleVersion)
+case "$have_build" in '' | *[!0-9]*) die "$app has no build number" ;; esac
+
+# Which release is the latest: github.com sends /releases/latest on to its
+# tag's page (no API, so no rate limit for those not signed in).
+tag=
+if [ -z "$zip" ]; then
+    to=$(curl -sS --proto '=https' --tlsv1.2 --max-time 30 -o /dev/null -w '%{redirect_url}' \
+        "https://github.com/$repo/releases/latest") || die "couldn't reach GitHub"
+    tag=${to#"https://github.com/$repo/releases/tag/"}
+    case "$tag" in
+    "$to" | '' | *[!A-Za-z0-9._-]*) die "GitHub didn't say which release is the latest" ;;
+    esac
+    latest=${tag#v}
+    if [ -z "$reinstall" ]; then
+        if [ "$latest" = "$have_version" ]; then
+            say "Pepper $have_version is the latest release"
+            exit 0
+        fi
+        latest_key=$(version_key "$latest")
+        have_key=$(version_key "$have_version")
+        if [ -n "$latest_key" ] && [ -n "$have_key" ] && before "$latest_key" "$have_key"; then
+            say "this Pepper ($have_version) is later than the latest release ($latest)"
+            exit 0
+        fi
+    fi
+    if [ "$mode" = check ]; then
+        say "Pepper $latest is out; this is $have_version (pepper-update installs it)"
+        exit 0
+    fi
+fi
+[ "$mode" = install ] || die "--check asks GitHub: not with --zip"
+
+# The app it replaces must be signed with a certificate: an ad hoc
+# signature names the build, so no other build could be told to be
+# Pepper's own.
+want=$(requirement "$app")
+[ -n "$want" ] || die "can't read $app's signature"
+case "$want" in
+*cdhash*) die "$app is signed ad hoc, so pepper-update can't tell Pepper's own builds from anyone's: install a release by hand once (the README says how), and pepper-update takes it from there" ;;
+esac
+
+# One update at a time: a second would race the first for the app. The lock
+# is a link whose target is the process holding it, made in one step.
+mkdir -p -- "$(dirname -- "$lock")" "$(dirname -- "$log")"
+if ! ln -s "$$" "$lock" 2>/dev/null; then
+    pid=$(readlink -- "$lock" 2>/dev/null || true)
+    case "$pid" in
+    '' | *[!0-9]*) ;;
+    *) ! { kill -0 "$pid" 2>/dev/null && updating "$pid"; } ||
+        die "an update is already on its way (process $pid): it installs when Pepper quits" ;;
+    esac
+    # Left by one that's gone.
+    rm -f -- "$lock"
+    ln -s "$$" "$lock" 2>/dev/null || die "another update took $lock just now"
+fi
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/pepper-update.XXXXXX")
+trap 'rm -rf "$tmp"; unlock $$' EXIT
+trap 'exit 1' HUP INT TERM
+
+if [ -n "$zip" ]; then
+    cp -- "$zip" "$tmp/Pepper.zip" || die "can't read $zip"
+else
+    get() {
+        curl -fL --proto '=https' --proto-redir '=https' --tlsv1.2 --max-time "$1" -sS \
+            -o "$tmp/$2" "https://github.com/$repo/releases/download/$tag/$2"
+    }
+    get 30 Pepper.zip.sha256 || die "release $tag has no Pepper.zip.sha256"
+    sha=$(sed -n '1s/^\([0-9a-f]\{64\}\)\( .*\)\{0,1\}$/\1/p' "$tmp/Pepper.zip.sha256")
+    [ -n "$sha" ] || die "release $tag's Pepper.zip.sha256 holds no SHA-256"
+    say "downloading Pepper $latest"
+    get 900 Pepper.zip || die "couldn't download release $tag's Pepper.zip"
+    got=$(shasum -a 256 "$tmp/Pepper.zip" | cut -d' ' -f1)
+    [ "$got" = "$sha" ] || die "Pepper.zip doesn't match its SHA-256: not installed"
+fi
+
+mkdir "$tmp/new"
+# The zip's files as they are: no resource forks, ACLs, extended attributes
+# or quarantine from it. With --norsrc, AppleDouble entries (__MACOSX/._*,
+# which carry ACLs and attributes past --noacl and --noextattr) stay plain
+# files in a __MACOSX folder, which the next check refuses; the release zip
+# has none, and nothing in the app needs them.
+ditto -x -k --norsrc --noacl --noextattr --noqtn -- "$tmp/Pepper.zip" "$tmp/new" || die "couldn't unzip Pepper.zip"
+[ "$(cd "$tmp/new" && ls -A)" = Pepper.app ] || die "Pepper.zip holds something other than Pepper.app"
+new=$tmp/new/Pepper.app
+signed_as "$new" "$want" ||
+    die "the new app isn't Pepper signed as $app is (with the same certificate, every part of it as its seal says): not installed"
+new_version=$(plist "$new" CFBundleShortVersionString)
+new_build=$(plist "$new" CFBundleVersion)
+case "$new_build" in '' | *[!0-9]*) die "the new app has no build number" ;; esac
+[ -z "$tag" ] || [ "$new_version" = "$latest" ] ||
+    die "release $tag holds Pepper $new_version: not installed"
+[ "$new_build" -ge "$have_build" ] ||
+    die "Pepper $new_version (build $new_build) is older than this one (build $have_build): not installed"
+[ "$new_build" -gt "$have_build" ] || [ -n "$reinstall" ] ||
+    die "Pepper $new_version is the same build as this one (--reinstall installs it again)"
+links_inside "$new" || die "the new app has a link that points out of it: not installed"
+own_modes "$new"
+
+# The second half runs from a copy, outside the app it replaces, and owns
+# the folder and the lock from here on.
+cp -- "$0" "$tmp/finish"
+trap - EXIT HUP INT TERM
+note "Pepper $new_version (build $new_build) checked; replacing $have_version (build $have_build) at $app" >>"$log"
+nohup /bin/sh "$tmp/finish" --finish "$tmp" "$app" >>"$log" 2>&1 </dev/null &
+finisher=$!
+# The lock is the second half's now (it takes it as it starts as well; if
+# it's done and gone already, a lock left to it is seen as stale).
+[ "$(readlink -- "$lock" 2>/dev/null)" != "$$" ] || ln -sfn "$finisher" "$lock"
+if [ -n "$(programs_in "$app")" ]; then
+    say "Pepper $new_version is ready: quit Pepper (⌘Q) to install it, and it opens again updated (log: $log)"
+else
+    say "installing Pepper $new_version (log: $log)"
+fi

@@ -2,11 +2,16 @@
 # Builds Pepper: Ghostty's build (Zig 0.17.0, which links against Apple's
 # 26.4+ SDKs as they are), then pepper-play (pepper-play/, Rust), put in the
 # app as Contents/Helpers/Pepper.app, and pepper-agent (pepper-agent/, Rust)
-# as Contents/MacOS/pepper-agent. It signs them all ad hoc with the hardened
-# runtime and entitlements of their own (pepper-agent: none), and checks what
-# the signatures say.
+# as Contents/MacOS/pepper-agent, and pepper-update (pepper-update/, a shell
+# script). It signs them all with Pepper's own certificate (or ad hoc, see
+# below), with the hardened runtime and entitlements of their own
+# (pepper-agent: none), and checks what the signatures say.
 #
 # Usage: ./pepper-build.sh [zig build options]   (default: -Doptimize=ReleaseFast)
+#
+# PEPPER_SIGN_IDENTITY: the name of the certificate to sign with (default:
+# "Pepper Code Signing", self-signed, in the login keychain), or `-` to sign
+# ad hoc, which a build without that certificate must ask for.
 set -eu
 cd "$(dirname "$0")"
 
@@ -20,6 +25,23 @@ zig_have=$(zig version 2>/dev/null || true)
 if [ "$zig_have" != "$zig_want" ]; then
     echo "pepper-build: needs zig $zig_want, found '${zig_have:-none}'" >&2
     exit 1
+fi
+
+# The signing identity, checked before anything is built. macOS keeps what
+# it lets Pepper do (Files and Folders, Accessibility, App Management)
+# against the signature's designated requirement: with a certificate that
+# names the certificate, so the next build keeps it; ad hoc it names the
+# build, so each build asks again, and pepper-update can't tell Pepper's own
+# builds from anyone's. So no build is signed ad hoc unless asked to be.
+identity=${PEPPER_SIGN_IDENTITY:-Pepper Code Signing}
+if [ "$identity" != - ]; then
+    case "$(security find-identity -p codesigning 2>/dev/null)" in
+    *"\"$identity\""*) ;;
+    *)
+        echo "pepper-build: no \"$identity\" code-signing certificate in the keychain (CLAUDE.md, Building). PEPPER_SIGN_IDENTITY=- signs ad hoc: macOS then asks for Pepper's permissions again with each build, and pepper-update won't take it." >&2
+        exit 1
+        ;;
+    esac
 fi
 
 [ "$#" -gt 0 ] || set -- -Doptimize=ReleaseFast
@@ -58,6 +80,14 @@ cargo build --release --locked --manifest-path pepper-agent/Cargo.toml
 cp pepper-agent/target/release/pepper-agent "$app/Contents/MacOS/pepper-agent"
 agent_version=$("$app/Contents/MacOS/pepper-agent" --version | cut -d' ' -f2)
 
+# pepper-update, a script: in Resources, where the app's seal covers it
+# (a script in Contents/MacOS would carry its signature in extended
+# attributes, which the release zip leaves out), and on every shell's PATH
+# by a link in Contents/MacOS.
+cp pepper-update/pepper-update "$app/Contents/Resources/pepper-update"
+chmod 755 "$app/Contents/Resources/pepper-update"
+ln -sf ../Resources/pepper-update "$app/Contents/MacOS/pepper-update"
+
 # What About and Finder say (the Xcode project has a placeholder).
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $pepper_version" \
     -c "Set :CFBundleVersion $pepper_build" "$app/Contents/Info.plist"
@@ -73,11 +103,19 @@ ln -sf ../Helpers/Pepper.app/Contents/MacOS/pepper-play "$app/Contents/MacOS/pep
 # MAP_JIT, so allow-jit isn't enough. The app gets its own entitlements, not
 # the ones Xcode signs a local build with, which add get-task-allow (a
 # debugger may attach).
-codesign --force --sign - --options runtime \
+codesign --force --sign "$identity" --timestamp=none --options runtime \
     --entitlements pepper-play/pepper-play.entitlements "$helper"
 # pepper-agent loads nothing and makes no code: no entitlements at all.
-codesign --force --sign - --options runtime "$app/Contents/MacOS/pepper-agent"
-codesign --force --sign - --options runtime \
+codesign --force --sign "$identity" --timestamp=none --options runtime \
+    "$app/Contents/MacOS/pepper-agent"
+# Xcode's plugins (the dock tile), which its local build signs ad hoc: with
+# the app's identity too, entitlements kept (the dock tile has none).
+for plugin in "$app"/Contents/PlugIns/*; do
+    [ -e "$plugin" ] || continue
+    codesign --force --sign "$identity" --timestamp=none --options runtime \
+        --preserve-metadata=entitlements "$plugin"
+done
+codesign --force --sign "$identity" --timestamp=none --options runtime \
     --entitlements macos/GhosttyReleaseLocal.entitlements "$app"
 codesign --verify --deep --strict "$app"
 
@@ -106,10 +144,19 @@ for known in "$app/Contents/MacOS/ghostty" "$helper/Contents/MacOS/pepper-play" 
     *) fail "$known isn't among the app's programs" ;;
     esac
 done
+case "$identity" in
+-) flags='flags=0x10002(adhoc,runtime)' signer='Signature=adhoc' ;;
+*) flags='flags=0x10000(runtime)' signer="Authority=$identity" ;;
+esac
 while IFS= read -r code <&3; do
-    case "$(codesign -d --verbose=2 "$code" 2>&1)" in
-    *"flags=0x10002(adhoc,runtime)"*) ;;
+    signature=$(codesign -d --verbose=2 "$code" 2>&1)
+    case "$signature" in
+    *"$flags"*) ;;
     *) fail "$code isn't signed with the hardened runtime" ;;
+    esac
+    case "$nl$signature$nl" in
+    *"$nl$signer$nl"*) ;;
+    *) fail "$code isn't signed by $identity" ;;
     esac
     allowed=$(entitlements "$code") || exit 1
     case "$allowed" in
@@ -127,5 +174,14 @@ esac
 [ ! -e "$app/Contents/Frameworks" ] || fail "$app has frameworks (Sparkle is taken out)"
 allowed=$(entitlements "$app/Contents/MacOS/pepper-agent") || exit 1
 [ -z "$allowed" ] || fail "pepper-agent has entitlements"
+# With a certificate, macOS must know the app by its name and certificate,
+# not by this build's hash, or it forgets Pepper's permissions again.
+if [ "$identity" != - ]; then
+    case "$(codesign -d -r- "$app" 2>/dev/null)" in
+    *cdhash*) fail "$app's designated requirement names the build" ;;
+    *'identifier "io.github.erictran308.pepper" and certificate leaf = H"'*) ;;
+    *) fail "$app's designated requirement isn't Pepper's identifier and certificate" ;;
+    esac
+fi
 
-echo "pepper-build: $app $pepper_version, with pepper-play $version and pepper-agent $agent_version" >&2
+echo "pepper-build: $app $pepper_version, with pepper-play $version and pepper-agent $agent_version, signed by $identity" >&2

@@ -40,23 +40,38 @@ Everything Pepper adds to Ghostty 1.4.0 is in this table, and in [a handful of c
 | --- | --- | --- |
 | Ghostty's core (Zig) | One escape sequence, `OSC 777;pepper`, which places a video box (with holes, so a popup over it shows); custom shaders' textures kept once per split; and `custom-shader-animation = cursor`, which animates a cursor shader only after the cursor moves. | 948 lines added and 92 taken out, tests included |
 | The macOS app (Swift) | Two new files: [`PepperServer.swift`](macos/Sources/Features/Pepper/PepperServer.swift), which takes frames from a player and shows them over the box, and [`PepperTabBar.swift`](macos/Sources/Features/Pepper/PepperTabBar.swift), a tab bar for `macos-titlebar-style = hidden` that shows what goes on in each tab (video, a progress report, a bell). | 1,126 and 663 lines, plus 48 that hook them in |
-| Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says where new releases are. | About 2,100 lines fewer |
+| Ghostty's updater | Taken out: Sparkle and its update screens. Ghostty's releases would install over Pepper, and without it Pepper loads no code but its own and the system's. *Check for Updates…* says to run `pepper-update`, and where new releases are. | About 2,100 lines fewer |
 | The player (Rust) | [`pepper-play`](pepper-play/), a program of its own inside the app. Pepper never starts it: you do, or a program you run does. | Separate program |
 | A helper for AI agents (Rust) | [`pepper-agent`](pepper-agent/), a program of its own inside the app: a viewer pane you run, and commands an AI agent runs to show you video or a live page there. Pepper never starts it either. | Separate program |
 | The name and icon | "Pepper" in menus, About and alerts, its own app id and icon, so it can't be confused with Ghostty or replace it. | Text and images |
-| The build | Signs Pepper and its player with macOS's hardened runtime, and checks what their signatures allow. | Build files only |
+| An updater (shell) | [`pepper-update`](pepper-update/pepper-update), a command inside the app: it installs the latest release only if it's a later build signed with the same certificate as the Pepper it replaces, once Pepper quits. Pepper never runs it: you do. | One script |
+| The build | Signs Pepper, its player and its helpers with a certificate of its own and macOS's hardened runtime, and checks what their signatures allow. | Build files only |
 
-Nothing else changes. Pepper adds no new way to run a command, and it doesn't update itself.
+Nothing else changes. Pepper adds no new way to run a command, and it doesn't update itself: `pepper-update` does, when you run it.
 
 Pepper follows Ghostty: each new Ghostty release, the same changes move onto it.
 
 ## Install
 
 1. Download `Pepper.zip` from [Releases](https://github.com/erictran308/pepper/releases), unzip it, and drag `Pepper.app` to Applications.
-2. Open it. macOS refuses the first time, because Pepper isn't notarized by Apple: it's signed ad hoc, without a paid Apple developer account. Open **System Settings → Privacy & Security**, scroll down to the message about Pepper, and click **Open Anyway**.
+2. Open it. macOS refuses the first time, because Pepper isn't notarized by Apple: it's signed with a certificate of its own (self-signed), not one from a paid Apple developer account. Open **System Settings → Privacy & Security**, scroll down to the message about Pepper, and click **Open Anyway**.
 3. To play video, install mpv (and yt-dlp, for web addresses): `brew install mpv yt-dlp`.
 
 It runs on Apple silicon Macs. It's built and tested on macOS 27; Ghostty itself runs on macOS 13 and later.
+
+## Update
+
+In a Pepper tab:
+
+```sh
+pepper-update            # the latest release, installed when you quit Pepper
+pepper-update --check    # only say which release is the latest
+```
+
+It downloads the latest release, checks that it matches its `Pepper.zip.sha256` and that its app is a later build signed with the same certificate as your Pepper, and installs it when you quit Pepper, which then opens again, updated. What it did goes to `~/Library/Logs/pepper-update.log`. Since every release is signed with that certificate, macOS keeps what you allowed Pepper (Files and Folders, Accessibility) from one release to the next.
+
+- A Pepper signed ad hoc (1.4.0-pepper.1 and earlier) can't tell which builds are Pepper's own, so `pepper-update` won't replace it: install the next release by hand once, as above.
+- If the log says "Operation not permitted", turn on the app you ran `pepper-update` in (Pepper, or your terminal) under **System Settings → Privacy & Security → App Management**, and run `pepper-update` again.
 
 ## Play video
 

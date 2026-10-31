@@ -966,12 +966,16 @@ class AppDelegate: NSObject,
         ghostty.reloadConfig()
     }
 
-    /// pepper: there's no updater (Ghostty's, Sparkle, is taken out), so this
-    /// says where new releases are.
+    /// pepper: Ghostty's updater (Sparkle) is taken out; Pepper updates with
+    /// pepper-update, which you run, so this says how, and where releases are.
     @IBAction func checkForUpdates(_ sender: Any?) {
         let alert = NSAlert()
-        alert.messageText = "Pepper doesn't update itself"
-        alert.informativeText = "New releases are at github.com/erictran308/pepper/releases."
+        alert.messageText = "Update Pepper with pepper-update"
+        alert.informativeText = """
+            In a Pepper tab, run pepper-update. It downloads the latest release, checks \
+            that it's signed as this Pepper is, and installs it when you quit Pepper. \
+            Releases are at github.com/erictran308/pepper/releases.
+            """
         alert.addButton(withTitle: "Open Releases")
         alert.addButton(withTitle: "OK")
         if alert.runModal() == .alertFirstButtonReturn,

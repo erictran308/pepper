@@ -32,7 +32,7 @@ Ways to make a separate helper the responsible one:
 What the helper needs:
 
 - **Its own .app** (`CFBundleIdentifier`, `LSUIElement`): on macOS 26 a bare executable doesn't show in the Settings pane at all.
-- **A stable signature for the grant to last.** TCC matches the designated requirement; an ad hoc signature's is its cdhash, so each build is a new identity and a new prompt (Pepper's is `cdhash H"…" or cdhash H"…"`). Apple Development (a free personal team), Developer ID, or a self-signed code-signing certificate would keep it. This Mac has no signing identity yet.
+- **A stable signature for the grant to last.** TCC matches the designated requirement; an ad hoc signature's is its cdhash, so each build is a new identity and a new prompt (Pepper's is `cdhash H"…" or cdhash H"…"`). Apple Development (a free personal team), Developer ID, or a self-signed code-signing certificate would keep it. Since 2026-10-31 `pepper-build.sh` signs with a self-signed one, "Pepper Code Signing" (CLAUDE.md, Building), so Pepper's requirement names the certificate and a grant lasts from one build to the next.
 - **Expect the monthly alert**: since macOS 15, direct `SCStream` capture brings "… is requesting to bypass the system private window picker" (Allow For One Month). replayd on 27.2 still has it.
 - **`SCContentSharingPicker`** (macOS 14+) avoids both TCC and the alert: the user picks the Simulator's window once a session. It needs a GUI app process, so the helper would present it, not the CLI. Prototype this first.
 - Keep it narrow: capture only windows whose owner is `com.apple.iphonesimulator`, and send pixels only to Pepper's port with the viewer's token.
