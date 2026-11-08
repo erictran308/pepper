@@ -77,7 +77,10 @@ struct SurfaceProgressBar: View {
 /// Bouncing progress bar for indeterminate states
 private struct BouncingProgressBar: View {
     let color: Color
-    @State private var position: CGFloat = 0
+    // pepper: still, and centered on a full track, so no percentage looks
+    // like it. The bounce redrew the window at every refresh: 25 points of
+    // WindowServer's CPU on a 5K screen.
+    private let position: CGFloat = 0.5
 
     private let barWidthRatio: CGFloat = 0.25
 
@@ -95,17 +98,6 @@ private struct BouncingProgressBar: View {
                     )
                     .offset(x: position * (geometry.size.width * (1 - barWidthRatio)))
             }
-        }
-        .onAppear {
-            withAnimation(
-                .easeInOut(duration: 1.2)
-                .repeatForever(autoreverses: true)
-            ) {
-                position = 1
-            }
-        }
-        .onDisappear {
-            position = 0
         }
     }
 }

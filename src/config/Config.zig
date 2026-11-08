@@ -3271,6 +3271,16 @@ keybind: Keybinds = .{},
 /// second, and a shader that animates on its own, from `iTime` alone, stops
 /// a second after the last change. Use `true` for those.
 ///
+/// `cursor-jump` (also Pepper only) is `cursor` for short effects on long
+/// moves: the loop runs for 0.3 seconds, and only when the terminal opens
+/// or gains focus, the shaders or this setting change, or the cursor changes
+/// size (not just by being over a wide cell) or goes, at once, more than one
+/// and a half of its heights and more than a cell's height. Other moves,
+/// such as typing along a line, and any move in an unfocused terminal,
+/// leave `iTimeCursorChange` and `iPreviousCursor` as they were and draw one
+/// frame per change. Use `cursor` for a shader that animates every move, or
+/// for longer than that.
+///
 /// This can be changed at runtime and will affect all open terminals.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
@@ -5527,6 +5537,13 @@ pub const CustomShaderAnimation = enum(c_int) {
     always,
     /// pepper: only for a while after the cursor or focus changes.
     cursor,
+    /// pepper: as `cursor`, but not for a small cursor move.
+    @"cursor-jump",
+
+    /// pepper: whether it animates only for a while after a change.
+    pub fn isWindowed(self: CustomShaderAnimation) bool {
+        return self == .cursor or self == .@"cursor-jump";
+    }
 };
 
 /// Valid values for macos-non-native-fullscreen

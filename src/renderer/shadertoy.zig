@@ -350,6 +350,15 @@ fn spvCross(
 /// loop running after the cursor or the focus last changed.
 pub const cursor_animation_ns: u64 = std.time.ns_per_s;
 
+/// pepper: the same for `cursor-jump`. Each redraw is a whole window for the
+/// compositor, so it's little more than the 0.2 s that cursor shaders'
+/// effects usually last, with room for a late frame to show the end of one.
+pub const cursor_jump_animation_ns: u64 = 300 * std.time.ns_per_ms;
+
+/// pepper: how far `custom-shader-animation = cursor-jump` counts as a jump,
+/// in the cursor's own heights.
+const cursor_jump_heights: f32 = 1.5;
+
 /// pepper: the monotonic clock (`.awake`) in nanoseconds, for
 /// `custom-shader-animation = cursor`'s window. A reading that doesn't fit
 /// (it can't) is 0, which never animates.
@@ -360,9 +369,9 @@ pub fn monotonicNs() u64 {
 
 /// pepper: when `custom-shader-animation = cursor`'s window ends, for a
 /// change at `now_ns`; none (0) for a clock that couldn't be read (0).
-pub fn cursorAnimationEnd(now_ns: u64) u64 {
+pub fn cursorAnimationEnd(now_ns: u64, mode: configpkg.CustomShaderAnimation) u64 {
     if (now_ns == 0) return 0;
-    return now_ns +| cursor_animation_ns;
+    return now_ns +| if (mode == .@"cursor-jump") cursor_jump_animation_ns else cursor_animation_ns;
 }
 
 /// pepper: whether `custom-shader-animation = cursor` animates at `now_ns`,
@@ -370,6 +379,56 @@ pub fn cursorAnimationEnd(now_ns: u64) u64 {
 /// couldn't be read (0).
 pub fn cursorAnimating(end_ns: u64, now_ns: u64) bool {
     return now_ns != 0 and now_ns < end_ns;
+}
+
+/// pepper: whether a cursor that went from `old` to `new` (x, y, width and
+/// height in pixels, as the uniforms have them) jumped, for
+/// `custom-shader-animation = cursor-jump`: it changed size, or its corner
+/// went more than `cursor_jump_heights` and more than a cell's height, so
+/// a cursor much shorter than a cell (an underline) doesn't jump at every
+/// keystroke. A width going between one and two cells at the same height is
+/// a cursor going over or off a wide cell: no change of size. `cell` is its
+/// width and height.
+fn cursorJumped(old: [4]f32, new: [4]f32, cell: [2]f32) bool {
+    const wide_cell = @min(old[2], new[2]) == cell[0] and @max(old[2], new[2]) == 2 * cell[0];
+    if (old[3] != new[3] or (old[2] != new[2] and !wide_cell)) return true;
+    const dx = new[0] - old[0];
+    const dy = new[1] - old[1];
+    const reach = @max(new[3] * cursor_jump_heights, cell[1]);
+    return dx * dx + dy * dy > reach * reach;
+}
+
+/// pepper: whether a cursor change from `old` to `new` (as `cursorJumped`)
+/// counts in `mode`: stamps `iTimeCursorChange` and starts the window. Only
+/// `cursor-jump` leaves any out: what isn't a jump, and anything while
+/// unfocused, where no loop runs to finish an effect.
+pub fn cursorChangeCounts(
+    mode: configpkg.CustomShaderAnimation,
+    focused: bool,
+    old: [4]f32,
+    new: [4]f32,
+    cell: [2]f32,
+) bool {
+    if (mode != .@"cursor-jump") return true;
+    return focused and cursorJumped(old, new, cell);
+}
+
+/// pepper: whether the cursor inputs `seen`, after `last` (null: none yet),
+/// start `mode`'s window. For generic.zig's `noteCustomShaderCursor`.
+pub fn cursorStartsWindow(
+    mode: configpkg.CustomShaderAnimation,
+    focused: bool,
+    last: ?CursorInputs,
+    seen: CursorInputs,
+) bool {
+    if (!focused) return false;
+    const l = last orelse return true;
+    if (std.meta.eql(l, seen)) return false;
+    if (mode != .@"cursor-jump") return true;
+    return cursorJumped(l.rect(), seen.rect(), .{
+        @floatFromInt(seen.frame.cell[0]),
+        @floatFromInt(seen.frame.cell[1]),
+    });
 }
 
 /// pepper: the cursor glyph's part of `CursorInputs`.
@@ -392,7 +451,8 @@ pub const CursorFrame = struct {
 };
 
 /// pepper: what generic.zig's `updateCustomShaderUniformsForFrame` makes
-/// the cursor uniforms from, whose change stamps `iTimeCursorChange`:
+/// the cursor uniforms from, whose change stamps `iTimeCursorChange` (in
+/// `cursor-jump`, only a jump's):
 /// `custom-shader-animation = cursor` animates for a while after any of it
 /// changes. Hiding or showing the cursor, or a new style that keeps the
 /// glyph's size (a hollow block for a block), stamps no time a shader could
@@ -404,6 +464,23 @@ pub const CursorFrame = struct {
 pub const CursorInputs = struct {
     glyph: CursorGlyph,
     frame: CursorFrame,
+
+    /// The cursor's pixels as the uniforms make them where +Y is down, for
+    /// `cursorJumped`: where +Y is up, a distance between two is the same
+    /// as long as the screen's height is (Pepper is Metal only).
+    pub fn rect(self: CursorInputs) [4]f32 {
+        const g = self.glyph;
+        const f = self.frame;
+        const x = @as(i64, g.grid_pos[0]) * f.cell[0] + f.padding[0] + g.bearings[0];
+        const y = @as(i64, g.grid_pos[1]) * f.cell[1] + f.padding[1] +
+            f.cell[1] - g.bearings[1] + g.glyph_size[1];
+        return .{
+            @floatFromInt(x),
+            @floatFromInt(y),
+            @floatFromInt(g.glyph_size[0]),
+            @floatFromInt(g.glyph_size[1]),
+        };
+    }
 };
 
 /// pepper: `CursorFrame.screen_height` for a graphics API: the screen's
@@ -564,28 +641,129 @@ test "shadertoy to glsl" {
     // log.warn("glsl={s}", .{glsl});
 }
 
-test "cursorAnimating: for a second after a change, never before one" {
+test "cursorAnimating: for a while after a change, never before one" {
     const testing = std.testing;
     const at: u64 = 5 * std.time.ns_per_s;
-    const end = cursorAnimationEnd(at);
+    const end = cursorAnimationEnd(at, .cursor);
 
     // No change yet (0): no animation, whenever it is.
     try testing.expect(!cursorAnimating(0, 0));
     try testing.expect(!cursorAnimating(0, at));
-    // From the change itself up to just before the second is out.
+    // From the change itself up to just before the window is out.
     try testing.expect(cursorAnimating(end, at));
     try testing.expect(cursorAnimating(end, at + std.time.ns_per_ms));
     try testing.expect(cursorAnimating(end, at + cursor_animation_ns - 1));
-    // From the second on, until the next change.
+    // From then on, until the next change.
     try testing.expect(!cursorAnimating(end, at + cursor_animation_ns));
     try testing.expect(!cursorAnimating(end, at + 3600 * std.time.ns_per_s));
     // A change at the clock's very end doesn't wrap around to the past.
-    try testing.expectEqual(std.math.maxInt(u64), cursorAnimationEnd(std.math.maxInt(u64) - 1));
+    try testing.expectEqual(std.math.maxInt(u64), cursorAnimationEnd(std.math.maxInt(u64) - 1, .cursor));
+    // `cursor-jump` has a window of its own.
+    try testing.expectEqual(at + cursor_jump_animation_ns, cursorAnimationEnd(at, .@"cursor-jump"));
     // A clock that couldn't be read (0) never starts or keeps a window.
-    try testing.expectEqual(@as(u64, 0), cursorAnimationEnd(0));
+    try testing.expectEqual(@as(u64, 0), cursorAnimationEnd(0, .cursor));
     try testing.expect(!cursorAnimating(end, 0));
     // The clock reads as a real time (not 0, which means no change).
     try testing.expect(monotonicNs() > 0);
+}
+
+test "cursorStartsWindow: what starts custom-shader-animation = cursor-jump" {
+    const testing = std.testing;
+    const glyph: CursorGlyph = .{
+        .grid_pos = .{ 3, 4 },
+        .glyph_size = .{ 18, 40 },
+        .bearings = .{ 0, 38 },
+        .color = .{ 255, 255, 255, 255 },
+    };
+    const frame: CursorFrame = .{
+        .cell = .{ 18, 42 },
+        .padding = .{ 4, 4 },
+        .screen_height = 0,
+    };
+    const from = cursorInputs(glyph, frame).?;
+    // As the uniforms make it, where +Y is down.
+    try testing.expectEqual([4]f32{ 58, 216, 18, 40 }, from.rect());
+
+    const jumped = struct {
+        fn to(a: CursorInputs, g: CursorGlyph, f: CursorFrame) bool {
+            return cursorStartsWindow(.@"cursor-jump", true, a, cursorInputs(g, f).?);
+        }
+    }.to;
+    const at = struct {
+        fn cell(g: CursorGlyph, col: u16, row: u16) CursorGlyph {
+            var moved = g;
+            moved.grid_pos = .{ col, row };
+            return moved;
+        }
+    }.cell;
+
+    // The first cursor seen starts one.
+    try testing.expect(cursorStartsWindow(.@"cursor-jump", true, null, from));
+    // Typing, a row down, or up to the reach (60 pixels here): no jump.
+    try testing.expect(!jumped(from, glyph, frame));
+    try testing.expect(!jumped(from, at(glyph, 4, 4), frame));
+    try testing.expect(!jumped(from, at(glyph, 6, 4), frame));
+    try testing.expect(!jumped(from, at(glyph, 3, 5), frame));
+    try testing.expect(!cursorJumped(.{ 0, 0, 18, 40 }, .{ 60, 0, 18, 40 }, .{ 18, 42 }));
+    // Past it, in either direction and along a diagonal.
+    try testing.expect(jumped(from, at(glyph, 7, 4), frame));
+    try testing.expect(jumped(from, at(glyph, 3, 6), frame));
+    try testing.expect(jumped(from, at(glyph, 0, 0), frame));
+    try testing.expect(cursorJumped(.{ 0, 0, 18, 40 }, .{ 50, 50, 18, 40 }, .{ 18, 42 }));
+    // Another color doesn't move it; another size is one (a bar).
+    var recolored = glyph;
+    recolored.color = .{ 255, 0, 0, 255 };
+    try testing.expect(!jumped(from, recolored, frame));
+    var bar = glyph;
+    bar.glyph_size = .{ 2, 40 };
+    try testing.expect(jumped(from, bar, frame));
+
+    // Over or off a wide cell, the width doubles or halves: no jump unless
+    // it also went far, or the height changed too.
+    var wide = glyph;
+    wide.glyph_size = .{ 36, 40 };
+    try testing.expect(!jumped(from, at(wide, 4, 4), frame));
+    try testing.expect(!jumped(cursorInputs(wide, frame).?, at(glyph, 5, 4), frame));
+    try testing.expect(jumped(from, at(wide, 8, 4), frame));
+    var wide_short = wide;
+    wide_short.glyph_size = .{ 36, 20 };
+    try testing.expect(jumped(from, at(wide_short, 4, 4), frame));
+    // Half a cell wide is a new size: only one and two cells is a wide cell.
+    var half = glyph;
+    half.glyph_size = .{ 9, 40 };
+    try testing.expect(jumped(from, half, frame));
+
+    // An underline much shorter than a cell: the cell's height is the
+    // reach (42 pixels here), so typing doesn't jump.
+    var underline = glyph;
+    underline.glyph_size = .{ 18, 3 };
+    const under = cursorInputs(underline, frame).?;
+    try testing.expect(!jumped(under, at(underline, 4, 4), frame));
+    try testing.expect(!jumped(under, at(underline, 5, 4), frame));
+    try testing.expect(!jumped(under, at(underline, 3, 5), frame));
+    try testing.expect(jumped(under, at(underline, 6, 4), frame));
+
+    // Only `cursor-jump` leaves a change out.
+    const near: [4]f32 = .{ 18, 0, 18, 40 };
+    const here: [4]f32 = .{ 0, 0, 18, 40 };
+    const cell: [2]f32 = .{ 18, 42 };
+    try testing.expect(!cursorChangeCounts(.@"cursor-jump", true, here, near, cell));
+    inline for (.{ .false, .true, .always, .cursor }) |mode| {
+        try testing.expect(cursorChangeCounts(mode, true, here, near, cell));
+    }
+
+    // Unfocused, no loop runs: `cursor-jump` stamps nothing, even for a
+    // jump, and no mode starts a window; the other modes' stamps stay.
+    const far: [4]f32 = .{ 500, 0, 18, 40 };
+    try testing.expect(cursorChangeCounts(.@"cursor-jump", true, here, far, cell));
+    try testing.expect(!cursorChangeCounts(.@"cursor-jump", false, here, far, cell));
+    try testing.expect(cursorChangeCounts(.cursor, false, here, far, cell));
+    const moved = cursorInputs(at(glyph, 40, 4), frame).?;
+    inline for (.{ .cursor, .@"cursor-jump" }) |mode| {
+        try testing.expect(cursorStartsWindow(mode, true, from, moved));
+        try testing.expect(!cursorStartsWindow(mode, false, from, moved));
+        try testing.expect(!cursorStartsWindow(mode, false, null, moved));
+    }
 }
 
 test "cursorInputs: what starts custom-shader-animation = cursor" {
@@ -607,7 +785,7 @@ test "cursorInputs: what starts custom-shader-animation = cursor" {
         /// one seen.
         fn by(last: CursorInputs, g: ?CursorGlyph, f: CursorFrame) bool {
             const now = cursorInputs(g, f) orelse return false;
-            return !std.meta.eql(last, now);
+            return cursorStartsWindow(.cursor, true, last, now);
         }
     }.by;
     const first = cursorInputs(glyph, frame).?;

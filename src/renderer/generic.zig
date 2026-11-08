@@ -1171,7 +1171,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .true => if (self.focused) draw_interval_ms else null,
                     // pepper: only for a while after the cursor or the
                     // focus changes.
-                    .cursor => if (self.focused and shadertoy.cursorAnimating(
+                    .cursor, .@"cursor-jump" => if (self.focused and shadertoy.cursorAnimating(
                         self.custom_shader_animate_until.load(.monotonic),
                         shadertoy.monotonicNs(),
                     )) draw_interval_ms else null,
@@ -2312,10 +2312,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.reinitialize_shaders = true;
             }
 
-            // pepper: another shader, or `cursor` just chosen, gets
-            // `custom-shader-animation = cursor`'s window, so its first
-            // second animates. Other config changes don't.
-            if (self.focused and (custom_shaders_changed or old_animation != .cursor))
+            // pepper: another shader, or `cursor` or `cursor-jump` just
+            // chosen, gets `custom-shader-animation = cursor`'s window, so
+            // its start animates. Other config changes don't.
+            if (self.focused and (custom_shaders_changed or
+                old_animation != self.config.custom_shader_animation))
                 self.startCustomShaderWindow();
         }
 
@@ -2514,7 +2515,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Not needed otherwise. A shader or this mode coming back
             // starts the window from `changeConfig`.
             if (!self.has_custom_shaders or
-                self.config.custom_shader_animation != .cursor) return;
+                !self.config.custom_shader_animation.isWindowed()) return;
             const glyph: ?shadertoy.CursorGlyph = if (self.cells.getCursorGlyph()) |g| .{
                 .grid_pos = g.grid_pos,
                 .glyph_size = g.glyph_size,
@@ -2529,25 +2530,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.size.screen.height,
                 ),
             }) orelse return;
-            if (self.custom_shader_cursor_seen) |last| {
-                if (std.meta.eql(last, seen)) return;
-            }
+            const starts = shadertoy.cursorStartsWindow(
+                self.config.custom_shader_animation,
+                self.focused,
+                self.custom_shader_cursor_seen,
+                seen,
+            );
             self.custom_shader_cursor_seen = seen;
-            if (self.focused) self.startCustomShaderWindow();
+            if (starts) self.startCustomShaderWindow();
         }
 
         /// pepper: starts (or extends) `custom-shader-animation = cursor`'s
-        /// window: a second from now. Its end is the latest of every start,
-        /// so the first one seen (before the loop is set) and the one the
-        /// frame's uniforms stamp (the shader's own clock, a refresh or so
-        /// later) both get their full second. Any thread. The render
-        /// thread's callers start it only while focused; the uniforms'
-        /// stamps don't look, and `animationWake` runs the loop only while
-        /// focused either way.
+        /// window, until `shadertoy.cursorAnimationEnd`. Its end is the
+        /// latest of every start, so the first one seen (before the loop is
+        /// set) and the one the frame's uniforms stamp (the shader's own
+        /// clock, a refresh or so later) both get all of it. Any thread.
+        /// The render thread's callers start it only while focused; the uniforms'
+        /// stamps look only in `cursor-jump`, and `animationWake` runs the
+        /// loop only while focused either way.
         fn startCustomShaderWindow(self: *Self) void {
-            if (self.config.custom_shader_animation != .cursor) return;
+            if (!self.config.custom_shader_animation.isWindowed()) return;
             _ = self.custom_shader_animate_until.fetchMax(
-                shadertoy.cursorAnimationEnd(shadertoy.monotonicNs()),
+                shadertoy.cursorAnimationEnd(
+                    shadertoy.monotonicNs(),
+                    self.config.custom_shader_animation,
+                ),
                 .monotonic,
             );
         }
@@ -2655,13 +2662,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     !std.meta.eql(cursor_color, uniforms.current_cursor_color);
 
                 if (cursor_changed) {
-                    uniforms.previous_cursor = uniforms.current_cursor;
-                    uniforms.previous_cursor_color = uniforms.current_cursor_color;
+                    // pepper: from where it was, as the shaders see it.
+                    const counts = shadertoy.cursorChangeCounts(
+                        self.config.custom_shader_animation,
+                        self.focused,
+                        uniforms.current_cursor,
+                        new_cursor,
+                        .{ @floatFromInt(cell.width), @floatFromInt(cell.height) },
+                    );
+                    // pepper: a change `cursor-jump` leaves out stamps no
+                    // time, so a shader can't start an effect the loop won't
+                    // run, which would freeze at its first frame; and keeps
+                    // the previous cursor, so an effect still running goes
+                    // on from where it started.
+                    if (counts) {
+                        uniforms.previous_cursor = uniforms.current_cursor;
+                        uniforms.previous_cursor_color = uniforms.current_cursor_color;
+                        uniforms.cursor_change_time = uniforms.time;
+                        // pepper: the shader's clock stamps it now.
+                        self.startCustomShaderWindow();
+                    }
                     uniforms.current_cursor = new_cursor;
                     uniforms.current_cursor_color = cursor_color;
-                    uniforms.cursor_change_time = uniforms.time;
-                    // pepper: the shader's clock stamps it now.
-                    self.startCustomShaderWindow();
                 }
             }
 
