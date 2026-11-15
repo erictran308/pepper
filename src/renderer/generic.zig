@@ -155,6 +155,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// draw runs on the main thread), hence atomic.
         custom_shader_animate_until: std.atomic.Value(u64) = .init(0),
 
+        /// pepper: a `custom-shader-animation-tick` frame is due. Set by the
+        /// render thread's tick timer just before it draws, so that draw
+        /// renders though nothing else changed, and cleared by the frame
+        /// that renders. Atomic, as a sync draw runs on the main thread.
+        shader_tick_due: std.atomic.Value(bool) = .init(false),
+
+        /// pepper: when the shaders' clock (`iTime`) started, in
+        /// `shadertoy.monotonicNs` (0: no frame yet), for
+        /// `custom-shader-animation-tick`. Set by the first frame, on
+        /// whichever thread draws it, hence atomic.
+        custom_shader_clock_start: std.atomic.Value(u64) = .init(0),
+
+        /// pepper: when the last `custom-shader-animation-tick` frame was
+        /// taken, in ms on the shaders' clock (null: none yet). Render
+        /// thread only.
+        shader_tick_last: ?u64 = null,
+
         /// pepper: the custom shaders' cursor as last seen by
         /// `noteCustomShaderCursor`, to tell when it changes.
         custom_shader_cursor_seen: ?shadertoy.CursorInputs = null,
@@ -622,6 +639,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             background_blur: configpkg.Config.BackgroundBlur,
             scroll_to_bottom_on_output: bool,
             custom_shader_animation: configpkg.CustomShaderAnimation,
+            custom_shader_animation_tick: u32,
+            custom_shader_animation_tick_fade: u32,
 
             pub fn init(
                 alloc_gpa: Allocator,
@@ -697,6 +716,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_blur = config.@"background-blur",
                     .scroll_to_bottom_on_output = config.@"scroll-to-bottom".output,
                     .custom_shader_animation = config.@"custom-shader-animation",
+                    .custom_shader_animation_tick = config.@"custom-shader-animation-tick",
+                    .custom_shader_animation_tick_fade = config.@"custom-shader-animation-tick-fade",
                     .arena = arena,
                 };
             }
@@ -1149,6 +1170,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 /// Frame data must be updated first: updateFrame, then draw.
                 update,
+
+                /// pepper: one frame for `custom-shader-animation-tick`.
+                /// Not an animation: `animationWake` never returns it (only
+                /// `shaderTickWake`, for the timer), so it neither keeps the
+                /// display link running nor makes every draw render.
+                tick,
             };
         };
 
@@ -1205,6 +1232,77 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (shader_delay) |s| return .{ .delay_ms = s, .kind = .draw };
 
             return null;
+        }
+
+        /// pepper: the step of `custom-shader-animation-tick`, while it
+        /// applies (focused, with custom shaders that animate only on
+        /// changes): at least `draw_interval_ms`, so its frames are never
+        /// closer together than `true`'s. Null when it doesn't apply.
+        fn shaderTick(self: *const Self) ?u64 {
+            const tick = self.config.custom_shader_animation_tick;
+            if (tick == 0 or !self.focused or !self.has_custom_shaders) return null;
+            return switch (self.config.custom_shader_animation) {
+                .true, .always => null,
+                .false, .cursor, .@"cursor-jump" => @max(tick, draw_interval_ms),
+            };
+        }
+
+        /// pepper: the shaders' clock (`iTime`) in ms; null until a first
+        /// frame starts it.
+        fn shaderClockMs(self: *const Self) ?u64 {
+            const start = self.custom_shader_clock_start.load(.monotonic);
+            if (start == 0) return null;
+            return (shadertoy.monotonicNs() -| start) / std.time.ns_per_ms;
+        }
+
+        /// pepper: the wake for the next `custom-shader-animation-tick`
+        /// frame, if the tick applies: by the schedule, at least a
+        /// millisecond on, so a timer that fired early comes back for what's
+        /// left. Before a first frame, once a step, until any frame starts
+        /// the clock (a terminal that can't draw yet isn't woken faster).
+        fn shaderTickWake(self: *const Self) ?AnimationWake {
+            const tick = self.shaderTick() orelse return null;
+            const now = self.shaderClockMs() orelse
+                return .{ .delay_ms = tick, .kind = .tick };
+            const due = shadertoy.tickNextFrame(
+                self.shader_tick_last,
+                tick,
+                self.config.custom_shader_animation_tick_fade,
+            );
+            return .{ .delay_ms = @max(due -| now, 1), .kind = .tick };
+        }
+
+        /// pepper: the animation timer's next wake: `animationWake`'s, or the
+        /// next `custom-shader-animation-tick` frame when that's sooner (an
+        /// animation wake draws too, so it wins a tie). Only the timer uses
+        /// this: a tick frame is no animation, so it neither keeps the
+        /// display link running nor makes every draw render.
+        pub fn nextWake(self: *const Self) ?AnimationWake {
+            const animation = self.animationWake();
+            const tick = self.shaderTickWake();
+            if (animation) |a| {
+                if (tick == null or a.delay_ms <= tick.?.delay_ms) return a;
+            }
+            return tick;
+        }
+
+        /// pepper: on a `.tick` wake, whether a tick frame is due (the tick
+        /// still applies and its time has come: a timer may fire early, or
+        /// after the focus went). If so, it's taken, and the next draw
+        /// renders though nothing else changed.
+        pub fn takeShaderTick(self: *Self) bool {
+            const tick = self.shaderTick() orelse return false;
+            if (self.shaderClockMs()) |now| {
+                const due = shadertoy.tickNextFrame(
+                    self.shader_tick_last,
+                    tick,
+                    self.config.custom_shader_animation_tick_fade,
+                );
+                if (now < due) return false;
+                self.shader_tick_last = now;
+            }
+            self.shader_tick_due.store(true, .monotonic);
+            return true;
         }
 
         /// Returns true if the display link is running, meaning frames
@@ -1845,6 +1943,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.cells_rebuilt or
                 self.images_rebuilt or
                 self.animationWake() != null or
+                self.shader_tick_due.load(.monotonic) or
                 sync;
 
             if (!needs_redraw) {
@@ -1855,6 +1954,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.cells_rebuilt = false;
             self.images_rebuilt = false;
+            self.shader_tick_due.store(false, .monotonic);
 
             // Wait for a frame to be available.
             const frame = swap_chain.nextFrame();
@@ -2572,6 +2672,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             defer self.last_frame_time = now;
             const first_frame_time = self.first_frame_time orelse t: {
                 self.first_frame_time = now;
+                // pepper: the same start, for `custom-shader-animation-tick`.
+                self.custom_shader_clock_start.store(
+                    @max(std.math.cast(u64, now.nanoseconds) orelse 1, 1),
+                    .monotonic,
+                );
                 break :t now;
             };
             const last_frame_time = self.last_frame_time orelse now;

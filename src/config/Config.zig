@@ -3284,6 +3284,30 @@ keybind: Keybinds = .{},
 /// This can be changed at runtime and will affect all open terminals.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
+/// Pepper only: when not `0`, a terminal whose `custom-shader-animation`
+/// draws only on changes (`false`, `cursor` or `cursor-jump`) also draws
+/// once every this many milliseconds of the shaders' clock (`iTime`) while
+/// it's focused, just after each multiple. A shader that moves in steps of
+/// that length (`floor(iTime * 1000.0 / tick)`) then shows every step on
+/// time, however often the terminal changes: `500` is two frames a second at
+/// rest, against one every display refresh with `true`. Changes still draw
+/// as they come, and an unfocused terminal draws only on changes. At `8` or
+/// less it draws as often as `true`. In a terminal open for days a step
+/// shows a little after it starts (`iTime` is a 32-bit float), still once
+/// each. The default, `0`, adds no frames.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"custom-shader-animation-tick": u32 = 0,
+
+/// Pepper only: with `custom-shader-animation-tick`, keep drawing for this
+/// many milliseconds after each step begins, 30 frames a second, for a
+/// shader that fades from one step to the next (it can tell how far into a
+/// step it is from `iTime`). `400` with a tick of `2000` is about seven
+/// frames a second at rest. The default, `0`, draws each step once.
+///
+/// This can be changed at runtime and will affect all open terminals.
+@"custom-shader-animation-tick-fade": u32 = 0,
+
 /// Bell features to enable if bell support is available in your runtime. Not
 /// all features are available on all runtimes. The format of this is a list of
 /// features to enable separated by commas. If you prefix a feature with `no-`

@@ -586,7 +586,7 @@ fn renderCallback(
 }
 
 /// Schedule the animation timer for the renderer's next animation
-/// wake, if it needs one.
+/// wake, if it needs one (pepper: or `custom-shader-animation-tick`'s).
 ///
 /// This is called after every frame update or animation draw and
 /// whenever the wake inputs change (focus, config, visibility
@@ -594,7 +594,7 @@ fn renderCallback(
 /// recomputes the wake, so the deadline only ever moves toward the
 /// actual next wake.
 fn armAnimationTimer(self: *Thread) void {
-    const wake = self.renderer.animationWake() orelse return;
+    const wake = self.renderer.nextWake() orelse return;
     self.animation_wake = wake.kind;
     self.render_h.reset(
         &self.loop,
@@ -645,6 +645,16 @@ fn animationTimerCallback(
         // are much cheaper than a frame update.
         .draw => {
             t.drawFrame(false);
+            t.armAnimationTimer();
+            return .disarm;
+        },
+
+        // pepper: a `custom-shader-animation-tick` frame, if one is due:
+        // drawn now even under a running display link (which may be about
+        // to stop without drawing again), and marked so it renders though
+        // nothing else changed.
+        .tick => {
+            if (t.renderer.takeShaderTick()) t.drawFrame(true);
             t.armAnimationTimer();
             return .disarm;
         },

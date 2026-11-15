@@ -381,6 +381,38 @@ pub fn cursorAnimating(end_ns: u64, now_ns: u64) bool {
     return now_ns != 0 and now_ns < end_ns;
 }
 
+/// pepper: how far past a step's start `custom-shader-animation-tick` draws
+/// its first frame, so `iTime` (32-bit float seconds, whose rounding grows
+/// with uptime) reads the new step: twice that rounding, about 120 ms after
+/// six days, at least a millisecond, at most a step less one.
+pub fn tickMargin(elapsed_ms: u64, tick_ms: u64) u64 {
+    // f32 holds 24 bits: rounding up to elapsed * 2^-23 (twice: 2^-22).
+    return @min((elapsed_ms >> 22) + 1, tick_ms -| 1);
+}
+
+/// pepper: the frame cadence of `custom-shader-animation-tick-fade`.
+pub const tick_fade_interval_ms: u64 = 33;
+
+/// pepper: the frames of `custom-shader-animation-tick`, in ms on the
+/// shaders' clock: each step's first frame a margin past its start, then,
+/// while the step's fade of `fade_ms` lasts (from the step's start, as the
+/// shader reads it), one every `tick_fade_interval_ms`, the last at or past
+/// its end, within the step. When the first one after `last_ms` (the last
+/// one taken) is due; 0, at once, when none was taken yet.
+pub fn tickNextFrame(last_ms: ?u64, tick_ms: u64, fade_ms: u64) u64 {
+    const last = last_ms orelse return 0;
+    if (tick_ms == 0) return std.math.maxInt(u64);
+    const start = last / tick_ms * tick_ms;
+    const first = start + tickMargin(start, tick_ms);
+    if (last < first) return first;
+    if (last < start + fade_ms) {
+        const at = first + ((last - first) / tick_fade_interval_ms + 1) * tick_fade_interval_ms;
+        if (at < start + tick_ms) return at;
+    }
+    const next = start + tick_ms;
+    return next + tickMargin(next, tick_ms);
+}
+
 /// pepper: whether a cursor that went from `old` to `new` (x, y, width and
 /// height in pixels, as the uniforms have them) jumped, for
 /// `custom-shader-animation = cursor-jump`: it changed size, or its corner
@@ -665,6 +697,43 @@ test "cursorAnimating: for a while after a change, never before one" {
     try testing.expect(!cursorAnimating(end, 0));
     // The clock reads as a real time (not 0, which means no change).
     try testing.expect(monotonicNs() > 0);
+}
+
+test "tickNextFrame: each step once, a margin past its start" {
+    const testing = std.testing;
+    // None taken yet: at once.
+    try testing.expectEqual(@as(u64, 0), tickNextFrame(null, 500, 0));
+    // Just before, at and after a step's first frame (1 ms past 1000 ms).
+    try testing.expectEqual(@as(u64, 1001), tickNextFrame(1000, 500, 0));
+    try testing.expectEqual(@as(u64, 1501), tickNextFrame(1001, 500, 0));
+    // Taken late, or by a timer that fired early: the next step all the same.
+    try testing.expectEqual(@as(u64, 1501), tickNextFrame(1300, 500, 0));
+    try testing.expectEqual(@as(u64, 1501), tickNextFrame(1499, 500, 0));
+    // Long runs: the margin follows iTime's rounding, 120 ms after about six
+    // days, and is at most a step less a millisecond after a month.
+    try testing.expectEqual(@as(u64, 500_000_120), tickNextFrame(499_999_999, 500, 0));
+    try testing.expectEqual(@as(u64, 2_592_000_499), tickNextFrame(2_591_999_999, 500, 0));
+}
+
+test "tickNextFrame: a fade's frames, then the next step" {
+    const testing = std.testing;
+    // 2 s steps with a 400 ms fade: a frame every 33 ms from the first.
+    try testing.expectEqual(@as(u64, 2034), tickNextFrame(2001, 2000, 400));
+    try testing.expectEqual(@as(u64, 2067), tickNextFrame(2034, 2000, 400));
+    // A frame taken late keeps to the same cadence.
+    try testing.expectEqual(@as(u64, 2067), tickNextFrame(2040, 2000, 400));
+    // The last frame of the fade at or past its end (2400), then the next step.
+    try testing.expectEqual(@as(u64, 2430), tickNextFrame(2397, 2000, 400));
+    try testing.expectEqual(@as(u64, 4001), tickNextFrame(2400, 2000, 400));
+    try testing.expectEqual(@as(u64, 4001), tickNextFrame(2430, 2000, 400));
+    // Long runs: the fade still ends 400 ms into the step, not later, though
+    // the first frame waits out a 120 ms margin.
+    try testing.expectEqual(@as(u64, 500_000_417), tickNextFrame(500_000_384, 2000, 400));
+    try testing.expectEqual(@as(u64, 500_002_120), tickNextFrame(500_000_417, 2000, 400));
+    // A fade as long as the step stops at the step's end.
+    try testing.expectEqual(@as(u64, 1001), tickNextFrame(990, 100, 1000));
+    // No tick: never.
+    try testing.expectEqual(std.math.maxInt(u64), tickNextFrame(5, 0, 0));
 }
 
 test "cursorStartsWindow: what starts custom-shader-animation = cursor-jump" {
