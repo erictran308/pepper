@@ -2210,11 +2210,12 @@ test "shape ligature pair and style boundaries" {
 
     var s = t.vtStream();
     defer s.deinit();
-    // Row 0: one style, with an `st` pair. Row 1: a color change, then bold.
-    // Row 2: italic. Row 3: invisible text mid-row. Row 4: both kinds of break.
+    // Row 0: one style, with an `st` pair. Row 1: a color change, faint and
+    // underline, then bold. Row 2: inverse, then italic. Row 3: invisible
+    // text mid-row. Row 4: an `st` pair, a color change and an `fi` pair.
     s.nextSlice("mk_test_x\r\n");
-    s.nextSlice("ab\x1b[31mcd\x1b[1mef\r\n");
-    s.nextSlice("\x1b[0mab\x1b[3mcd\r\n");
+    s.nextSlice("ab\x1b[31mcd\x1b[2;4mgh\x1b[1mef\r\n");
+    s.nextSlice("\x1b[0mab\x1b[7mcd\x1b[27;3mef\r\n");
     s.nextSlice("\x1b[0mab\x1b[8mcd\x1b[28mef\r\n");
     s.nextSlice("\x1b[0ms\x1b[31mtfi");
 
@@ -2222,21 +2223,23 @@ test "shape ligature pair and style boundaries" {
     defer state.deinit(alloc);
     try state.update(alloc, &t);
 
-    const Case = struct { row: usize, pairs: bool, style: bool, runs: usize };
+    // Each case lists the cells where its runs start.
+    const Case = struct { row: usize, pairs: bool, style: bool, starts: []const u16 };
     for ([_]Case{
-        .{ .row = 0, .pairs = true, .style = true, .runs = 2 },
-        .{ .row = 0, .pairs = false, .style = true, .runs = 1 },
-        .{ .row = 1, .pairs = true, .style = true, .runs = 3 },
+        .{ .row = 0, .pairs = true, .style = true, .starts = &.{ 0, 6 } },
+        .{ .row = 0, .pairs = false, .style = true, .starts = &.{0} },
+        .{ .row = 1, .pairs = true, .style = true, .starts = &.{ 0, 2, 4, 6 } },
         // Bold uses another face, so it still breaks the run.
-        .{ .row = 1, .pairs = true, .style = false, .runs = 2 },
-        // So does italic.
-        .{ .row = 2, .pairs = true, .style = false, .runs = 2 },
+        .{ .row = 1, .pairs = true, .style = false, .starts = &.{ 0, 6 } },
+        // Inverse swaps the text and background colors; italic is another face.
+        .{ .row = 2, .pairs = true, .style = false, .starts = &.{ 0, 2, 4 } },
         // Invisible cells must end a run: the renderer skips them before
         // reading their glyphs.
-        .{ .row = 3, .pairs = true, .style = false, .runs = 2 },
-        // `s|t` and `f|i` pairs and a color change: "s", "tf", "i".
-        .{ .row = 4, .pairs = true, .style = true, .runs = 3 },
-        .{ .row = 4, .pairs = false, .style = false, .runs = 1 },
+        .{ .row = 3, .pairs = true, .style = false, .starts = &.{ 0, 4 } },
+        .{ .row = 4, .pairs = true, .style = true, .starts = &.{ 0, 1, 3 } },
+        .{ .row = 4, .pairs = true, .style = false, .starts = &.{ 0, 1, 3 } },
+        .{ .row = 4, .pairs = false, .style = true, .starts = &.{ 0, 1 } },
+        .{ .row = 4, .pairs = false, .style = false, .starts = &.{0} },
     }) |case| {
         var shaper = &testdata.shaper;
         var it = shaper.runIterator(.{
@@ -2245,12 +2248,14 @@ test "shape ligature pair and style boundaries" {
             .break_ligature_pairs = case.pairs,
             .break_style = case.style,
         });
+        var starts: [20]u16 = undefined;
         var count: usize = 0;
         while (try it.next(alloc)) |run| {
+            starts[count] = run.offset;
             count += 1;
             _ = try shaper.shape(run);
         }
-        try testing.expectEqual(case.runs, count);
+        try testing.expectEqualSlices(u16, case.starts, starts[0..count]);
     }
 }
 

@@ -397,11 +397,14 @@ fn comparableStyle(style: terminal.Style, break_style: bool) terminal.Style {
     s.bg_color = .none;
 
     // pepper: without style breaks, only what picks the face (bold,
-    // italic) or skips shaping (invisible) splits a run. Each cell is
-    // still drawn with its own colors and decorations.
+    // italic), swaps the text and background colors (inverse, which would
+    // draw half a ligature in its own background color) or skips shaping
+    // (invisible) splits a run. A glyph takes its own cell's text color;
+    // backgrounds and decorations are still drawn per cell.
     if (!break_style) return .{ .flags = .{
         .bold = s.flags.bold,
         .italic = s.flags.italic,
+        .inverse = s.flags.inverse,
         .invisible = s.flags.invisible,
     } };
 

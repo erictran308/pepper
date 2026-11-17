@@ -379,20 +379,32 @@ language: ?[:0]const u8 = null,
 ///   * `cursor` - Break runs under the cursor.
 ///
 ///   * `ligature-pairs` - (Pepper only: Ghostty itself reports it as an
-///     invalid value) Break runs inside the letter pairs `fi`, `fl` and `st`,
-///     so a font can't join them into a typographic ligature. Disable it when
-///     a font's contextual rules must see whole words, such as a font that
-///     masks a secret after `sk_test_`.
+///     invalid value and ignores the whole line, `cursor` included) Break
+///     runs inside the letter pairs `fi`, `fl` and `st`, so a font can't join
+///     them into a typographic ligature. Disable it when a font's contextual
+///     rules must see whole words, such as a font that masks a secret after
+///     `sk_test_`.
 ///
 ///   * `style` - (Pepper only, as `ligature-pairs`) Break runs where a cell's
-///     text or underline color or its decorations change, so a ligature never
-///     spans two text colors. Background colors never break runs. Bold, italic
-///     and invisible text break runs either way: bold and italic use another
-///     face. Disable it when a font's contextual rules must see text an editor
-///     colors in parts, such as `API_KEY=value`; a ligature across two colors
-///     then takes the color of its first cell.
+///     text or underline color, its decorations, or faint or blink change, so
+///     a ligature never spans two text colors. Background colors never break
+///     runs. Bold, italic, inverse and invisible text break runs either way:
+///     bold and italic use another face, and inverse swaps the text and
+///     background colors, so half a ligature would be drawn in its own
+///     background color. Disable it when a font's contextual rules must see
+///     text an editor colors in parts, such as `API_KEY=value`; a ligature
+///     across two colors then takes the color and faintness of its first
+///     cell.
 ///
-/// A bare `true` or `false` sets every option at once.
+/// A bare `true` or `false` sets every option at once. Each
+/// `font-shaping-break` line starts again from the defaults, so put every
+/// option on one line.
+///
+/// Even with every option disabled, runs still break at the end of each row
+/// (a wrapped line included), at a selection's edges, where the font changes
+/// (bold, italic, or a fallback font for a missing glyph) and at inverse and
+/// invisible text, so a font that masks secrets shows the part of a secret
+/// after such a break.
 ///
 /// Available since: 1.2.0
 @"font-shaping-break": FontShapingBreak = .{},

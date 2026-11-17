@@ -87,8 +87,9 @@ pub const RunOptions = struct {
     /// pepper: break runs inside the letter pairs fi, fl and st.
     break_ligature_pairs: bool = true,
 
-    /// pepper: break runs where colors or decorations change. Bold and
-    /// italic always break runs, since they use another face.
+    /// pepper: break runs where colors or decorations change. Bold,
+    /// italic, inverse and invisible always break runs (comparableStyle
+    /// in shaper/run.zig).
     break_style: bool = true,
 
     /// Apply the font break configuration to the run.
