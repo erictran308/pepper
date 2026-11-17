@@ -378,6 +378,22 @@ language: ?[:0]const u8 = null,
 ///
 ///   * `cursor` - Break runs under the cursor.
 ///
+///   * `ligature-pairs` - (Pepper only: Ghostty itself reports it as an
+///     invalid value) Break runs inside the letter pairs `fi`, `fl` and `st`,
+///     so a font can't join them into a typographic ligature. Disable it when
+///     a font's contextual rules must see whole words, such as a font that
+///     masks a secret after `sk_test_`.
+///
+///   * `style` - (Pepper only, as `ligature-pairs`) Break runs where a cell's
+///     text or underline color or its decorations change, so a ligature never
+///     spans two text colors. Background colors never break runs. Bold, italic
+///     and invisible text break runs either way: bold and italic use another
+///     face. Disable it when a font's contextual rules must see text an editor
+///     colors in parts, such as `API_KEY=value`; a ligature across two colors
+///     then takes the color of its first cell.
+///
+/// A bare `true` or `false` sets every option at once.
+///
 /// Available since: 1.2.0
 @"font-shaping-break": FontShapingBreak = .{},
 
@@ -8832,7 +8848,19 @@ pub const FontSyntheticStyle = packed struct {
 /// See "font-shaping-break" for documentation
 pub const FontShapingBreak = packed struct {
     cursor: bool = true,
+    /// pepper: break runs inside the letter pairs fi, fl and st.
+    @"ligature-pairs": bool = true,
+    /// pepper: break runs where colors or decorations change.
+    style: bool = true,
 };
+
+test "font-shaping-break: pepper options" {
+    const value = try cli.args.parsePackedStruct(FontShapingBreak, "no-ligature-pairs, no-style");
+    try std.testing.expectEqual(
+        FontShapingBreak{ .cursor = true, .@"ligature-pairs" = false, .style = false },
+        value,
+    );
+}
 
 /// See "link" for documentation.
 pub const RepeatableLink = struct {

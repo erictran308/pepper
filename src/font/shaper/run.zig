@@ -115,7 +115,8 @@ pub const RunIterator = struct {
                 // If the prev cell and this cell are both plain
                 // codepoints then we check if they are commonly "bad"
                 // ligatures and spit the run if they are.
-                if (prev_cell.content_tag == .codepoint and
+                if (self.opts.break_ligature_pairs and
+                    prev_cell.content_tag == .codepoint and
                     cell.content_tag == .codepoint)
                 {
                     const prev_cp = prev_cell.codepoint();
@@ -141,8 +142,11 @@ pub const RunIterator = struct {
 
                 // The style is different. We allow differing background
                 // styles but any other change results in a new run.
-                const c1 = comparableStyle(style);
-                const c2 = comparableStyle(if (cell.hasStyling()) styles[j] else .{});
+                const c1 = comparableStyle(style, self.opts.break_style);
+                const c2 = comparableStyle(
+                    if (cell.hasStyling()) styles[j] else .{},
+                    self.opts.break_style,
+                );
                 if (!c1.eql(c2)) break;
             }
 
@@ -384,13 +388,22 @@ pub const RunIterator = struct {
 
 /// Returns a style that when compared must be identical for a run to
 /// continue.
-fn comparableStyle(style: terminal.Style) terminal.Style {
+fn comparableStyle(style: terminal.Style, break_style: bool) terminal.Style {
     var s = style;
 
     // We allow background colors to differ because we'll just paint the
     // cell background whatever the style is, and wherever the glyph
     // lands on top of it will be the color of the glyph.
     s.bg_color = .none;
+
+    // pepper: without style breaks, only what picks the face (bold,
+    // italic) or skips shaping (invisible) splits a run. Each cell is
+    // still drawn with its own colors and decorations.
+    if (!break_style) return .{ .flags = .{
+        .bold = s.flags.bold,
+        .italic = s.flags.italic,
+        .invisible = s.flags.invisible,
+    } };
 
     return s;
 }

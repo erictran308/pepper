@@ -84,14 +84,32 @@ pub const RunOptions = struct {
     /// null.
     cursor_x: ?usize = null,
 
+    /// pepper: break runs inside the letter pairs fi, fl and st.
+    break_ligature_pairs: bool = true,
+
+    /// pepper: break runs where colors or decorations change. Bold and
+    /// italic always break runs, since they use another face.
+    break_style: bool = true,
+
     /// Apply the font break configuration to the run.
     pub fn applyBreakConfig(
         self: *RunOptions,
         config: configpkg.FontShapingBreak,
     ) void {
         if (!config.cursor) self.cursor_x = null;
+        self.break_ligature_pairs = config.@"ligature-pairs";
+        self.break_style = config.style;
     }
 };
+
+test "applyBreakConfig" {
+    // pepper: each config option reaches its own run option.
+    var opts: RunOptions = .{ .grid = undefined, .cursor_x = 3 };
+    opts.applyBreakConfig(.{ .cursor = false, .@"ligature-pairs" = false });
+    try std.testing.expectEqual(@as(?usize, null), opts.cursor_x);
+    try std.testing.expect(!opts.break_ligature_pairs);
+    try std.testing.expect(opts.break_style);
+}
 
 test {
     _ = Cache;

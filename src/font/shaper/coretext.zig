@@ -2197,6 +2197,63 @@ test "shape cursor boundary" {
     }
 }
 
+test "shape ligature pair and style boundaries" {
+    // pepper: `font-shaping-break = no-ligature-pairs,no-style`
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var testdata = try testShaper(alloc);
+    defer testdata.deinit();
+
+    var t = try terminal.Terminal.init(testing.io, alloc, .{ .cols = 20, .rows = 5 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // Row 0: one style, with an `st` pair. Row 1: a color change, then bold.
+    // Row 2: italic. Row 3: invisible text mid-row. Row 4: both kinds of break.
+    s.nextSlice("mk_test_x\r\n");
+    s.nextSlice("ab\x1b[31mcd\x1b[1mef\r\n");
+    s.nextSlice("\x1b[0mab\x1b[3mcd\r\n");
+    s.nextSlice("\x1b[0mab\x1b[8mcd\x1b[28mef\r\n");
+    s.nextSlice("\x1b[0ms\x1b[31mtfi");
+
+    var state: terminal.RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    const Case = struct { row: usize, pairs: bool, style: bool, runs: usize };
+    for ([_]Case{
+        .{ .row = 0, .pairs = true, .style = true, .runs = 2 },
+        .{ .row = 0, .pairs = false, .style = true, .runs = 1 },
+        .{ .row = 1, .pairs = true, .style = true, .runs = 3 },
+        // Bold uses another face, so it still breaks the run.
+        .{ .row = 1, .pairs = true, .style = false, .runs = 2 },
+        // So does italic.
+        .{ .row = 2, .pairs = true, .style = false, .runs = 2 },
+        // Invisible cells must end a run: the renderer skips them before
+        // reading their glyphs.
+        .{ .row = 3, .pairs = true, .style = false, .runs = 2 },
+        // `s|t` and `f|i` pairs and a color change: "s", "tf", "i".
+        .{ .row = 4, .pairs = true, .style = true, .runs = 3 },
+        .{ .row = 4, .pairs = false, .style = false, .runs = 1 },
+    }) |case| {
+        var shaper = &testdata.shaper;
+        var it = shaper.runIterator(.{
+            .grid = testdata.grid,
+            .cells = state.row_data.get(case.row).cells.slice(),
+            .break_ligature_pairs = case.pairs,
+            .break_style = case.style,
+        });
+        var count: usize = 0;
+        while (try it.next(alloc)) |run| {
+            count += 1;
+            _ = try shaper.shape(run);
+        }
+        try testing.expectEqual(case.runs, count);
+    }
+}
+
 test "shape cursor boundary and colored emoji" {
     const testing = std.testing;
     const alloc = testing.allocator;
